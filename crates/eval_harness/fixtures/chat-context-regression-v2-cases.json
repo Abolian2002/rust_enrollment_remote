@@ -6,28 +6,42 @@
         "message": "北京数学与应用数学近五年录取线",
         "expect": {
           "type": "score_query",
-          "replyIncludes": ["北京", "数学与应用数学"]
+          "replyIncludes": [
+            "北京",
+            "数学与应用数学"
+          ]
         }
       },
       {
         "message": "汉语言文学呢？",
         "expect": {
           "type": "score_query",
-          "replyIncludes": ["北京", "汉语言文学"]
+          "replyIncludes": [
+            "北京",
+            "汉语言文学"
+          ]
         }
       },
       {
         "message": "525分能上汉语言文学吗？",
         "expect": {
           "type": "probability_assessment",
-          "replyIncludes": ["北京", "525", "汉语言文学"]
+          "replyIncludes": [
+            "北京",
+            "525",
+            "汉语言文学"
+          ]
         }
       },
       {
         "message": "那数学与应用数学525分呢？",
         "expect": {
           "type": "probability_assessment",
-          "replyIncludes": ["北京", "525", "数学与应用数学"]
+          "replyIncludes": [
+            "北京",
+            "525",
+            "数学与应用数学"
+          ]
         }
       }
     ]
@@ -40,22 +54,34 @@
         "message": "河北物理类数学与应用数学和物理学哪个分数更高？",
         "expect": {
           "type": "evidence_bundle",
-          "bundleIncludes": ["score_query"],
-          "replyIncludes": ["河北", "数学与应用数学", "物理学"]
+          "bundleIncludes": [
+            "score_query"
+          ],
+          "replyIncludes": [
+            "河北",
+            "数学与应用数学",
+            "物理学"
+          ]
         }
       },
       {
         "message": "那化学师范呢？",
         "expect": {
           "type": "score_query",
-          "replyIncludes": ["河北", "化学"]
+          "replyIncludes": [
+            "河北",
+            "化学"
+          ]
         }
       },
       {
         "message": "换成山西呢？",
         "expect": {
           "type": "score_query",
-          "replyIncludes": ["山西", "化学"]
+          "replyIncludes": [
+            "山西",
+            "化学"
+          ]
         }
       }
     ]
@@ -67,21 +93,32 @@
         "message": "山西软件工程2021到2025分数线",
         "expect": {
           "type": "score_query",
-          "replyIncludes": ["山西", "软件工程"]
+          "replyIncludes": [
+            "山西",
+            "软件工程"
+          ]
         }
       },
       {
         "message": "480分报软件工程稳吗？",
         "expect": {
           "type": "probability_assessment",
-          "replyIncludes": ["山西", "480", "软件工程"]
+          "replyIncludes": [
+            "山西",
+            "480",
+            "软件工程"
+          ]
         }
       },
       {
         "message": "那计算机呢？",
         "expect": {
           "type": "probability_assessment",
-          "replyIncludes": ["山西", "480", "计算机"]
+          "replyIncludes": [
+            "山西",
+            "480",
+            "计算机"
+          ]
         }
       }
     ]
@@ -94,28 +131,40 @@
         "message": "河北环境设计录取分数线",
         "expect": {
           "type": "score_query",
-          "replyIncludes": ["河北", "环境设计"]
+          "replyIncludes": [
+            "河北",
+            "环境设计"
+          ]
         }
       },
       {
         "message": "视觉传达设计呢？",
         "expect": {
           "type": "score_query",
-          "replyIncludes": ["河北", "视觉传达设计"]
+          "replyIncludes": [
+            "河北",
+            "视觉传达设计"
+          ]
         }
       },
       {
         "message": "美术学师范类呢？",
         "expect": {
           "type": "score_query",
-          "replyIncludes": ["河北", "美术学"]
+          "replyIncludes": [
+            "河北",
+            "美术学"
+          ]
         }
       },
       {
         "message": "这些分数和普通类能直接比较吗？",
         "expect": {
           "type": "knowledge_answer",
-          "replyIncludes": ["普通类", "比较"]
+          "replyIncludes": [
+            "普通类",
+            "比较"
+          ]
         }
       }
     ]
@@ -127,28 +176,54 @@
         "message": "天津思想政治教育师范类录取线",
         "expect": {
           "type": "score_query",
-          "replyIncludes": ["天津", "思想政治教育"]
+          "replyIncludes": [
+            "天津",
+            "思想政治教育"
+          ]
         }
       },
       {
         "message": "学前教育呢？",
         "expect": {
           "type": "score_query",
-          "replyIncludes": ["天津", "学前教育"]
+          "replyIncludes": [
+            "天津",
+            "学前教育"
+          ]
         }
       },
       {
         "message": "540分概率怎么样？",
         "expect": {
           "type": "probability_assessment",
-          "replyIncludes": ["天津", "540", "学前教育"]
+          "replyIncludes": [
+            "天津",
+            "540",
+            "学前教育",
+            "未区分"
+          ],
+          "replyExcludes": [
+            "暂未找到天津历史类",
+            "暂无天津历史类",
+            "缺少该专业在天津的直接录取记录"
+          ]
         }
       },
       {
         "message": "我是天津历史类540分",
         "expect": {
           "type": "probability_assessment",
-          "replyIncludes": ["天津", "540", "学前教育"]
+          "replyIncludes": [
+            "天津",
+            "540",
+            "学前教育",
+            "未区分"
+          ],
+          "replyExcludes": [
+            "暂未找到天津历史类",
+            "暂无天津历史类",
+            "缺少该专业在天津的直接录取记录"
+          ]
         }
       }
     ]
@@ -159,29 +234,43 @@
       {
         "message": "辽宁招生哪些专业？",
         "expect": {
-          "type": "follow_up",
-          "replyIncludes": ["辽宁", "专业"]
+          "type": "province_major_list",
+          "replyIncludes": [
+            "辽宁",
+            "专业"
+          ]
         }
       },
       {
         "message": "物理学师范类分数线",
         "expect": {
           "type": "score_query",
-          "replyIncludes": ["辽宁", "物理学"]
+          "replyIncludes": [
+            "辽宁",
+            "物理学"
+          ]
         }
       },
       {
         "message": "584分录取概率",
         "expect": {
           "type": "probability_assessment",
-          "replyIncludes": ["辽宁", "584", "物理学"]
+          "replyIncludes": [
+            "辽宁",
+            "584",
+            "物理学"
+          ]
         }
       },
       {
         "message": "换成法学呢？",
         "expect": {
           "type": "probability_assessment",
-          "replyIncludes": ["辽宁", "584", "法学"]
+          "replyIncludes": [
+            "辽宁",
+            "584",
+            "法学"
+          ]
         }
       }
     ]
@@ -195,7 +284,9 @@
         "expect": {
           "type": "knowledge_answer",
           "minVectorChunks": 1,
-          "replyIncludes": ["软件工程"]
+          "replyIncludes": [
+            "软件工程"
+          ]
         }
       },
       {
@@ -203,7 +294,10 @@
         "expect": {
           "type": "knowledge_answer",
           "minVectorChunks": 1,
-          "replyIncludes": ["软件工程", "毕业"]
+          "replyIncludes": [
+            "软件工程",
+            "毕业"
+          ]
         }
       },
       {
@@ -211,7 +305,10 @@
         "expect": {
           "type": "knowledge_answer",
           "minVectorChunks": 1,
-          "replyIncludes": ["软件工程", "课程"]
+          "replyIncludes": [
+            "软件工程",
+            "课程"
+          ]
         }
       },
       {
@@ -219,7 +316,10 @@
         "expect": {
           "type": "knowledge_answer",
           "minVectorChunks": 1,
-          "replyIncludes": ["软件工程", "实践"]
+          "replyIncludes": [
+            "软件工程",
+            "实践"
+          ]
         }
       }
     ]
@@ -231,35 +331,46 @@
         "message": "2025招生简章的录取规则说一下",
         "expect": {
           "type": "knowledge_answer",
-          "replyIncludes": ["2025"]
+          "replyIncludes": [
+            "2025"
+          ]
         }
       },
       {
         "message": "艺术类怎么录取？",
         "expect": {
           "type": "knowledge_answer",
-          "replyIncludes": ["艺术类"]
+          "replyIncludes": [
+            "艺术类"
+          ]
         }
       },
       {
         "message": "外语语种有限制吗？",
         "expect": {
           "type": "knowledge_answer",
-          "replyIncludes": ["外语", "英语"]
+          "replyIncludes": [
+            "外语",
+            "英语"
+          ]
         }
       },
       {
         "message": "体检有什么要求？",
         "expect": {
           "type": "knowledge_answer",
-          "replyIncludes": ["体检"]
+          "replyIncludes": [
+            "体检"
+          ]
         }
       },
       {
         "message": "如果我服从调剂会怎样？",
         "expect": {
           "type": "knowledge_answer",
-          "replyIncludes": ["调剂"]
+          "replyIncludes": [
+            "调剂"
+          ]
         }
       }
     ]

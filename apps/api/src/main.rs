@@ -1,10 +1,10 @@
-use admissions_agent::{AdmissionsAgent, chunk_reply_text};
+use admissions_agent::AdmissionsAgent;
 use axum::{
     Json, Router,
     extract::{Path, Query, State},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, HeaderValue, Method, StatusCode},
     response::{
-        IntoResponse,
+        IntoResponse, Response,
         sse::{Event, Sse},
     },
     routing::{get, post},
@@ -13,11 +13,16 @@ use db::Database;
 use domain::{ChatRequest, fail, ok, ok_with_meta};
 use serde_json::json;
 use std::collections::HashMap;
-use std::{convert::Infallible, net::SocketAddr, sync::Arc, time::Duration};
-use tokio::sync::mpsc;
+use std::{
+    convert::Infallible,
+    net::SocketAddr,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+use tokio::sync::{Mutex, Semaphore, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tower_http::{
-    cors::{Any, CorsLayer},
+    cors::{AllowOrigin, Any, CorsLayer},
     limit::RequestBodyLimitLayer,
     timeout::TimeoutLayer,
     trace::TraceLayer,
@@ -28,6 +33,19 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 struct AppState {
     db: Database,
     agent: AdmissionsAgent,
+    chat_semaphore: Arc<Semaphore>,
+    tts_limiter: Arc<TtsTokenLimiter>,
+    tts_http: reqwest::Client,
+}
+
+struct TtsRateBucket {
+    window_started_at: Instant,
+    count: u32,
+}
+
+struct TtsTokenLimiter {
+    limit_per_minute: u32,
+    buckets: Mutex<HashMap<String, TtsRateBucket>>,
 }
 
 #[tokio::main]
@@ -41,6 +59,15 @@ async fn main() -> anyhow::Result<()> {
     let state = Arc::new(AppState {
         agent: AdmissionsAgent::new(db.clone()),
         db,
+        chat_semaphore: Arc::new(Semaphore::new(read_env_usize(
+            "CHAT_MAX_CONCURRENT_REQUESTS",
+            40,
+        ))),
+        tts_limiter: Arc::new(TtsTokenLimiter::new(read_env_u32(
+            "TTS_TOKEN_RATE_LIMIT_PER_MINUTE",
+            20,
+        ))),
+        tts_http: build_tts_http_client(),
     });
     let app = build_router(state);
     let port = std::env::var("PORT")
@@ -90,12 +117,7 @@ fn build_router(state: Arc<AppState>) -> Router {
             Duration::from_secs(90),
         ))
         .layer(RequestBodyLimitLayer::new(1024 * 1024))
-        .layer(
-            CorsLayer::new()
-                .allow_origin(Any)
-                .allow_methods(Any)
-                .allow_headers(Any),
-        )
+        .layer(cors_layer())
         .with_state(state)
 }
 
@@ -115,16 +137,28 @@ async fn chat(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<ChatRequest>,
 ) -> impl IntoResponse {
-    match state.agent.chat(payload).await {
-        Ok(reply) => {
-            let meta = reply
-                .diagnostics
-                .as_ref()
-                .map(|diagnostics| json!({ "diagnostics": diagnostics }))
-                .unwrap_or_else(|| json!({}));
+    let Ok(_permit) = state.chat_semaphore.clone().try_acquire_owned() else {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(fail("CHAT_BUSY", "当前咨询人数较多，请稍后再试。")),
+        )
+            .into_response();
+    };
+
+    match tokio::time::timeout(agent_timeout_duration(), state.agent.chat(payload)).await {
+        Ok(Ok(reply)) => {
+            let meta = if client_diagnostics_enabled() {
+                reply
+                    .diagnostics
+                    .as_ref()
+                    .map(|diagnostics| json!({ "diagnostics": diagnostics }))
+                    .unwrap_or_else(|| json!({}))
+            } else {
+                json!({})
+            };
             (StatusCode::OK, Json(ok_with_meta(reply, meta))).into_response()
         }
-        Err(error) => {
+        Ok(Err(error)) => {
             tracing::error!(error = %error, "chat request failed");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -135,6 +169,11 @@ async fn chat(
             )
                 .into_response()
         }
+        Err(_) => (
+            StatusCode::GATEWAY_TIMEOUT,
+            Json(fail("CHAT_TIMEOUT", "本次查询耗时较长，请稍后重试。")),
+        )
+            .into_response(),
     }
 }
 
@@ -142,13 +181,24 @@ async fn chat_history(
     State(state): State<Arc<AppState>>,
     Path(conversation_id): Path<String>,
 ) -> impl IntoResponse {
-    match state.db.get_conversation_history(&conversation_id).await {
-        Ok(Some(history)) => (StatusCode::OK, Json(ok(history))).into_response(),
-        Ok(None) => (
-            StatusCode::NOT_FOUND,
-            Json(fail("NOT_FOUND", "Conversation not found")),
+    if !is_valid_conversation_id(&conversation_id) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(fail("BAD_REQUEST", "Invalid conversation id")),
         )
-            .into_response(),
+            .into_response();
+    }
+    match state.db.get_conversation_history(&conversation_id).await {
+        Ok(reply) => {
+            let Some(history) = reply else {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(fail("NOT_FOUND", "Conversation not found")),
+                )
+                    .into_response();
+            };
+            (StatusCode::OK, Json(ok(history))).into_response()
+        }
         Err(error) => {
             tracing::error!(error = %error, "failed to load conversation history");
             (
@@ -164,11 +214,20 @@ async fn chat_stream(
     State(state): State<Arc<AppState>>,
     _headers: HeaderMap,
     Json(payload): Json<ChatRequest>,
-) -> impl IntoResponse {
+) -> Response {
+    let Ok(permit) = state.chat_semaphore.clone().try_acquire_owned() else {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(fail("CHAT_BUSY", "当前咨询人数较多，请稍后再试。")),
+        )
+            .into_response();
+    };
+
     let (tx, rx) = mpsc::channel::<Result<Event, Infallible>>(32);
     let agent = state.agent.clone();
 
     tokio::spawn(async move {
+        let _permit = permit;
         let send = |tx: mpsc::Sender<Result<Event, Infallible>>, event: Event| async move {
             tx.send(Ok(event)).await.is_ok()
         };
@@ -180,30 +239,41 @@ async fn chat_stream(
             return;
         }
 
-        match agent.chat(payload).await {
-            Ok(reply) => {
-                if !send(tx.clone(), status_event("generating")).await {
+        let mut generating_sent = false;
+        let stream_future = agent.chat_stream_with_deltas(payload, |conversation_id, delta| {
+            let tx = tx.clone();
+            let should_send_generating = !generating_sent;
+            generating_sent = true;
+            async move {
+                if should_send_generating && !send(tx.clone(), status_event("generating")).await {
+                    return false;
+                }
+                let event = Event::default().event("chunk").data(
+                    json!({
+                        "conversationId": conversation_id,
+                        "delta": delta
+                    })
+                    .to_string(),
+                );
+                send(tx, event).await
+            }
+        });
+
+        match tokio::time::timeout(agent_timeout_duration(), stream_future).await {
+            Ok(Ok(reply)) => {
+                if !generating_sent && !send(tx.clone(), status_event("generating")).await {
                     return;
                 }
 
-                for chunk in chunk_reply_text(&reply.reply) {
-                    let event = Event::default().event("chunk").data(
-                        json!({
-                            "conversationId": reply.conversation_id,
-                            "delta": chunk
-                        })
-                        .to_string(),
-                    );
-                    if !send(tx.clone(), event).await {
-                        return;
-                    }
-                }
-
-                let meta = reply
-                    .diagnostics
-                    .as_ref()
-                    .map(|diagnostics| json!({ "diagnostics": diagnostics }))
-                    .unwrap_or_else(|| json!({}));
+                let meta = if client_diagnostics_enabled() {
+                    reply
+                        .diagnostics
+                        .as_ref()
+                        .map(|diagnostics| json!({ "diagnostics": diagnostics }))
+                        .unwrap_or_else(|| json!({}))
+                } else {
+                    json!({})
+                };
                 let event = Event::default().event("message").data(
                     serde_json::to_string(&ok_with_meta(reply, meta))
                         .unwrap_or_else(|_| "{}".to_owned()),
@@ -212,7 +282,7 @@ async fn chat_stream(
                     return;
                 }
             }
-            Err(error) => {
+            Ok(Err(error)) => {
                 tracing::error!(error = %error, "stream chat request failed");
                 let event = Event::default().event("message").data(
                     serde_json::to_string(&fail(
@@ -220,6 +290,16 @@ async fn chat_stream(
                         "当前咨询人数较多，暂时无法完成本次查询，请稍后再试。",
                     ))
                     .unwrap_or_else(|_| "{}".to_owned()),
+                );
+                if !send(tx.clone(), event).await {
+                    return;
+                }
+            }
+            Err(_) => {
+                tracing::warn!("stream chat request timed out");
+                let event = Event::default().event("message").data(
+                    serde_json::to_string(&fail("CHAT_TIMEOUT", "本次查询耗时较长，请稍后重试。"))
+                        .unwrap_or_else(|_| "{}".to_owned()),
                 );
                 if !send(tx.clone(), event).await {
                     return;
@@ -236,7 +316,9 @@ async fn chat_stream(
         .await;
     });
 
-    Sse::new(ReceiverStream::new(rx)).keep_alive(axum::response::sse::KeepAlive::default())
+    Sse::new(ReceiverStream::new(rx))
+        .keep_alive(axum::response::sse::KeepAlive::default())
+        .into_response()
 }
 
 fn status_event(status: &'static str) -> Event {
@@ -422,7 +504,26 @@ async fn knowledge_policies(
     }
 }
 
-async fn tts_token() -> impl IntoResponse {
+async fn tts_token(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl IntoResponse {
+    if !tts_auth_allowed(&headers) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(fail("UNAUTHORIZED", "TTS token access is not authorized")),
+        )
+            .into_response();
+    }
+    let rate_key = client_rate_key(&headers);
+    if !state.tts_limiter.allow(&rate_key).await {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(fail(
+                "TTS_RATE_LIMITED",
+                "语音服务请求过于频繁，请稍后再试。",
+            )),
+        )
+            .into_response();
+    }
+
     let api_key = match std::env::var("DASHSCOPE_API_KEY") {
         Ok(value) if !value.trim().is_empty() => value,
         _ => {
@@ -437,7 +538,8 @@ async fn tts_token() -> impl IntoResponse {
         }
     };
 
-    let response = match reqwest::Client::new()
+    let response = match state
+        .tts_http
         .post("https://dashscope.aliyuncs.com/api/v1/tokens")
         .bearer_auth(api_key)
         .header(reqwest::header::CONTENT_TYPE, "application/json")
@@ -460,8 +562,12 @@ async fn tts_token() -> impl IntoResponse {
 
     if !response.status().is_success() {
         let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        tracing::error!(%status, body = %body, "DashScope TTS token API returned an error");
+        let body_len = response
+            .text()
+            .await
+            .map(|body| body.len())
+            .unwrap_or_default();
+        tracing::error!(%status, body_len, "DashScope TTS token API returned an error");
         return (
             StatusCode::BAD_GATEWAY,
             Json(fail(
@@ -502,7 +608,7 @@ async fn tts_token() -> impl IntoResponse {
             (StatusCode::OK, Json(ok(json!({ "token": token })))).into_response()
         }
         _ => {
-            tracing::error!(response = %payload, "DashScope returned empty TTS token");
+            tracing::error!("DashScope returned empty TTS token");
             (
                 StatusCode::BAD_GATEWAY,
                 Json(fail("TTS_TOKEN_ERROR", "DashScope returned empty token")),
@@ -510,4 +616,183 @@ async fn tts_token() -> impl IntoResponse {
                 .into_response()
         }
     }
+}
+
+impl TtsTokenLimiter {
+    fn new(limit_per_minute: u32) -> Self {
+        Self {
+            limit_per_minute: limit_per_minute.max(1),
+            buckets: Mutex::new(HashMap::new()),
+        }
+    }
+
+    async fn allow(&self, key: &str) -> bool {
+        let now = Instant::now();
+        let mut buckets = self.buckets.lock().await;
+        if buckets.len() > 4096 {
+            buckets.retain(|_, bucket| {
+                now.duration_since(bucket.window_started_at) < Duration::from_secs(60)
+            });
+        }
+
+        let bucket = buckets
+            .entry(key.to_owned())
+            .or_insert_with(|| TtsRateBucket {
+                window_started_at: now,
+                count: 0,
+            });
+        if now.duration_since(bucket.window_started_at) >= Duration::from_secs(60) {
+            bucket.window_started_at = now;
+            bucket.count = 0;
+        }
+        if bucket.count >= self.limit_per_minute {
+            return false;
+        }
+        bucket.count += 1;
+        true
+    }
+}
+
+fn cors_layer() -> CorsLayer {
+    let origins = read_allowed_origins();
+    let layer = CorsLayer::new()
+        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+        .allow_headers(Any);
+
+    if origins.is_empty() && !is_production() {
+        layer.allow_origin(Any)
+    } else {
+        layer.allow_origin(AllowOrigin::list(origins))
+    }
+}
+
+fn read_allowed_origins() -> Vec<HeaderValue> {
+    std::env::var("CORS_ALLOWED_ORIGINS")
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|origin| {
+            let origin = origin.trim();
+            if origin.is_empty() {
+                None
+            } else {
+                origin.parse::<HeaderValue>().ok()
+            }
+        })
+        .collect()
+}
+
+fn build_tts_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(read_env_u64(
+            "TTS_CONNECT_TIMEOUT_SECS",
+            5,
+        )))
+        .timeout(Duration::from_secs(read_env_u64(
+            "TTS_REQUEST_TIMEOUT_SECS",
+            15,
+        )))
+        .pool_idle_timeout(Duration::from_secs(read_env_u64(
+            "TTS_POOL_IDLE_TIMEOUT_SECS",
+            30,
+        )))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
+fn tts_auth_allowed(headers: &HeaderMap) -> bool {
+    let Some(expected) = std::env::var("TTS_TOKEN_AUTH_TOKEN")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return true;
+    };
+    let expected = expected.trim();
+
+    let bearer = headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::trim);
+    let header_token = headers
+        .get("x-tts-auth-token")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim);
+
+    bearer == Some(expected) || header_token == Some(expected)
+}
+
+fn client_rate_key(headers: &HeaderMap) -> String {
+    for header in ["x-forwarded-for", "x-real-ip"] {
+        if let Some(value) = headers.get(header).and_then(|value| value.to_str().ok()) {
+            if let Some(first) = value
+                .split(',')
+                .next()
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+            {
+                return first.chars().take(80).collect();
+            }
+        }
+    }
+    "unknown-client".to_owned()
+}
+
+fn client_diagnostics_enabled() -> bool {
+    if let Some(value) = read_env_bool("ENABLE_CLIENT_DIAGNOSTICS") {
+        return value;
+    }
+    !is_production()
+}
+
+fn is_production() -> bool {
+    ["APP_ENV", "RUST_ENV", "NODE_ENV"]
+        .iter()
+        .any(|key| std::env::var(key).is_ok_and(|value| value.eq_ignore_ascii_case("production")))
+}
+
+fn agent_timeout_duration() -> Duration {
+    Duration::from_secs(read_env_u64("AGENT_TIMEOUT_SECS", 75))
+}
+
+fn read_env_bool(key: &str) -> Option<bool> {
+    std::env::var(key).ok().and_then(|value| {
+        let normalized = value.trim().to_ascii_lowercase();
+        match normalized.as_str() {
+            "true" | "1" | "yes" | "on" => Some(true),
+            "false" | "0" | "no" | "off" => Some(false),
+            _ => None,
+        }
+    })
+}
+
+fn read_env_usize(key: &str, default: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+fn read_env_u32(key: &str, default: u32) -> u32 {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+fn read_env_u64(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+fn is_valid_conversation_id(value: &str) -> bool {
+    let len = value.chars().count();
+    (8..=96).contains(&len)
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
 }

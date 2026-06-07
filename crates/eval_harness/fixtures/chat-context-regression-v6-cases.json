@@ -1,0 +1,242 @@
+[
+  {
+    "name": "g1-hebei-geography-score-comparison-and-probability",
+    "requiresLiveProvider": true,
+    "turns": [
+      {
+        "message": "我是河北本科批考生，想看地理科学（师范类）近三年最低分和最低位次。",
+        "expect": {
+          "type": "score_query",
+          "minToolCalls": 1,
+          "replyIncludes": ["河北", "地理科学"]
+        }
+      },
+      {
+        "message": "那它和地理信息科学相比，最近三年哪个分数更高一点？",
+        "expect": {
+          "type": "evidence_bundle",
+          "minToolCalls": 1,
+          "replyIncludes": ["地理科学", "地理信息科学"]
+        }
+      },
+      {
+        "message": "如果我今年560分，想报地理科学（师范类），你建议我怎么判断风险？",
+        "expect": {
+          "type": "probability_assessment",
+          "minToolCalls": 1,
+          "replyIncludes": ["560", "地理科学"]
+        }
+      },
+      {
+        "message": "顺便问一下，学校在河北还招汉语言文学（师范类）吗？最近一年最低分多少？",
+        "expect": {
+          "type": "score_query",
+          "minToolCalls": 1,
+          "replyIncludes": ["河北", "汉语言文学"]
+        }
+      }
+    ]
+  },
+  {
+    "name": "g2-brochure-admission-rules-and-contact",
+    "requiresLiveProvider": true,
+    "turns": [
+      {
+        "message": "服从调剂以后还会被退档吗？",
+        "expect": {
+          "type": "knowledge_answer",
+          "minToolCalls": 1,
+          "minVectorChunks": 1,
+          "replyIncludes": ["调剂", "退档"]
+        }
+      },
+      {
+        "message": "普通类专业录取是分数优先还是专业优先？有专业级差吗？",
+        "expect": {
+          "type": "knowledge_answer",
+          "minToolCalls": 1,
+          "minVectorChunks": 1,
+          "replyIncludes": ["普通类", "级差"]
+        }
+      },
+      {
+        "message": "如果两个考生投档成绩一样，学校会优先录取谁？",
+        "expect": {
+          "type": "knowledge_answer",
+          "minToolCalls": 1,
+          "minVectorChunks": 1,
+          "replyIncludes": ["同分"]
+        }
+      },
+      {
+        "message": "学校今年提档比例大概多少？招生咨询电话是多少？",
+        "expect": {
+          "type": "knowledge_answer",
+          "minToolCalls": 1,
+          "minVectorChunks": 1,
+          "replyIncludes": ["提档", "0451"]
+        }
+      }
+    ]
+  },
+  {
+    "name": "g3-music-training-plan-and-campus-life",
+    "requiresLiveProvider": true,
+    "turns": [
+      {
+        "message": "音乐学院音乐学（师范）培养方案里有哪些核心课程？",
+        "expect": {
+          "type": "knowledge_answer",
+          "minToolCalls": 1,
+          "minVectorChunks": 1,
+          "replyIncludes": ["音乐学", "课程"]
+        }
+      },
+      {
+        "message": "音乐学（师范）的实践环节有哪些？教育实习一般多久？",
+        "expect": {
+          "type": "knowledge_answer",
+          "minToolCalls": 1,
+          "minVectorChunks": 1,
+          "replyIncludes": ["音乐学", "教育实习"]
+        }
+      },
+      {
+        "message": "音乐学院新生在哪个校区？宿舍晚上供电到几点？",
+        "expect": {
+          "type": "knowledge_answer",
+          "minModelCalls": 1,
+          "replyIncludes": ["音乐学院"]
+        }
+      },
+      {
+        "message": "学校有几个食堂？江南校区有什么餐厅？",
+        "expect": {
+          "type": "knowledge_answer",
+          "minModelCalls": 1,
+          "replyIncludes": ["食堂"]
+        }
+      }
+    ]
+  },
+  {
+    "name": "g4-shanxi-computer-score-and-variant-training-plan",
+    "requiresLiveProvider": true,
+    "turns": [
+      {
+        "message": "山西2025年计算机科学与技术和软件工程的录取情况怎么样？",
+        "expect": {
+          "type": "score_query",
+          "minToolCalls": 1,
+          "replyIncludes": ["山西", "计算机科学与技术", "软件工程"]
+        }
+      },
+      {
+        "message": "那物联网工程、数字媒体技术在山西2025年有招生吗？最低分分别是多少？",
+        "expect": {
+          "type": "score_query",
+          "minToolCalls": 1,
+          "replyIncludes": ["山西", "物联网工程", "数字媒体技术"]
+        }
+      },
+      {
+        "message": "计算机科学与技术（师范）培养方案里有没有数据结构、数据库系统原理、Web项目综合实践、机器人教育实践这些课？",
+        "expect": {
+          "type": "knowledge_answer",
+          "minToolCalls": 1,
+          "minVectorChunks": 1,
+          "replyIncludes": ["计算机科学与技术", "数据结构", "机器人教育实践"]
+        }
+      },
+      {
+        "message": "这个专业授予什么学位？实践教学占比大概高不高？",
+        "expect": {
+          "type": "knowledge_answer",
+          "minToolCalls": 1,
+          "minVectorChunks": 1,
+          "replyIncludes": ["计算机科学与技术", "学位", "实践"]
+        }
+      }
+    ]
+  },
+  {
+    "name": "g5-hebei-biology-score-training-plan-and-life-chat",
+    "requiresLiveProvider": true,
+    "turns": [
+      {
+        "message": "河北本科批生物科学（师范类）近五年最低分和最低位次能帮我列一下吗？",
+        "expect": {
+          "type": "score_query",
+          "minToolCalls": 1,
+          "replyIncludes": ["河北", "生物科学"]
+        }
+      },
+      {
+        "message": "生物科学专业主要学哪些核心课程？实践环节有哪些？",
+        "expect": {
+          "type": "knowledge_answer",
+          "minToolCalls": 1,
+          "minVectorChunks": 1,
+          "replyIncludes": ["生物科学", "实践"]
+        }
+      },
+      {
+        "message": "如果我喜欢做实验，也想以后当生物老师，这个专业的培养目标适合吗？",
+        "expect": {
+          "type": "knowledge_answer",
+          "minToolCalls": 1,
+          "minVectorChunks": 1,
+          "replyIncludes": ["生物科学", "培养目标"]
+        }
+      },
+      {
+        "message": "闲聊一下，冬天去哈师大读书会不会很冷？食堂和图书馆怎么样？",
+        "expect": {
+          "type": "knowledge_answer",
+          "minModelCalls": 1,
+          "replyIncludes": ["冬天", "食堂"]
+        }
+      }
+    ]
+  },
+  {
+    "name": "g6-chinese-training-plan-score-and-new-student",
+    "requiresLiveProvider": true,
+    "turns": [
+      {
+        "message": "汉语言文学专业核心课程有哪些？有没有“修辞分析与AI实践”这种课？",
+        "expect": {
+          "type": "knowledge_answer",
+          "minToolCalls": 1,
+          "minVectorChunks": 1,
+          "replyIncludes": ["汉语言文学", "修辞分析"]
+        }
+      },
+      {
+        "message": "汉语言文学毕业条件是什么？专业核心课绩点要求多少？毕业论文能不能用成果置换？",
+        "expect": {
+          "type": "knowledge_answer",
+          "minToolCalls": 1,
+          "minVectorChunks": 1,
+          "replyIncludes": ["汉语言文学", "毕业"]
+        }
+      },
+      {
+        "message": "我是河北本科批500分，想报汉语言文学（师范类），结合近三年分数看有希望吗？",
+        "expect": {
+          "type": "probability_assessment",
+          "minToolCalls": 1,
+          "replyIncludes": ["河北", "500", "汉语言文学"]
+        }
+      },
+      {
+        "message": "入学前需要自己选课吗？军训大概多久？新生可以带电脑吗？",
+        "expect": {
+          "type": "knowledge_answer",
+          "minModelCalls": 1,
+          "replyIncludes": ["选课", "军训", "电脑"]
+        }
+      }
+    ]
+  }
+]

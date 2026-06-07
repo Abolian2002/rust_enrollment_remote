@@ -7,6 +7,7 @@ use domain::{
 };
 use serde_json::Value;
 use sqlx::{PgPool, Row, postgres::PgPoolOptions};
+use std::time::Duration;
 
 #[derive(Clone)]
 pub struct Database {
@@ -25,6 +26,7 @@ pub struct MajorRecord {
     pub name: String,
     pub code: Option<String>,
     pub is_normal_major: bool,
+    pub latest_score: Option<LatestScore>,
 }
 
 #[derive(Debug, Clone)]
@@ -44,8 +46,14 @@ pub struct KnowledgeSearchFilters {
 
 impl Database {
     pub fn connect_lazy(database_url: &str) -> Result<Self> {
+        let max_connections = read_env_u32("DATABASE_MAX_CONNECTIONS", 24);
+        let min_connections = read_env_u32("DATABASE_MIN_CONNECTIONS", 1).min(max_connections);
+        let acquire_timeout_secs = read_env_u64("DATABASE_ACQUIRE_TIMEOUT_SECS", 5);
+
         let pool = PgPoolOptions::new()
-            .max_connections(12)
+            .max_connections(max_connections)
+            .min_connections(min_connections)
+            .acquire_timeout(Duration::from_secs(acquire_timeout_secs))
             .connect_lazy(database_url)
             .context("failed to create lazy postgres pool")?;
         Ok(Self { pool })
@@ -102,6 +110,58 @@ impl Database {
                 name: row.get("name"),
                 code: row.try_get("code").ok(),
                 is_normal_major: row.get("is_normal_major"),
+                latest_score: None,
+            })
+            .collect())
+    }
+
+    pub async fn list_major_catalog_with_latest_scores(&self) -> Result<Vec<MajorRecord>> {
+        let rows = sqlx::query(
+            r#"
+            WITH latest_scores AS (
+              SELECT DISTINCT ON (m.slug)
+                m.slug,
+                s.year AS latest_year,
+                s.min_score AS latest_min_score
+              FROM admission_scores s
+              JOIN majors m ON m.id = s.major_id
+              WHERE s.batch NOT ILIKE '%专升本%'
+                AND s.batch NOT ILIKE '%单招%'
+                AND s.batch NOT ILIKE '%预科%'
+              ORDER BY m.slug, s.year DESC, s.min_score ASC
+            )
+            SELECT
+              m.slug,
+              m.name,
+              m.code,
+              m.is_normal_major,
+              ls.latest_year,
+              ls.latest_min_score
+            FROM majors m
+            LEFT JOIN latest_scores ls ON ls.slug = m.slug
+            ORDER BY m.name
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                let latest_year = row.try_get::<Option<i32>, _>("latest_year").ok().flatten();
+                let latest_min_score = row
+                    .try_get::<Option<i32>, _>("latest_min_score")
+                    .ok()
+                    .flatten();
+                MajorRecord {
+                    slug: row.get("slug"),
+                    name: row.get("name"),
+                    code: row.try_get("code").ok(),
+                    is_normal_major: row.get("is_normal_major"),
+                    latest_score: latest_year
+                        .zip(latest_min_score)
+                        .map(|(year, min_score)| LatestScore { year, min_score }),
+                }
             })
             .collect())
     }
@@ -113,6 +173,9 @@ impl Database {
             FROM admission_scores s
             JOIN majors m ON m.id = s.major_id
             WHERE m.slug = $1
+              AND s.batch NOT ILIKE '%专升本%'
+              AND s.batch NOT ILIKE '%单招%'
+              AND s.batch NOT ILIKE '%预科%'
             ORDER BY s.year DESC, s.min_score ASC
             LIMIT 1
             "#,
@@ -145,9 +208,12 @@ impl Database {
             JOIN majors m ON m.id = s.major_id
             JOIN provinces p ON p.id = s.province_id
             WHERE (p.code = $1 OR p.name = $1)
-              AND m.slug = $2
+              AND (m.slug = $2 OR m.name = $2)
               AND ($3::text IS NULL OR s.subject_type = $3 OR s.subject_type = '未区分')
               AND ($4::int IS NULL OR s.year = $4)
+              AND s.batch NOT ILIKE '%专升本%'
+              AND s.batch NOT ILIKE '%单招%'
+              AND s.batch NOT ILIKE '%预科%'
             ORDER BY s.year DESC, s.batch, s.subject_type, s.min_score
             LIMIT 200
             "#,
@@ -201,6 +267,9 @@ impl Database {
                 WHERE (p.code = $1 OR p.name = $1)
                   AND ($2::text IS NULL OR s.subject_type = $2 OR s.subject_type = '未区分')
                   AND s.year = $3
+                  AND s.batch NOT ILIKE '%专升本%'
+                  AND s.batch NOT ILIKE '%单招%'
+                  AND s.batch NOT ILIKE '%预科%'
                 ORDER BY m.name, s.subject_type, s.batch, s.min_score
                 LIMIT $4
                 "#,
@@ -240,6 +309,9 @@ impl Database {
               FROM admission_major_province_coverage
               WHERE (province_code = $1 OR province_name = $1)
                 AND ($2::text IS NULL OR subject_type = $2 OR subject_type = '未区分')
+                AND batch NOT ILIKE '%专升本%'
+                AND batch NOT ILIKE '%单招%'
+                AND batch NOT ILIKE '%预科%'
             ),
             target_year AS (
               SELECT MAX(year) AS year FROM filtered
@@ -296,6 +368,9 @@ impl Database {
                 WHERE m.slug = $1
                   AND ($2::text IS NULL OR s.subject_type = $2 OR s.subject_type = '未区分')
                   AND s.year = $3
+                  AND s.batch NOT ILIKE '%专升本%'
+                  AND s.batch NOT ILIKE '%单招%'
+                  AND s.batch NOT ILIKE '%预科%'
                 ORDER BY p.name, s.subject_type, s.batch, s.min_score
                 LIMIT $4
                 "#,
@@ -335,6 +410,9 @@ impl Database {
               FROM admission_major_province_coverage
               WHERE major_slug = $1
                 AND ($2::text IS NULL OR subject_type = $2 OR subject_type = '未区分')
+                AND batch NOT ILIKE '%专升本%'
+                AND batch NOT ILIKE '%单招%'
+                AND batch NOT ILIKE '%预科%'
             ),
             target_year AS (
               SELECT MAX(year) AS year FROM filtered
@@ -637,6 +715,62 @@ impl Database {
             .collect())
     }
 
+    pub async fn search_training_plan_chunks_by_major(
+        &self,
+        major_name: &str,
+        topic_keyword: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<VectorChunkEvidence>> {
+        let major_pattern = format!("%{}%", major_name.trim());
+        let topic_pattern = topic_keyword.map(|keyword| format!("%{}%", keyword.trim()));
+        let rows = sqlx::query(
+            r#"
+            SELECT kc.id, kc.title, kc.content, kc.metadata, pd.category, pd.year
+            FROM knowledge_chunks kc
+            LEFT JOIN policy_documents pd ON pd.id = kc.policy_document_id
+            WHERE kc.data_version = 'official-pdf-knowledge-v2'
+              AND kc.metadata->>'documentKind' = 'training_plan'
+              AND kc.metadata->>'majorName' ILIKE $1
+            ORDER BY
+              CASE
+                WHEN $2::text IS NOT NULL AND kc.content ILIKE $2 THEN 0
+                WHEN $2::text IS NOT NULL AND kc.title ILIKE $2 THEN 1
+                ELSE 2
+              END,
+              CASE kc.metadata->>'sectionType'
+                WHEN 'training_objectives' THEN 0
+                WHEN 'graduation_conditions' THEN 1
+                WHEN 'credit_structure' THEN 2
+                WHEN 'teaching_plan' THEN 3
+                WHEN 'practice_teaching' THEN 4
+                WHEN 'semester_weeks' THEN 5
+                ELSE 9
+              END,
+              COALESCE((kc.metadata->>'sequence')::int, 999999),
+              length(kc.content) DESC
+            LIMIT $3
+            "#,
+        )
+        .bind(major_pattern)
+        .bind(topic_pattern.as_deref())
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| VectorChunkEvidence {
+                id: row.get("id"),
+                title: row.try_get("title").ok(),
+                content: row.get("content"),
+                category: row.try_get("category").ok(),
+                year: row.try_get("year").ok(),
+                similarity: Some(0.95),
+                metadata: row.try_get("metadata").unwrap_or(Value::Null),
+            })
+            .collect())
+    }
+
     pub async fn list_college_training_plan_majors(
         &self,
         college_name: &str,
@@ -702,6 +836,24 @@ impl Database {
         &self,
         conversation_id: &str,
     ) -> Result<Option<ConversationHistory>> {
+        self.get_conversation_history_with_limit(conversation_id, None)
+            .await
+    }
+
+    pub async fn get_conversation_recent_history(
+        &self,
+        conversation_id: &str,
+        limit: i64,
+    ) -> Result<Option<ConversationHistory>> {
+        self.get_conversation_history_with_limit(conversation_id, Some(limit.max(1)))
+            .await
+    }
+
+    async fn get_conversation_history_with_limit(
+        &self,
+        conversation_id: &str,
+        limit: Option<i64>,
+    ) -> Result<Option<ConversationHistory>> {
         let conversation = sqlx::query(
             r#"
             SELECT id, session_key
@@ -719,17 +871,37 @@ impl Database {
         };
 
         let id: String = conversation.get("id");
-        let rows = sqlx::query(
-            r#"
-            SELECT role, content, structured_payload, citations, created_at
-            FROM conversation_messages
-            WHERE conversation_id = $1
-            ORDER BY created_at ASC
-            "#,
-        )
-        .bind(&id)
-        .fetch_all(&self.pool)
-        .await?;
+        let rows = if let Some(limit) = limit {
+            sqlx::query(
+                r#"
+                SELECT role, content, structured_payload, citations, created_at
+                FROM (
+                  SELECT role, content, structured_payload, citations, created_at
+                  FROM conversation_messages
+                  WHERE conversation_id = $1
+                  ORDER BY created_at DESC
+                  LIMIT $2
+                ) recent_messages
+                ORDER BY created_at ASC
+                "#,
+            )
+            .bind(&id)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query(
+                r#"
+                SELECT role, content, structured_payload, citations, created_at
+                FROM conversation_messages
+                WHERE conversation_id = $1
+                ORDER BY created_at ASC
+                "#,
+            )
+            .bind(&id)
+            .fetch_all(&self.pool)
+            .await?
+        };
 
         let messages = rows
             .into_iter()
@@ -788,6 +960,22 @@ impl Database {
 
         Ok(())
     }
+}
+
+fn read_env_u32(key: &str, default: u32) -> u32 {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+fn read_env_u64(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
 }
 
 fn pgvector_literal(values: &[f32]) -> String {

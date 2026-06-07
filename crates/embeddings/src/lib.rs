@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 
 #[derive(Debug, Clone)]
 pub struct EmbeddingClient {
@@ -28,7 +29,21 @@ struct EmbeddingData {
 impl EmbeddingClient {
     pub fn new(base_url: impl Into<String>, model: impl Into<String>) -> Self {
         Self {
-            http: Client::new(),
+            http: Client::builder()
+                .connect_timeout(Duration::from_secs(read_env_u64(
+                    "EMBEDDING_CONNECT_TIMEOUT_SECS",
+                    5,
+                )))
+                .timeout(Duration::from_secs(read_env_u64(
+                    "EMBEDDING_REQUEST_TIMEOUT_SECS",
+                    15,
+                )))
+                .pool_idle_timeout(Duration::from_secs(read_env_u64(
+                    "EMBEDDING_POOL_IDLE_TIMEOUT_SECS",
+                    30,
+                )))
+                .build()
+                .unwrap_or_else(|_| Client::new()),
             base_url: base_url.into(),
             model: model.into(),
         }
@@ -66,4 +81,12 @@ impl EmbeddingClient {
             .map(|item| item.embedding)
             .context("embedding response did not include vectors")
     }
+}
+
+fn read_env_u64(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
 }

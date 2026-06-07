@@ -3,6 +3,7 @@
 import { cn } from "@/lib/cn";
 
 import type { ChatMessage } from "@/components/use-chat-session";
+import { FormattedMessage } from "@/components/formatted-message";
 
 export type ChatTranscriptProps = {
   loading: boolean;
@@ -45,13 +46,13 @@ export function ChatTranscript({ loading, messages, streamReply, streamStatus }:
                 </div>
                 <div className="rounded-[26px] rounded-tl-md border border-white/80 bg-white px-5 py-4 shadow-[0_18px_60px_rgba(15,23,42,0.06)]">
                   <p className="mb-2 text-[11px] font-semibold uppercase tracking-[0.2em] text-school-600">智能招生顾问</p>
-                  <p className="whitespace-pre-wrap text-[15px] leading-8 text-ink-800">{message.content}</p>
+                  <FormattedMessage className="text-[15px] leading-8 text-ink-800" text={message.content} />
                 </div>
               </div>
             ) : (
               <div className="max-w-[92%] rounded-[26px] rounded-tr-md bg-ink-900 px-5 py-4 text-white shadow-[0_18px_60px_rgba(15,23,42,0.12)] sm:max-w-[82%]">
                 <p className="mb-2 text-[11px] font-semibold uppercase tracking-[0.2em] text-white/60">我的问题</p>
-                <p className="whitespace-pre-wrap text-[15px] leading-8">{message.content}</p>
+                <FormattedMessage className="text-[15px] leading-8" text={message.content} />
               </div>
             )}
           </div>
@@ -70,7 +71,7 @@ export function ChatTranscript({ loading, messages, streamReply, streamStatus }:
               <p className="mb-2 text-[11px] font-semibold uppercase tracking-[0.2em] text-school-600">智能招生顾问</p>
               <p className="text-sm font-medium text-ink-500">{getStreamStatusText(streamStatus)}</p>
               {streamReply ? (
-                <p className="mt-3 whitespace-pre-wrap text-[15px] leading-8 text-ink-800">{streamReply}</p>
+                <FormattedMessage className="mt-3 text-[15px] leading-8 text-ink-800" text={streamReply} />
               ) : null}
             </div>
           </div>

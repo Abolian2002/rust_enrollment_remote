@@ -9,6 +9,7 @@ anyhow = { workspace = true }
 async-trait = { workspace = true }
 db = { workspace = true }
 domain = { workspace = true }
+futures = { workspace = true }
 llm = { workspace = true }
 probability = { workspace = true }
 retrieval = { workspace = true }

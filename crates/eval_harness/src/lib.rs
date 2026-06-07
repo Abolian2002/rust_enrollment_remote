@@ -30,6 +30,8 @@ pub struct RegressionExpectation {
     pub missing_fields: Vec<String>,
     #[serde(default, rename = "replyIncludes")]
     pub reply_includes: Vec<String>,
+    #[serde(default, rename = "replyExcludes")]
+    pub reply_excludes: Vec<String>,
     #[serde(default, rename = "minVectorChunks")]
     pub min_vector_chunks: Option<usize>,
     #[serde(default, rename = "minModelCalls")]
@@ -133,7 +135,15 @@ pub async fn run_case(
             .expect
             .reply_includes
             .iter()
-            .all(|expected| reply.contains(expected));
+            .all(|expected| reply.contains(expected))
+            && turn
+                .expect
+                .reply_excludes
+                .iter()
+                .all(|forbidden| !reply.contains(forbidden))
+            && default_reply_excludes()
+                .iter()
+                .all(|forbidden| !reply.contains(forbidden));
         let missing_fields = structured
             .get("missingFields")
             .and_then(Value::as_array)
@@ -234,6 +244,24 @@ fn pass_fail(passed: bool) -> String {
     if passed { "passed" } else { "failed" }.to_owned()
 }
 
+fn default_reply_excludes() -> &'static [&'static str] {
+    &[
+        "0451-88060176",
+        "0451–88060176",
+        "0451-88060177",
+        "0451–88060177",
+        "文化课×40%",
+        "文化课 x 40%",
+        "文化课*40%",
+        "文化课成绩×40%",
+        "文化课成绩*40%",
+        "专业课×60%",
+        "专业课*60%",
+        "专业课成绩×60%",
+        "专业课成绩*60%",
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -250,5 +278,12 @@ mod tests {
         let cases = load_fixture("fixtures/chat-context-regression-v5-cases.json").unwrap();
         assert_eq!(cases.len(), 5);
         assert_eq!(cases.iter().map(|case| case.turns.len()).sum::<usize>(), 20);
+    }
+
+    #[test]
+    fn loads_v6_fixture() {
+        let cases = load_fixture("fixtures/chat-context-regression-v6-cases.json").unwrap();
+        assert_eq!(cases.len(), 6);
+        assert_eq!(cases.iter().map(|case| case.turns.len()).sum::<usize>(), 24);
     }
 }

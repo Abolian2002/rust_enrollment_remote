@@ -5,6 +5,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { useChatSession } from "@/components/use-chat-session";
 import { useVoicePlayback } from "@/components/digital-human/use-voice-playback";
+import { FormattedMessage } from "@/components/formatted-message";
 import { cn } from "@/lib/cn";
 
 const hotCategories = [
@@ -916,7 +917,11 @@ function ChatBubble({ children, role }: { children: ReactNode; role: "user" | "a
             : "max-w-[min(680px,calc(100%-56px))] rounded-tl-none border-slate-200/60 bg-white text-slate-800"
         )}
       >
-        <p className="whitespace-pre-wrap font-sans tracking-wide">{children}</p>
+        {typeof children === "string" ? (
+          <FormattedMessage className="font-sans tracking-wide" text={children} />
+        ) : (
+          <p className="whitespace-pre-wrap font-sans tracking-wide">{children}</p>
+        )}
       </div>
       {isUser ? (
         <div className="mt-1 h-10 w-10 shrink-0 overflow-hidden rounded-full border-2 border-white bg-gradient-to-br from-[#ce3459] to-[#b02244] shadow-md flex items-center justify-center text-white text-[10px] font-bold">
@@ -934,7 +939,7 @@ function RichAnswerBubble({ message }: { message: Extract<LocalRichMessage, { ro
         <img src="/coze-replica/muyang-listen.gif" alt="沐阳头像" className="h-full w-full object-cover object-top" />
       </div>
       <div className="max-w-[min(720px,calc(100%-56px))] rounded-2xl rounded-tl-none border border-slate-200/60 bg-white p-5 shadow-sm text-left">
-        <p className="whitespace-pre-wrap text-sm leading-8 font-medium text-slate-800">{message.content}</p>
+        <FormattedMessage className="text-sm leading-8 font-medium text-slate-800" text={message.content} />
 
         {message.video ? (
           <div className="mt-4 overflow-hidden rounded-2xl border border-slate-200 bg-slate-950 shadow-md hover-zoom relative group">

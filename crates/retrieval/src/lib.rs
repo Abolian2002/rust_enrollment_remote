@@ -3,12 +3,15 @@ use db::{
     CollegeMajorRecord, Database, KnowledgeSearchFilters, MajorRecord, summarize_score_records,
 };
 use domain::{
-    ChatCitation, ChatIntent, ChatStructuredResult, FaqEvidence, MajorCandidate, PolicyEvidence,
-    VectorChunkEvidence,
+    AdmissionScoreRecord, ChatCitation, ChatIntent, ChatStructuredResult, FaqEvidence,
+    MajorCandidate, PolicyEvidence, VectorChunkEvidence,
 };
 use embeddings::EmbeddingClient;
 use serde_json::json;
 use std::cmp::Ordering;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::sync::RwLock;
 
 const DEFAULT_FAQ_MIN_SIMILARITY: f64 = 0.66;
 
@@ -32,6 +35,13 @@ pub struct RouteDecision {
 pub struct RetrievalService {
     db: Database,
     embeddings: EmbeddingClient,
+    major_catalog_cache: Arc<RwLock<MajorCatalogCache>>,
+}
+
+#[derive(Debug, Default)]
+struct MajorCatalogCache {
+    loaded_at: Option<Instant>,
+    majors: Vec<MajorRecord>,
 }
 
 impl RetrievalService {
@@ -39,6 +49,7 @@ impl RetrievalService {
         Self {
             db,
             embeddings: EmbeddingClient::from_env(),
+            major_catalog_cache: Arc::new(RwLock::new(MajorCatalogCache::default())),
         }
     }
 
@@ -51,7 +62,7 @@ impl RetrievalService {
         query: &str,
         limit: usize,
     ) -> Result<Vec<MajorCandidate>> {
-        let majors = self.db.list_major_catalog().await?;
+        let majors = self.major_catalog_snapshot().await?;
         let mut scored = majors
             .into_iter()
             .map(|major| {
@@ -86,18 +97,12 @@ impl RetrievalService {
                 continue;
             }
 
-            let latest_score = self
-                .db
-                .latest_score_for_major(&major.slug)
-                .await
-                .ok()
-                .flatten();
             results.push(MajorCandidate {
                 slug: major.slug,
                 name: major.name,
                 code: major.code,
                 is_normal_major: major.is_normal_major,
-                latest_score,
+                latest_score: major.latest_score,
             });
             if results.len() >= limit {
                 break;
@@ -105,6 +110,32 @@ impl RetrievalService {
         }
 
         Ok(results)
+    }
+
+    async fn major_catalog_snapshot(&self) -> Result<Vec<MajorRecord>> {
+        let ttl = major_catalog_cache_ttl();
+        {
+            let cache = self.major_catalog_cache.read().await;
+            if cache
+                .loaded_at
+                .is_some_and(|loaded_at| loaded_at.elapsed() < ttl)
+            {
+                return Ok(cache.majors.clone());
+            }
+        }
+
+        let mut cache = self.major_catalog_cache.write().await;
+        if cache
+            .loaded_at
+            .is_some_and(|loaded_at| loaded_at.elapsed() < ttl)
+        {
+            return Ok(cache.majors.clone());
+        }
+
+        let majors = self.db.list_major_catalog_with_latest_scores().await?;
+        cache.loaded_at = Some(Instant::now());
+        cache.majors = majors.clone();
+        Ok(majors)
     }
 
     pub async fn list_college_majors(&self, college_name: &str) -> Result<Vec<CollegeMajorRecord>> {
@@ -126,13 +157,16 @@ impl RetrievalService {
             .query_admission_scores(province, major_slug, subject_type, year)
             .await?;
         let summary = summarize_score_records(&records);
+        let resolved_subject_type = resolve_score_query_subject_type(subject_type, &records);
+        let diagnostics =
+            score_query_subject_diagnostics(subject_type, resolved_subject_type.as_deref());
         Ok(ChatStructuredResult::ScoreQuery {
             major_name: major_name.to_owned(),
             province: province.to_owned(),
-            subject_type: subject_type.map(ToOwned::to_owned),
+            subject_type: resolved_subject_type,
             records,
             summary,
-            diagnostics: None,
+            diagnostics,
         })
     }
 
@@ -180,13 +214,39 @@ impl RetrievalService {
     }
 
     pub async fn retrieve_knowledge(&self, query: &str) -> Result<KnowledgeRetrievalResult> {
+        self.retrieve_knowledge_with_focus(query, None).await
+    }
+
+    pub async fn retrieve_knowledge_for_major(
+        &self,
+        query: &str,
+        major_focus: &str,
+    ) -> Result<KnowledgeRetrievalResult> {
+        self.retrieve_knowledge_with_focus(query, Some(major_focus))
+            .await
+    }
+
+    async fn retrieve_knowledge_with_focus(
+        &self,
+        query: &str,
+        forced_major_focus: Option<&str>,
+    ) -> Result<KnowledgeRetrievalResult> {
         let filters = infer_knowledge_filters(query);
         let major_focus = if filters.document_kind.as_deref() == Some("training_plan") {
-            self.search_major_candidates(query, 1)
-                .await
-                .ok()
-                .and_then(|candidates| candidates.into_iter().next())
-                .map(|candidate| candidate.name)
+            if let Some(major_focus) = forced_major_focus
+                .and_then(sanitize_major_focus_for_retrieval)
+                .filter(|value| !value.trim().is_empty())
+            {
+                Some(major_focus)
+            } else if let Some(major_focus) = extract_major_focus_from_query(query) {
+                Some(major_focus)
+            } else {
+                self.search_major_candidates(query, 1)
+                    .await
+                    .ok()
+                    .and_then(|candidates| candidates.into_iter().next())
+                    .map(|candidate| candidate.name)
+            }
         } else {
             None
         };
@@ -206,8 +266,52 @@ impl RetrievalService {
                 }
             }
         }
+        if filters.document_kind.as_deref() == Some("training_plan") && chunks.is_empty() {
+            for fallback_query in fallback_knowledge_queries(query) {
+                let (_, _, fallback_chunks) = self
+                    .retrieve_knowledge_once(&fallback_query, &filters, major_focus.as_deref())
+                    .await?;
+                merge_chunks(&mut chunks, fallback_chunks);
+                if !chunks.is_empty() {
+                    break;
+                }
+            }
+        }
         let faq = grade_faq(faq);
-        let graded_chunks = grade_chunks(chunks, query, major_focus.as_deref());
+        let mut graded_chunks = grade_chunks(
+            chunks,
+            query,
+            major_focus.as_deref(),
+            filters.document_kind.as_deref() == Some("training_plan"),
+        );
+        if graded_chunks.is_empty()
+            && (filters.document_kind.as_deref() == Some("training_plan")
+                || query_looks_like_training_plan(query))
+        {
+            for major_query in training_plan_major_fallback_queries(query, major_focus.as_deref()) {
+                let fallback_chunks = self
+                    .db
+                    .search_knowledge_chunks_keyword(&major_query, &filters, 12)
+                    .await
+                    .unwrap_or_default();
+                graded_chunks = grade_chunks(fallback_chunks, query, Some(&major_query), true);
+                if graded_chunks.is_empty() {
+                    let direct_chunks = self
+                        .db
+                        .search_training_plan_chunks_by_major(
+                            &major_query,
+                            knowledge_topic_keyword(query),
+                            12,
+                        )
+                        .await
+                        .unwrap_or_default();
+                    graded_chunks = grade_chunks(direct_chunks, query, Some(&major_query), true);
+                }
+                if !graded_chunks.is_empty() {
+                    break;
+                }
+            }
+        }
         let citations = build_knowledge_citations(&faq, &policies, &graded_chunks);
         Ok(KnowledgeRetrievalResult {
             structured_result: ChatStructuredResult::KnowledgeAnswer {
@@ -279,19 +383,42 @@ impl RetrievalService {
         let Some(major_focus) = major_focus else {
             return Ok(Vec::new());
         };
-        let major_name = root_major_name(major_focus);
+        let major_name = normalize_major_for_metadata(major_focus);
         if major_name.chars().count() < 2 {
             return Ok(Vec::new());
         }
+        let topic = knowledge_topic_keyword(query);
+        let chunks = self
+            .db
+            .search_knowledge_chunks_by_major(&major_name, topic, filters, limit)
+            .await
+            .or_else(|_| Ok::<Vec<VectorChunkEvidence>, anyhow::Error>(Vec::new()))?;
+        if !chunks.is_empty() || topic.is_none() {
+            return Ok(chunks);
+        }
         self.db
-            .search_knowledge_chunks_by_major(
-                &major_name,
-                knowledge_topic_keyword(query),
-                filters,
-                limit,
-            )
+            .search_knowledge_chunks_by_major(&major_name, None, filters, limit)
             .await
             .or_else(|_| Ok(Vec::new()))
+    }
+}
+
+fn extract_major_focus_from_query(query: &str) -> Option<String> {
+    let index = query.find("专业")?;
+    let before = query[..index].trim_matches(['，', ',', '。', '？', '?', ' ']);
+    if before.is_empty() || before.ends_with("这个") || before.ends_with("该") {
+        return None;
+    }
+    let segment = before
+        .split(['，', ',', '。', '？', '?', ' '])
+        .next_back()
+        .unwrap_or(before)
+        .trim();
+    let normalized = normalize_major_for_metadata(segment);
+    if normalized.chars().count() >= 2 {
+        Some(segment.to_owned())
+    } else {
+        None
     }
 }
 
@@ -328,6 +455,17 @@ fn fallback_knowledge_queries(query: &str) -> Vec<String> {
         "毕业要求",
         "实践环节",
         "学分",
+        "新生",
+        "入学",
+        "报到",
+        "选课",
+        "军训",
+        "带电脑",
+        "电脑",
+        "宿舍",
+        "住宿",
+        "食堂",
+        "校区",
     ] {
         if query.contains(term) && !queries.iter().any(|item| item == term) {
             queries.push(term.to_owned());
@@ -369,6 +507,15 @@ fn faq_min_similarity() -> f64 {
         .unwrap_or(DEFAULT_FAQ_MIN_SIMILARITY)
 }
 
+fn major_catalog_cache_ttl() -> Duration {
+    let seconds = std::env::var("MAJOR_CATALOG_CACHE_TTL_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(300);
+    Duration::from_secs(seconds)
+}
+
 fn merge_policies(target: &mut Vec<PolicyEvidence>, incoming: Vec<PolicyEvidence>) {
     for item in incoming {
         if !target.iter().any(|existing| existing.id == item.id) {
@@ -383,6 +530,158 @@ fn merge_chunks(target: &mut Vec<VectorChunkEvidence>, incoming: Vec<VectorChunk
             target.push(item);
         }
     }
+}
+
+fn resolve_score_query_subject_type(
+    requested_subject_type: Option<&str>,
+    records: &[AdmissionScoreRecord],
+) -> Option<String> {
+    if records.is_empty() {
+        return requested_subject_type.map(ToOwned::to_owned);
+    }
+    if let Some(requested) = requested_subject_type {
+        if records
+            .iter()
+            .any(|record| record.subject_type.as_str() == requested)
+        {
+            return Some(requested.to_owned());
+        }
+    }
+    if records.iter().all(|record| record.subject_type == "未区分") {
+        return Some("未区分".to_owned());
+    }
+    requested_subject_type.map(ToOwned::to_owned)
+}
+
+fn score_query_subject_diagnostics(
+    requested_subject_type: Option<&str>,
+    resolved_subject_type: Option<&str>,
+) -> Option<serde_json::Value> {
+    let requested = requested_subject_type?;
+    let resolved = resolved_subject_type?;
+    if requested == resolved {
+        return None;
+    }
+    Some(json!({
+        "requestedSubjectType": requested,
+        "actualSubjectType": resolved,
+        "note": "用户指定科类没有单列记录，已使用录取统计表中的实际科类记录。"
+    }))
+}
+
+fn sanitize_major_focus_for_retrieval(value: &str) -> Option<String> {
+    let mut text = value.trim().to_owned();
+    for marker in [
+        "培养方案",
+        "培养目标",
+        "毕业要求",
+        "毕业条件",
+        "毕业需要",
+        "主要课程",
+        "核心课程",
+        "课程",
+        "教育实习",
+        "专业实践",
+        "实践环节",
+        "第二课堂",
+        "创新实践",
+        "毕业创作",
+        "毕业论文",
+        "学分",
+        "适合",
+        "匹配",
+        "契合",
+        "有没有",
+        "怎么安排",
+        "是什么",
+    ] {
+        if let Some(index) = text.find(marker) {
+            text.truncate(index);
+        }
+    }
+    let text = text
+        .replace("这个专业", "")
+        .replace("该专业", "")
+        .replace("专业的", "")
+        .replace("专业里", "")
+        .replace("专业", "")
+        .trim_matches([
+            '，', ',', '。', '？', '?', '！', '!', ' ', '的', '里', '：', ':',
+        ])
+        .to_owned();
+    let text = text
+        .split_whitespace()
+        .next()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(&text)
+        .to_owned();
+    (normalize_major_for_metadata(&text).chars().count() >= 2).then_some(text)
+}
+
+fn training_plan_major_fallback_queries(query: &str, major_focus: Option<&str>) -> Vec<String> {
+    let mut candidates = Vec::new();
+    if let Some(major) = major_focus.and_then(sanitize_major_focus_for_retrieval) {
+        candidates.push(major);
+    }
+    if let Some(major) = extract_major_focus_from_query(query) {
+        candidates.push(major);
+    }
+    let mut before_marker = query.to_owned();
+    for marker in [
+        "培养方案",
+        "培养目标",
+        "毕业要求",
+        "毕业条件",
+        "毕业需要",
+        "主要课程",
+        "核心课程",
+        "课程",
+        "教育实习",
+        "专业实践",
+        "实践环节",
+        "第二课堂",
+        "创新实践",
+        "毕业创作",
+        "毕业论文",
+        "学分",
+        "有没有",
+        "怎么安排",
+        "是什么",
+    ] {
+        if let Some(index) = before_marker.find(marker) {
+            before_marker.truncate(index);
+        }
+    }
+    if let Some(before_marker) = sanitize_major_focus_for_retrieval(&before_marker) {
+        candidates.push(before_marker);
+    }
+    candidates.sort();
+    candidates.dedup();
+    candidates
+}
+
+fn query_looks_like_training_plan(query: &str) -> bool {
+    contains_any(
+        query,
+        &[
+            "培养方案",
+            "培养目标",
+            "毕业要求",
+            "毕业条件",
+            "毕业需要",
+            "主要课程",
+            "核心课程",
+            "课程",
+            "教育实习",
+            "专业实践",
+            "实践环节",
+            "第二课堂",
+            "创新实践",
+            "毕业创作",
+            "毕业论文",
+            "学分",
+        ],
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -452,6 +751,9 @@ pub fn infer_knowledge_filters(query: &str) -> KnowledgeSearchFilters {
             "服从调剂",
             "退档",
             "同分",
+            "优先录取",
+            "分数相同",
+            "成绩相同",
             "体检",
             "语种",
             "外语语种",
@@ -460,6 +762,28 @@ pub fn infer_knowledge_filters(query: &str) -> KnowledgeSearchFilters {
             "选科",
         ],
     ) {
+        filters.category = Some("招生简章".to_owned());
+        filters.document_kind = Some("admission_brochure".to_owned());
+        return filters;
+    }
+
+    if contains_any(query, &["学校介绍", "学校简介", "学校情况", "院校介绍"])
+        || (contains_any(query, &["介绍", "简介", "讲讲", "说说", "了解"])
+            && contains_any(query, &["学校", "院校", "哈师大", "哈尔滨师范大学", "大学"])
+            && !contains_any(
+                query,
+                &[
+                    "专业",
+                    "学院",
+                    "课程",
+                    "培养",
+                    "录取",
+                    "分数",
+                    "位次",
+                    "招生计划",
+                ],
+            ))
+    {
         filters.category = Some("招生简章".to_owned());
         filters.document_kind = Some("admission_brochure".to_owned());
         return filters;
@@ -666,11 +990,20 @@ fn is_probability_message(message: &str) -> bool {
             "能上",
             "能不能上",
             "能报",
+            "能录取",
+            "能不能录取",
             "录取概率",
             "概率",
             "稳吗",
             "稳不稳",
             "冲稳保",
+            "有希望",
+            "希望吗",
+            "希望大吗",
+            "希望大不大",
+            "把握",
+            "录取机会",
+            "风险",
         ],
     )
 }
@@ -694,12 +1027,20 @@ fn is_score_message(message: &str) -> bool {
 fn is_knowledge_message(message: &str) -> bool {
     let asks_school_intro = contains_any(message, &["介绍", "讲讲", "说说"])
         && contains_any(message, &["学校", "院校", "哈师大", "哈尔滨师范大学"]);
+    let asks_major_fit = contains_any(message, &["适合", "匹配", "契合", "合适"])
+        && contains_any(
+            message,
+            &["专业", "培养", "老师", "教师", "实验", "课程", "就业"],
+        );
     contains_any(
         message,
         &[
             "招生简章",
             "招生章程",
             "录取规则",
+            "优先录取",
+            "分数相同",
+            "成绩相同",
             "调剂",
             "体检",
             "语种",
@@ -714,6 +1055,13 @@ fn is_knowledge_message(message: &str) -> bool {
             "校园生活",
             "大学生活",
             "学生生活",
+            "新生",
+            "入学",
+            "报到",
+            "选课",
+            "军训",
+            "带电脑",
+            "电脑",
             "校区",
             "学校介绍",
             "学校情况",
@@ -759,6 +1107,7 @@ fn is_knowledge_message(message: &str) -> bool {
             "FAQ",
         ],
     ) || asks_school_intro
+        || asks_major_fit
 }
 
 fn contains_any(text: &str, needles: &[&str]) -> bool {
@@ -884,6 +1233,7 @@ fn grade_chunks(
     mut chunks: Vec<VectorChunkEvidence>,
     query: &str,
     major_focus: Option<&str>,
+    strict_major_focus: bool,
 ) -> Vec<VectorChunkEvidence> {
     if let Some(major_focus) = major_focus {
         let focused_chunks = chunks
@@ -893,6 +1243,8 @@ fn grade_chunks(
             .collect::<Vec<_>>();
         if !focused_chunks.is_empty() {
             chunks = focused_chunks;
+        } else if strict_major_focus {
+            return Vec::new();
         }
     }
 
@@ -947,10 +1299,10 @@ fn score_chunk(chunk: &VectorChunkEvidence, query: &str, major_focus: Option<&st
         {
             let actual = normalize_major_for_metadata(chunk_major);
             if !expected.is_empty() && !actual.is_empty() {
-                if expected == actual || expected.contains(&actual) || actual.contains(&expected) {
+                if major_metadata_matches(major_focus, chunk_major) {
                     score += 0.55;
                 } else {
-                    score -= 0.35;
+                    score -= 0.65;
                 }
             }
         }
@@ -996,9 +1348,7 @@ fn chunk_matches_major_focus(chunk: &VectorChunkEvidence, major_focus: &str) -> 
         .get("majorName")
         .and_then(|value| value.as_str())
     {
-        let actual = normalize_major_for_metadata(chunk_major);
-        return !actual.is_empty()
-            && (expected == actual || expected.contains(&actual) || actual.contains(&expected));
+        return major_metadata_matches(major_focus, chunk_major);
     }
 
     let title = normalize_major_for_metadata(chunk.title.as_deref().unwrap_or_default());
@@ -1008,6 +1358,40 @@ fn chunk_matches_major_focus(chunk: &VectorChunkEvidence, major_focus: &str) -> 
 
     let content_head = chunk.content.chars().take(240).collect::<String>();
     normalize_major_for_metadata(&content_head).contains(&expected)
+}
+
+fn major_metadata_matches(expected_major: &str, actual_major: &str) -> bool {
+    let expected = normalize_major_for_metadata(expected_major);
+    let actual = normalize_major_for_metadata(actual_major);
+    if expected.is_empty() || actual.is_empty() {
+        return false;
+    }
+    if !(expected == actual || expected.contains(&actual) || actual.contains(&expected)) {
+        return false;
+    }
+    compatible_major_variants(expected_major, actual_major)
+}
+
+fn compatible_major_variants(expected_major: &str, actual_major: &str) -> bool {
+    let expected = normalize_text(expected_major);
+    let actual = normalize_text(actual_major);
+    for variant in ["行知", "实验班", "非师范"] {
+        let expected_has = expected.contains(variant);
+        let actual_has = actual.contains(variant);
+        if expected_has != actual_has {
+            return false;
+        }
+    }
+    if expected.contains("师范") != actual.contains("师范") {
+        let expected_has_specific_variant =
+            expected.contains("非师范") || expected.contains("行知") || expected.contains("实验班");
+        let actual_has_specific_variant =
+            actual.contains("非师范") || actual.contains("行知") || actual.contains("实验班");
+        if expected_has_specific_variant || actual_has_specific_variant {
+            return false;
+        }
+    }
+    true
 }
 
 fn normalize_major_for_metadata(text: &str) -> String {
@@ -1174,6 +1558,25 @@ mod tests {
         let practice = route_message("音乐学专业的教育实习和实践环节怎么安排？");
         assert_eq!(practice.intent, RetrievalIntent::KnowledgeAnswer);
         assert!(practice.must_use_tools);
+
+        let same_score = route_message("如果两个考生投档成绩一样，学校会优先录取谁？");
+        assert_eq!(same_score.intent, RetrievalIntent::KnowledgeAnswer);
+        assert!(same_score.must_use_tools);
+
+        let new_student = route_message("入学前需要自己选课吗？军训大概多久？新生可以带电脑吗？");
+        assert_eq!(new_student.intent, RetrievalIntent::KnowledgeAnswer);
+        assert!(new_student.must_use_tools);
+    }
+
+    #[test]
+    fn routes_natural_probability_and_major_fit_questions() {
+        let probability = route_message("河北500分报汉语言文学师范类有希望吗？");
+        assert_eq!(probability.intent, RetrievalIntent::ProbabilityAssessment);
+        assert!(probability.must_use_tools);
+
+        let fit = route_message("生物科学专业适合喜欢实验、以后想当老师的学生吗？");
+        assert_eq!(fit.intent, RetrievalIntent::KnowledgeAnswer);
+        assert!(fit.must_use_tools);
     }
 
     #[test]
@@ -1202,6 +1605,49 @@ mod tests {
     }
 
     #[test]
+    fn training_plan_major_matching_respects_variants() {
+        assert!(major_metadata_matches(
+            "音乐学专业（师范）",
+            "音乐学专业（师范）"
+        ));
+        assert!(!major_metadata_matches(
+            "音乐学专业（师范）",
+            "音乐学专业（非师范）"
+        ));
+        assert!(!major_metadata_matches(
+            "计算机科学与技术专业（师范）",
+            "计算机科学与技术专业（行知班）"
+        ));
+        assert!(major_metadata_matches("生物科学（师范类）", "生物科学专业"));
+        assert!(!major_metadata_matches(
+            "计算机科学与技术专业（师范）",
+            "计算机科学与技术专业（非师范）"
+        ));
+        assert!(major_metadata_matches("生物科学专业", "生物科学专业"));
+        assert_eq!(
+            normalize_major_for_metadata("计算机科学与技术（师范）"),
+            "计算机科学与技术"
+        );
+        assert_eq!(
+            extract_major_focus_from_query("生物科学专业 如果喜欢实验，这个专业培养目标适合吗？")
+                .as_deref(),
+            Some("生物科学")
+        );
+        assert_eq!(
+            sanitize_major_focus_for_retrieval("地理科学专业培养目标是什么？").as_deref(),
+            Some("地理科学")
+        );
+        assert_eq!(
+            sanitize_major_focus_for_retrieval("地理信息科学 GIS和遥感相关课程有没有？").as_deref(),
+            Some("地理信息科学")
+        );
+        assert_eq!(
+            extract_major_focus_from_query("这个专业培养目标是什么？"),
+            None
+        );
+    }
+
+    #[test]
     fn extracts_college_major_catalog_query() {
         assert_eq!(
             extract_college_major_catalog_query("教育科学学院还有哪些专业"),
@@ -1221,6 +1667,13 @@ mod tests {
     }
 
     #[test]
+    fn infers_admission_brochure_filter_for_school_intro() {
+        let filters = infer_knowledge_filters("简单介绍一下学校");
+        assert_eq!(filters.category, Some("招生简章".to_owned()));
+        assert_eq!(filters.document_kind, Some("admission_brochure".to_owned()));
+    }
+
+    #[test]
     fn major_scoring_prefers_explicit_discipline_over_generic_normal_major() {
         let query = "辽宁物理类584分物理学师范类录取概率";
         let physics = MajorRecord {
@@ -1228,12 +1681,14 @@ mod tests {
             name: "物理学（师范类）".to_owned(),
             code: None,
             is_normal_major: true,
+            latest_score: None,
         };
         let preschool = MajorRecord {
             slug: "preschool".to_owned(),
             name: "学前教育（固边计划，师范类）".to_owned(),
             code: None,
             is_normal_major: true,
+            latest_score: None,
         };
 
         assert!(score_major_candidate(query, &physics) > score_major_candidate(query, &preschool));
@@ -1247,12 +1702,14 @@ mod tests {
             name: "汉语言文学（师范类）".to_owned(),
             code: None,
             is_normal_major: true,
+            latest_score: None,
         };
         let history = MajorRecord {
             slug: "history".to_owned(),
             name: "历史学（师范类）".to_owned(),
             code: None,
             is_normal_major: true,
+            latest_score: None,
         };
 
         assert!(score_major_candidate(query, &literature) > score_major_candidate(query, &history));
@@ -1266,12 +1723,14 @@ mod tests {
             name: "数据科学与大数据技术".to_owned(),
             code: None,
             is_normal_major: false,
+            latest_score: None,
         };
         let short = MajorRecord {
             slug: "data-science".to_owned(),
             name: "数据科学".to_owned(),
             code: None,
             is_normal_major: false,
+            latest_score: None,
         };
 
         assert!(score_major_candidate(query, &full) > score_major_candidate(query, &short));

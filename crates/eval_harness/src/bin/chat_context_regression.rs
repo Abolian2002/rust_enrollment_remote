@@ -1,6 +1,9 @@
 use anyhow::{Context, Result};
 use eval_harness::{HarnessReport, load_fixture, run_case};
+use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::Arc;
+use tokio::sync::Semaphore;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -15,21 +18,26 @@ async fn main() -> Result<()> {
         ("v3", "chat-context-regression-v3-cases.json"),
         ("v4", "chat-context-regression-v4-cases.json"),
         ("v5", "chat-context-regression-v5-cases.json"),
+        ("v6", "chat-context-regression-v6-cases.json"),
     ];
+    let selected_suites = selected_suites();
+    let concurrency = std::env::var("RUST_HARNESS_CONCURRENCY")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(1);
 
     let mut reports = Vec::new();
     for (suite, file_name) in suites {
+        if !selected_suites.is_empty() && !selected_suites.contains(suite) {
+            continue;
+        }
         let fixture_path = fixtures_dir.join(file_name);
         let cases = load_fixture(&fixture_path).with_context(|| {
             format!("failed to load {suite} fixture {}", fixture_path.display())
         })?;
-        for case in cases {
-            let mut case_reports = run_case(&api_base, suite, &case).await?;
-            for report in &case_reports {
-                println!("{}", serde_json::to_string(report)?);
-            }
-            reports.append(&mut case_reports);
-        }
+        let suite_reports = run_suite(&api_base, suite, cases, concurrency).await?;
+        reports.extend(suite_reports);
     }
 
     print_summary(&reports);
@@ -39,6 +47,45 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn selected_suites() -> HashSet<String> {
+    std::env::var("RUST_HARNESS_SUITES")
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+async fn run_suite(
+    api_base: &str,
+    suite: &'static str,
+    cases: Vec<eval_harness::RegressionCase>,
+    concurrency: usize,
+) -> Result<Vec<HarnessReport>> {
+    let semaphore = Arc::new(Semaphore::new(concurrency));
+    let mut tasks = tokio::task::JoinSet::new();
+
+    for case in cases {
+        let permit = semaphore.clone().acquire_owned().await?;
+        let api_base = api_base.to_owned();
+        tasks.spawn(async move {
+            let _permit = permit;
+            run_case(&api_base, suite, &case).await
+        });
+    }
+
+    let mut reports = Vec::new();
+    while let Some(result) = tasks.join_next().await {
+        let mut case_reports = result??;
+        for report in &case_reports {
+            println!("{}", serde_json::to_string(report)?);
+        }
+        reports.append(&mut case_reports);
+    }
+    Ok(reports)
 }
 
 fn print_summary(reports: &[HarnessReport]) {

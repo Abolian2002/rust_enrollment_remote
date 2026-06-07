@@ -1,10 +1,11 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
-use futures::{Stream, stream};
+use futures::{Stream, StreamExt, stream};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::pin::Pin;
+use std::time::Duration;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -78,6 +79,8 @@ struct ChatCompletionRequest<'a> {
     max_tokens: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     enable_thinking: Option<bool>,
+    #[serde(default)]
+    stream: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -102,7 +105,21 @@ impl OpenAiCompatibleClient {
         model: impl Into<String>,
     ) -> Self {
         Self {
-            http: Client::new(),
+            http: Client::builder()
+                .connect_timeout(Duration::from_secs(read_env_u64(
+                    "LLM_CONNECT_TIMEOUT_SECS",
+                    10,
+                )))
+                .timeout(Duration::from_secs(read_env_u64(
+                    "LLM_REQUEST_TIMEOUT_SECS",
+                    45,
+                )))
+                .pool_idle_timeout(Duration::from_secs(read_env_u64(
+                    "LLM_POOL_IDLE_TIMEOUT_SECS",
+                    30,
+                )))
+                .build()
+                .unwrap_or_else(|_| Client::new()),
             base_url: base_url.into().trim_end_matches('/').to_owned(),
             api_key: api_key.into(),
             model: model.into(),
@@ -129,6 +146,14 @@ impl OpenAiCompatibleClient {
     }
 }
 
+fn read_env_u64(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
 #[async_trait]
 impl LlmProvider for OpenAiCompatibleClient {
     async fn complete(&self, messages: &[LlmMessage]) -> Result<LlmResponse> {
@@ -148,6 +173,7 @@ impl LlmProvider for OpenAiCompatibleClient {
                         .as_deref(),
                     std::env::var("DASHSCOPE_ENABLE_THINKING").ok().as_deref(),
                 ),
+                stream: false,
             })
             .send()
             .await
@@ -169,6 +195,134 @@ impl LlmProvider for OpenAiCompatibleClient {
             content,
             tool_calls: Vec::new(),
         })
+    }
+
+    async fn stream_complete(&self, messages: &[LlmMessage]) -> Result<LlmDeltaStream> {
+        let url = format!("{}/chat/completions", self.base_url);
+        let response = self
+            .http
+            .post(url)
+            .bearer_auth(&self.api_key)
+            .json(&ChatCompletionRequest {
+                model: &self.model,
+                messages,
+                temperature: 0.2,
+                max_tokens: 1600,
+                enable_thinking: read_optional_bool(
+                    std::env::var("OPENAI_COMPAT_ENABLE_THINKING")
+                        .ok()
+                        .as_deref(),
+                    std::env::var("DASHSCOPE_ENABLE_THINKING").ok().as_deref(),
+                ),
+                stream: true,
+            })
+            .send()
+            .await
+            .context("llm streaming request failed")?
+            .error_for_status()
+            .context("llm streaming returned non-success status")?;
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<String>>(32);
+        tokio::spawn(async move {
+            let mut bytes = response.bytes_stream();
+            let mut buffer = String::new();
+
+            while let Some(item) = bytes.next().await {
+                match item {
+                    Ok(chunk) => {
+                        buffer.push_str(&String::from_utf8_lossy(&chunk));
+                        while let Some(line) = take_sse_line(&mut buffer) {
+                            match parse_sse_delta(&line) {
+                                SseParseOutcome::Delta(delta) => {
+                                    if tx.send(Ok(delta)).await.is_err() {
+                                        return;
+                                    }
+                                }
+                                SseParseOutcome::Done => return,
+                                SseParseOutcome::Skip => {}
+                                SseParseOutcome::Error(error) => {
+                                    let _ = tx.send(Err(error)).await;
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        let _ = tx
+                            .send(Err(anyhow!("llm streaming chunk failed: {error}")))
+                            .await;
+                        return;
+                    }
+                }
+            }
+
+            if !buffer.trim().is_empty() {
+                match parse_sse_delta(buffer.trim()) {
+                    SseParseOutcome::Delta(delta) => {
+                        let _ = tx.send(Ok(delta)).await;
+                    }
+                    SseParseOutcome::Error(error) => {
+                        let _ = tx.send(Err(error)).await;
+                    }
+                    SseParseOutcome::Done | SseParseOutcome::Skip => {}
+                }
+            }
+        });
+
+        Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)))
+    }
+}
+
+enum SseParseOutcome {
+    Delta(String),
+    Done,
+    Skip,
+    Error(anyhow::Error),
+}
+
+fn take_sse_line(buffer: &mut String) -> Option<String> {
+    let newline = buffer.find('\n')?;
+    let mut line = buffer[..newline].to_owned();
+    if line.ends_with('\r') {
+        line.pop();
+    }
+    buffer.drain(..=newline);
+    Some(line)
+}
+
+fn parse_sse_delta(line: &str) -> SseParseOutcome {
+    let line = line.trim();
+    if line.is_empty() || line.starts_with(':') {
+        return SseParseOutcome::Skip;
+    }
+    let Some(data) = line.strip_prefix("data:").map(str::trim) else {
+        return SseParseOutcome::Skip;
+    };
+    if data == "[DONE]" {
+        return SseParseOutcome::Done;
+    }
+
+    let value = match serde_json::from_str::<Value>(data) {
+        Ok(value) => value,
+        Err(error) => {
+            return SseParseOutcome::Error(anyhow!("failed to parse llm stream event: {error}"));
+        }
+    };
+
+    let Some(content) = value
+        .get("choices")
+        .and_then(|choices| choices.get(0))
+        .and_then(|choice| choice.get("delta"))
+        .and_then(|delta| delta.get("content"))
+        .and_then(|content| content.as_str())
+    else {
+        return SseParseOutcome::Skip;
+    };
+
+    if content.is_empty() {
+        SseParseOutcome::Skip
+    } else {
+        SseParseOutcome::Delta(content.to_owned())
     }
 }
 

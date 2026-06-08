@@ -470,6 +470,7 @@ async fn handle_voice_socket(mut socket: WebSocket, state: Arc<AppState>) {
     let (out_tx, mut out_rx) = mpsc::channel::<VoiceWsOut>(64);
     let (cancel_tx, cancel_rx) = watch::channel(false);
 
+    let writer_cancel = cancel_tx.clone();
     let writer = tokio::spawn(async move {
         while let Some(message) = out_rx.recv().await {
             let result = match message {
@@ -479,9 +480,11 @@ async fn handle_voice_socket(mut socket: WebSocket, state: Arc<AppState>) {
                 VoiceWsOut::Audio(bytes) => sender.send(Message::Binary(bytes.into())).await,
             };
             if result.is_err() {
+                let _ = writer_cancel.send(true);
                 break;
             }
         }
+        let _ = writer_cancel.send(true);
     });
 
     let reader_cancel = cancel_tx.clone();
@@ -708,6 +711,7 @@ async fn run_server_tts_synth(
     let retry_delay = server_tts_retry_delay();
     let mut consecutive_failures = 0usize;
     let mut reported_instability = false;
+    let mut segment_cancel_rx = cancel_rx.clone();
 
     while let Some(segment) = segment_rx.recv().await {
         if *cancel_rx.borrow() {
@@ -716,7 +720,7 @@ async fn run_server_tts_synth(
 
         let mut attempt = 0usize;
         loop {
-            match stream_tts_segment(&state, &segment, &out_tx, &cancel_rx).await {
+            match stream_tts_segment(&state, &segment, &out_tx, &mut segment_cancel_rx).await {
                 Ok(()) => {
                     consecutive_failures = 0;
                     break;
@@ -777,10 +781,14 @@ async fn stream_tts_segment(
     state: &AppState,
     segment: &str,
     out_tx: &mpsc::Sender<VoiceWsOut>,
-    cancel_rx: &watch::Receiver<bool>,
+    cancel_rx: &mut watch::Receiver<bool>,
 ) -> Result<(), TtsSegmentStreamError> {
+    if *cancel_rx.borrow() {
+        return Err(TtsSegmentStreamError::client_disconnected(false));
+    }
+
     let endpoint = local_tts_stream_url();
-    let response = state
+    let request = state
         .tts_http
         .post(endpoint)
         .json(&json!({
@@ -788,22 +796,39 @@ async fn stream_tts_segment(
             "voice": local_tts_voice(),
             "input": segment,
         }))
-        .send()
-        .await
-        .map_err(|error| {
-            TtsSegmentStreamError::upstream(
-                format!("failed to request local streaming TTS: {error}"),
-                false,
-            )
-        })?;
+        .send();
+
+    let response = tokio::select! {
+        biased;
+        changed = cancel_rx.changed() => {
+            if changed.is_ok() && *cancel_rx.borrow() {
+                return Err(TtsSegmentStreamError::client_disconnected(false));
+            }
+            return Err(TtsSegmentStreamError::client_disconnected(false));
+        }
+        result = request => {
+            result.map_err(|error| {
+                TtsSegmentStreamError::upstream(
+                    format!("failed to request local streaming TTS: {error}"),
+                    false,
+                )
+            })?
+        }
+    };
 
     if !response.status().is_success() {
         let status = response.status();
-        let body_len = response
-            .text()
-            .await
-            .map(|body| body.len())
-            .unwrap_or_default();
+        let body = response.text();
+        let body_len = tokio::select! {
+            biased;
+            changed = cancel_rx.changed() => {
+                if changed.is_ok() && *cancel_rx.borrow() {
+                    return Err(TtsSegmentStreamError::client_disconnected(false));
+                }
+                return Err(TtsSegmentStreamError::client_disconnected(false));
+            }
+            result = body => result.map(|body| body.len()).unwrap_or_default(),
+        };
         return Err(TtsSegmentStreamError::upstream(
             format!("local streaming TTS returned {status}; body_len={body_len}"),
             false,
@@ -812,10 +837,19 @@ async fn stream_tts_segment(
 
     let mut stream = response.bytes_stream();
     let mut audio_started = false;
-    while let Some(chunk) = stream.next().await {
-        if *cancel_rx.borrow() {
+    loop {
+        let Some(chunk) = (tokio::select! {
+            biased;
+            changed = cancel_rx.changed() => {
+                if changed.is_ok() && *cancel_rx.borrow() {
+                    return Err(TtsSegmentStreamError::client_disconnected(audio_started));
+                }
+                return Err(TtsSegmentStreamError::client_disconnected(audio_started));
+            }
+            chunk = stream.next() => chunk,
+        }) else {
             break;
-        }
+        };
         let chunk = chunk.map_err(|error| {
             TtsSegmentStreamError::upstream(
                 format!("error decoding streaming TTS response body: {error}"),
@@ -823,10 +857,17 @@ async fn stream_tts_segment(
             )
         })?;
         if !chunk.is_empty()
-            && out_tx
-                .send(VoiceWsOut::Audio(chunk.to_vec()))
-                .await
-                .is_err()
+            && (tokio::select! {
+                biased;
+                changed = cancel_rx.changed() => {
+                    if changed.is_ok() && *cancel_rx.borrow() {
+                        return Err(TtsSegmentStreamError::client_disconnected(audio_started));
+                    }
+                    return Err(TtsSegmentStreamError::client_disconnected(audio_started));
+                }
+                result = out_tx.send(VoiceWsOut::Audio(chunk.to_vec())) => result,
+            })
+            .is_err()
         {
             return Err(TtsSegmentStreamError::client_disconnected(audio_started));
         }

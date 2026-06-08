@@ -1,7 +1,3 @@
-"use client";
-
-import type { ReactNode } from "react";
-
 import { cn } from "@/lib/cn";
 
 type FormattedMessageProps = {
@@ -10,32 +6,19 @@ type FormattedMessageProps = {
 };
 
 export function FormattedMessage({ className, text }: FormattedMessageProps) {
-  return <p className={cn("whitespace-pre-wrap", className)}>{renderLightMarkdown(text)}</p>;
+  return (
+    <p className={cn("whitespace-pre-wrap break-words [line-break:strict]", className)}>
+      {formatDisplayText(text)}
+    </p>
+  );
 }
 
-function renderLightMarkdown(text: string): ReactNode[] {
-  const nodes: ReactNode[] = [];
-  const lines = text.split("\n");
-
-  lines.forEach((line, lineIndex) => {
-    if (lineIndex > 0) {
-      nodes.push(<br key={`br-${lineIndex}`} />);
-    }
-
-    const parts = line.split(/(\*\*[^*]+\*\*)/g);
-    parts.forEach((part, partIndex) => {
-      const key = `${lineIndex}-${partIndex}`;
-      if (part.startsWith("**") && part.endsWith("**") && part.length > 4) {
-        nodes.push(
-          <strong key={key} className="font-bold">
-            {part.slice(2, -2)}
-          </strong>
-        );
-      } else if (part) {
-        nodes.push(part);
-      }
-    });
-  });
-
-  return nodes;
+export function formatDisplayText(text: string) {
+  return text
+    .replace(/\*\*([^*\n]+)\*\*/g, "$1")
+    .replace(/\*\*/g, "")
+    .replace(/(^|\n)\s*[*+-]\s+/g, "$1• ")
+    .replace(/(^|\n)\s{0,3}#{1,6}\s*/g, "$1")
+    .replace(/`([^`\n]+)`/g, "$1")
+    .replace(/```[\s\S]*?```/g, (block) => block.replace(/```[a-zA-Z0-9_-]*\n?/g, "").replace(/```/g, ""));
 }

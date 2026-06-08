@@ -178,7 +178,7 @@ impl RetrievalService {
     ) -> Result<ChatStructuredResult> {
         let majors = self
             .db
-            .list_province_admission_majors_from_scores(province, subject_type, year, 120)
+            .list_province_admission_majors_from_scores(province, subject_type, year, 500)
             .await?;
         let latest_year = majors.first().map(|item| item.year);
         Ok(ChatStructuredResult::ProvinceMajorList {
@@ -187,7 +187,7 @@ impl RetrievalService {
             year: year.or(latest_year),
             majors,
             source_mode: "admission_scores_latest_year".to_owned(),
-            note: "当前 admission_plans 招生计划表为空；这里使用已导入录取统计中最新一年在该省有录取记录的专业作为参考，不等同于当年正式招生计划。".to_owned(),
+            note: "当前已导入资料中暂缺当年的分省分专业招生计划明细；这里使用已导入录取统计中最新一年在该省有录取记录的专业作为参考，不等同于当年正式招生计划。".to_owned(),
         })
     }
 
@@ -200,7 +200,7 @@ impl RetrievalService {
     ) -> Result<ChatStructuredResult> {
         let provinces = self
             .db
-            .list_major_admission_provinces_from_scores(major_slug, subject_type, year, 120)
+            .list_major_admission_provinces_from_scores(major_slug, subject_type, year, 500)
             .await?;
         let latest_year = provinces.first().map(|item| item.year);
         Ok(ChatStructuredResult::MajorProvinceList {
@@ -209,7 +209,7 @@ impl RetrievalService {
             year: year.or(latest_year),
             provinces,
             source_mode: "admission_scores_latest_year".to_owned(),
-            note: "当前 admission_plans 招生计划表为空；这里使用已导入录取统计中最新一年该专业有录取记录的省份作为参考，不等同于当年正式招生计划。".to_owned(),
+            note: "当前已导入资料中暂缺当年的分省分专业招生计划明细；这里使用已导入录取统计中最新一年该专业有录取记录的省份作为参考，不等同于当年正式招生计划。".to_owned(),
         })
     }
 

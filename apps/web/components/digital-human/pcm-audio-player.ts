@@ -15,6 +15,7 @@ export class PCMAudioPlayer {
   private isConnected = false;
   private callbacks: PCMAudioPlayerCallbacks;
   private speakingThrottle = 0;
+  private pendingByte: number | null = null;
 
   constructor(sampleRate: number, callbacks: PCMAudioPlayerCallbacks = {}) {
     this.sampleRate = sampleRate;
@@ -70,7 +71,23 @@ export class PCMAudioPlayer {
 
   pushPCM(arrayBuffer: ArrayBuffer): void {
     if (!this.isConnected || !this.workletNode) return;
-    const int16Data = new Int16Array(arrayBuffer);
+    let bytes = new Uint8Array(arrayBuffer);
+
+    if (this.pendingByte !== null) {
+      const merged = new Uint8Array(bytes.byteLength + 1);
+      merged[0] = this.pendingByte;
+      merged.set(bytes, 1);
+      this.pendingByte = null;
+      bytes = merged;
+    }
+
+    if (bytes.byteLength % 2 === 1) {
+      this.pendingByte = bytes[bytes.byteLength - 1] ?? null;
+      bytes = bytes.subarray(0, bytes.byteLength - 1);
+    }
+    if (bytes.byteLength === 0) return;
+
+    const int16Data = new Int16Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 2);
     this.workletNode.port.postMessage(
       { type: "audio", data: int16Data },
       [int16Data.buffer]
@@ -78,11 +95,13 @@ export class PCMAudioPlayer {
   }
 
   sendTtsFinished(): void {
+    this.pendingByte = null;
     if (!this.workletNode) return;
     this.workletNode.port.postMessage({ type: "task-finished" });
   }
 
   clear(): void {
+    this.pendingByte = null;
     if (this.workletNode) {
       this.workletNode.port.postMessage({ type: "clear" });
     }

@@ -6,6 +6,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useChatSession } from "@/components/use-chat-session";
 import { useVoicePlayback } from "@/components/digital-human/use-voice-playback";
 import { FormattedMessage } from "@/components/formatted-message";
+import { stopActiveVoiceStream, streamVoiceChatMessage } from "@/lib/api-client";
 import { cn } from "@/lib/cn";
 
 const hotCategories = [
@@ -236,19 +237,37 @@ export default function ChatPage() {
     streamStatus,
     submitMessage
   } = useChatSession({
-    onStreamStart: () => {
-      void (async () => {
-        try {
-          await voice.prepare();
-        } catch {
-          await voice.markUnavailable();
+    onStreamStart: async () => {
+      try {
+        if (voice.usesServerVoice) {
+          stopActiveVoiceStream();
         }
-      })();
+        await voice.prepare();
+      } catch {
+        await voice.markUnavailable();
+      }
     },
     onStreamChunk: (delta) => {
       voice.speakChunk(delta);
     },
+    ...(voice.usesServerVoice
+      ? {
+          streamMessage: (payload, handlers) =>
+            streamVoiceChatMessage(payload, {
+              ...handlers,
+              onAudioChunk: (chunk) => {
+                voice.playAudioChunk(chunk);
+              },
+              onAudioDone: () => {
+                void voice.complete();
+              }
+            })
+        }
+      : {}),
     onStreamComplete: () => {
+      if (voice.usesServerVoice) {
+        return;
+      }
       void voice.complete();
     },
     onStreamError: () => {
@@ -398,11 +417,13 @@ export default function ChatPage() {
                       )
                     )}
 
-                    {/* Loading State */}
-                    {loading ? (
+                    {/* Loading / Streaming State */}
+                    {loading && streamReply ? (
                       <ChatBubble role="assistant">
-                        {streamReply || getStreamStatusText(streamStatus)}
+                        {streamReply}
                       </ChatBubble>
+                    ) : loading ? (
+                      <AssistantStatusLine text={getStreamStatusText(streamStatus)} />
                     ) : null}
 
                     {/* Error State */}
@@ -928,6 +949,19 @@ function ChatBubble({ children, role }: { children: ReactNode; role: "user" | "a
           <span>考生</span>
         </div>
       ) : null}
+    </div>
+  );
+}
+
+function AssistantStatusLine({ text }: { text: string }) {
+  return (
+    <div className="flex w-full items-start gap-3.5">
+      <div className="mt-1 h-10 w-10 shrink-0 overflow-hidden rounded-full border-2 border-white bg-gradient-to-br from-school-300 to-school-600 shadow-md">
+        <img src="/coze-replica/muyang-listen.gif" alt="沐阳头像" className="h-full w-full object-cover object-top" />
+      </div>
+      <div className="rounded-full border border-slate-200/70 bg-white/80 px-4 py-2 text-xs font-semibold text-slate-500 shadow-sm">
+        {text}
+      </div>
     </div>
   );
 }

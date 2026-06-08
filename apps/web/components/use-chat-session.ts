@@ -3,10 +3,13 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import {
+  type ChatRequestInput,
+  type ChatResult,
   streamChatMessage,
   type ChatCitation,
   type ChatProfileInput,
   type ChatStructuredResult,
+  type ChatStreamHandlers,
   type ChatStreamStatus
 } from "@/lib/api-client";
 
@@ -22,6 +25,7 @@ export type ChatSessionCallbacks = {
   onStreamError?: () => void | Promise<void>;
   onStreamStart?: () => void | Promise<void>;
   onReplyResolved?: (reply: string) => void;
+  streamMessage?: (input: ChatRequestInput, handlers: ChatStreamHandlers) => Promise<ChatResult>;
 };
 
 const STORAGE_KEY = "hnu.enrollment.chat.conversationId";
@@ -116,6 +120,10 @@ function normalizeProfileRecord(value: unknown): ChatProfileInput | undefined {
   };
 
   return Object.keys(profile).length > 0 ? profile : undefined;
+}
+
+function chooseDisplayReply(finalReply: string, streamedReply: string) {
+  return streamedReply.trim() ? streamedReply : finalReply;
 }
 
 export function extractProfile(structuredResult: ChatStructuredResult | null): ChatProfileInput | undefined {
@@ -218,11 +226,14 @@ export function useChatSession(callbacks: ChatSessionCallbacks = {}) {
         };
 
         await callbacks.onStreamStart?.();
-        const result = await streamChatMessage(payload, {
+        let streamedReply = "";
+        const streamMessage = callbacks.streamMessage ?? streamChatMessage;
+        const result = await streamMessage(payload, {
           onStatus(status) {
             setStreamStatus(status);
           },
           onChunk(delta) {
+            streamedReply += delta;
             setStreamReply((current) => current + delta);
             callbacks.onStreamChunk?.(delta);
           }
@@ -235,17 +246,18 @@ export function useChatSession(callbacks: ChatSessionCallbacks = {}) {
 
         setConversationId(result.conversationId);
         safeSetLocalStorageItem(STORAGE_KEY, result.conversationId);
+        const displayReply = chooseDisplayReply(result.reply, streamedReply);
         setStructuredResult(result.structuredResult ?? null);
         setCitations(Array.isArray(result.citations) ? result.citations : []);
         setMessages((current) => [
           ...current,
           {
             role: "assistant",
-            content: result.reply,
+            content: displayReply,
             meta: "助手"
           }
         ]);
-        callbacks.onReplyResolved?.(result.reply);
+        callbacks.onReplyResolved?.(displayReply);
       } catch {
         if (requestSeq.current !== seq) {
           return;

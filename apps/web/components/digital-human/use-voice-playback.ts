@@ -64,6 +64,16 @@ export function useVoicePlayback() {
     [tts]
   );
 
+  const playAudioChunk = useCallback(
+    (chunk: ArrayBuffer) => {
+      if (!voiceEnabled.current || !sessionPrepared.current) {
+        return;
+      }
+      tts.pushAudioData(chunk);
+    },
+    [tts]
+  );
+
   const complete = useCallback(async () => {
     if (!voiceEnabled.current) {
       return;
@@ -128,9 +138,11 @@ export function useVoicePlayback() {
     lastError,
     markUnavailable,
     prepare,
+    playAudioChunk,
     speakChunk,
     state: tts.state,
     stateLabel,
-    toggleMute: tts.toggleMute
+    toggleMute: tts.toggleMute,
+    usesServerVoice: tts.usesServerVoice
   };
 }

@@ -53,7 +53,24 @@ export type ChatStreamStatus = "resolving" | "retrieving" | "generating";
 export type ChatStreamHandlers = {
   onStatus?: (status: ChatStreamStatus) => void;
   onChunk?: (delta: string) => void;
+  onAudioChunk?: (chunk: ArrayBuffer) => void;
+  onAudioDone?: () => void;
 };
+
+let activeVoiceSocket: WebSocket | null = null;
+
+export function stopActiveVoiceStream() {
+  if (!activeVoiceSocket) {
+    return;
+  }
+  try {
+    activeVoiceSocket.close();
+  } catch {
+    // Ignore close errors from already-closed sockets.
+  } finally {
+    activeVoiceSocket = null;
+  }
+}
 
 function isChatStreamStatus(value: unknown): value is ChatStreamStatus {
   return value === "resolving" || value === "retrieving" || value === "generating";
@@ -73,6 +90,12 @@ function buildApiUrl(pathname: string, params?: Record<string, string | number |
       url.searchParams.set(key, String(value));
     }
   }
+  return url.toString();
+}
+
+function buildApiWsUrl(pathname: string) {
+  const url = new URL(pathname, getApiBaseUrl());
+  url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
   return url.toString();
 }
 
@@ -144,6 +167,12 @@ function parseEventBlock(block: string) {
     eventName,
     data: dataLines.join("\n")
   };
+}
+
+function yieldToBrowser() {
+  return new Promise<void>((resolve) => {
+    window.setTimeout(resolve, 0);
+  });
 }
 
 export type MajorCatalogItem = {
@@ -458,6 +487,7 @@ export async function streamChatMessage(input: ChatRequestInput, handlers: ChatS
   let buffer = "";
   let result: ChatResult | null = null;
   let emittedGenerating = false;
+  let chunksSinceYield = 0;
 
   while (true) {
     const { value, done } = await reader.read();
@@ -490,6 +520,11 @@ export async function streamChatMessage(input: ChatRequestInput, handlers: ChatS
         }
         if (payload.delta) {
           handlers.onChunk?.(payload.delta);
+          chunksSinceYield += 1;
+          if (chunksSinceYield >= 4) {
+            chunksSinceYield = 0;
+            await yieldToBrowser();
+          }
         }
         continue;
       }
@@ -518,6 +553,163 @@ export async function streamChatMessage(input: ChatRequestInput, handlers: ChatS
   }
 
   return result;
+}
+
+export async function streamVoiceChatMessage(
+  input: ChatRequestInput,
+  handlers: ChatStreamHandlers = {}
+) {
+  let currentStatus: ChatStreamStatus | null = null;
+  const emitStatus = (status: ChatStreamStatus) => {
+    if (currentStatus === status) {
+      return;
+    }
+    currentStatus = status;
+    handlers.onStatus?.(status);
+  };
+
+  emitStatus("resolving");
+
+  return new Promise<ChatResult>((resolve, reject) => {
+    stopActiveVoiceStream();
+    const socket = new WebSocket(buildApiWsUrl("/api/v1/chat/voice"));
+    activeVoiceSocket = socket;
+    socket.binaryType = "arraybuffer";
+
+    let result: ChatResult | null = null;
+    let emittedGenerating = false;
+    let settled = false;
+    let chunksSinceYield = 0;
+
+    const failOnce = (error: Error) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      if (activeVoiceSocket === socket) {
+        activeVoiceSocket = null;
+      }
+      try {
+        socket.close();
+      } catch {
+        // Ignore close errors from already-closed sockets.
+      }
+      reject(error);
+    };
+
+    socket.onopen = () => {
+      socket.send(JSON.stringify(input));
+    };
+
+    socket.onerror = () => {
+      failOnce(new Error("API request failed: voice stream websocket error"));
+    };
+
+    socket.onclose = () => {
+      if (activeVoiceSocket === socket) {
+        activeVoiceSocket = null;
+      }
+      if (!settled && !result) {
+        failOnce(new Error("API request failed: voice stream closed before final message"));
+      }
+    };
+
+    socket.onmessage = (event) => {
+      if (event.data instanceof ArrayBuffer) {
+        handlers.onAudioChunk?.(event.data);
+        return;
+      }
+
+      if (event.data instanceof Blob) {
+        void event.data.arrayBuffer().then((chunk) => {
+          handlers.onAudioChunk?.(chunk);
+        });
+        return;
+      }
+
+      if (typeof event.data !== "string") {
+        return;
+      }
+
+      let payload: Record<string, unknown>;
+      try {
+        payload = JSON.parse(event.data) as Record<string, unknown>;
+      } catch {
+        return;
+      }
+
+      if (payload.event === "status") {
+        if (isChatStreamStatus(payload.status)) {
+          emitStatus(payload.status);
+        }
+        return;
+      }
+
+      if (payload.event === "chunk") {
+        if (!emittedGenerating) {
+          emittedGenerating = true;
+          emitStatus("generating");
+        }
+        if (typeof payload.delta === "string" && payload.delta) {
+          handlers.onChunk?.(payload.delta);
+          chunksSinceYield += 1;
+          if (chunksSinceYield >= 4) {
+            chunksSinceYield = 0;
+            void yieldToBrowser();
+          }
+        }
+        return;
+      }
+
+      if (payload.event === "message") {
+        const envelope = payload.payload as ApiEnvelope<ChatResult>;
+        if (!envelope?.success) {
+          const error = envelope?.error;
+          failOnce(
+            new Error(
+              `API error: ${error?.code ?? "VOICE_STREAM_ERROR"}: ${
+                error?.message ?? "voice stream returned an error"
+              }`
+            )
+          );
+          return;
+        }
+        result = envelope.data;
+        if (!settled) {
+          settled = true;
+          resolve(result);
+        }
+        return;
+      }
+
+      if (payload.event === "error") {
+        failOnce(
+          new Error(
+            `API error: ${String(payload.code ?? "VOICE_STREAM_ERROR")}: ${String(
+              payload.message ?? "voice stream returned an error"
+            )}`
+          )
+        );
+        return;
+      }
+
+      if (payload.event === "tts_error") {
+        return;
+      }
+
+      if (payload.event === "done") {
+        if (activeVoiceSocket === socket) {
+          activeVoiceSocket = null;
+        }
+        handlers.onAudioDone?.();
+        if (!result && !settled) {
+          failOnce(new Error("API request failed: voice stream completed without a final message"));
+          return;
+        }
+        socket.close();
+      }
+    };
+  });
 }
 
 export async function listAdminImportBatches() {

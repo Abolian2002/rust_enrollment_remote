@@ -1,8 +1,12 @@
 use admissions_agent::AdmissionsAgent;
 use axum::{
     Json, Router,
-    extract::{Path, Query, State},
-    http::{HeaderMap, HeaderValue, Method, StatusCode},
+    body::Body,
+    extract::{
+        Path, Query, State,
+        ws::{Message, WebSocket, WebSocketUpgrade},
+    },
+    http::{HeaderMap, HeaderValue, Method, StatusCode, header},
     response::{
         IntoResponse, Response,
         sse::{Event, Sse},
@@ -11,6 +15,8 @@ use axum::{
 };
 use db::Database;
 use domain::{ChatRequest, fail, ok, ok_with_meta};
+use futures::{SinkExt, StreamExt};
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
 use std::{
@@ -19,7 +25,7 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-use tokio::sync::{Mutex, Semaphore, mpsc};
+use tokio::sync::{Mutex, Semaphore, mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
 use tower_http::{
     cors::{AllowOrigin, Any, CorsLayer},
@@ -46,6 +52,44 @@ struct TtsRateBucket {
 struct TtsTokenLimiter {
     limit_per_minute: u32,
     buckets: Mutex<HashMap<String, TtsRateBucket>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TtsSpeechRequest {
+    input: String,
+    model: Option<String>,
+    voice: Option<String>,
+}
+
+#[derive(Debug)]
+enum VoiceWsOut {
+    Json(serde_json::Value),
+    Audio(Vec<u8>),
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ServerTtsSegmenterConfig {
+    first_min_chars: usize,
+    first_max_chars: usize,
+    min_chars: usize,
+    max_chars: usize,
+    flush_after: Duration,
+}
+
+#[derive(Debug)]
+struct ServerTtsSegmenter {
+    buffer: String,
+    emitted_count: usize,
+    config: ServerTtsSegmenterConfig,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct VoiceChatErrorPayload {
+    event: &'static str,
+    code: &'static str,
+    message: &'static str,
 }
 
 #[tokio::main]
@@ -100,6 +144,7 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/v1/health", get(health))
         .route("/api/v1/chat", post(chat))
         .route("/api/v1/chat/stream", post(chat_stream))
+        .route("/api/v1/chat/voice", get(chat_voice_ws))
         .route("/api/v1/chat/history/{conversation_id}", get(chat_history))
         .route("/api/v1/majors", get(list_majors))
         .route("/api/v1/majors/{slug}", get(get_major))
@@ -111,6 +156,8 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/v1/knowledge/faq", get(knowledge_faq))
         .route("/api/v1/knowledge/policies", get(knowledge_policies))
         .route("/api/v1/tts/token", post(tts_token))
+        .route("/api/v1/tts/speech", post(tts_speech))
+        .route("/api/v1/tts/stream", post(tts_stream))
         .layer(TraceLayer::new_for_http())
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
@@ -319,6 +366,374 @@ async fn chat_stream(
     Sse::new(ReceiverStream::new(rx))
         .keep_alive(axum::response::sse::KeepAlive::default())
         .into_response()
+}
+
+async fn chat_voice_ws(
+    ws: WebSocketUpgrade,
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Response {
+    if !tts_auth_allowed(&headers) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(fail("UNAUTHORIZED", "Voice chat access is not authorized")),
+        )
+            .into_response();
+    }
+    let rate_key = client_rate_key(&headers);
+    if !state.tts_limiter.allow(&rate_key).await {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(fail(
+                "TTS_RATE_LIMITED",
+                "语音服务请求过于频繁，请稍后再试。",
+            )),
+        )
+            .into_response();
+    }
+
+    ws.on_upgrade(move |socket| handle_voice_socket(socket, state))
+        .into_response()
+}
+
+async fn handle_voice_socket(mut socket: WebSocket, state: Arc<AppState>) {
+    let payload = match read_voice_chat_init(&mut socket).await {
+        Ok(payload) => payload,
+        Err(error) => {
+            let _ = socket
+                .send(Message::Text(
+                    json!(VoiceChatErrorPayload {
+                        event: "error",
+                        code: "VOICE_INIT_ERROR",
+                        message: error,
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await;
+            let _ = socket.close().await;
+            return;
+        }
+    };
+
+    let Ok(permit) = state.chat_semaphore.clone().try_acquire_owned() else {
+        let _ = socket
+            .send(Message::Text(
+                json!(VoiceChatErrorPayload {
+                    event: "error",
+                    code: "CHAT_BUSY",
+                    message: "当前咨询人数较多，请稍后再试。",
+                })
+                .to_string()
+                .into(),
+            ))
+            .await;
+        let _ = socket.close().await;
+        return;
+    };
+
+    let (mut sender, mut receiver) = socket.split();
+    let (out_tx, mut out_rx) = mpsc::channel::<VoiceWsOut>(64);
+    let (cancel_tx, cancel_rx) = watch::channel(false);
+
+    let writer = tokio::spawn(async move {
+        while let Some(message) = out_rx.recv().await {
+            let result = match message {
+                VoiceWsOut::Json(value) => {
+                    sender.send(Message::Text(value.to_string().into())).await
+                }
+                VoiceWsOut::Audio(bytes) => sender.send(Message::Binary(bytes.into())).await,
+            };
+            if result.is_err() {
+                break;
+            }
+        }
+    });
+
+    let reader_cancel = cancel_tx.clone();
+    let reader = tokio::spawn(async move {
+        while let Some(message) = receiver.next().await {
+            match message {
+                Ok(Message::Close(_)) | Err(_) => break,
+                _ => {}
+            }
+        }
+        let _ = reader_cancel.send(true);
+    });
+
+    let (tts_delta_tx, tts_delta_rx) = mpsc::unbounded_channel::<String>();
+    let (tts_segment_tx, tts_segment_rx) = mpsc::channel::<String>(16);
+    let segmenter_config = server_tts_segmenter_config();
+    let segmenter_cancel = cancel_rx.clone();
+    let segmenter = tokio::spawn(run_server_tts_segmenter(
+        tts_delta_rx,
+        tts_segment_tx,
+        segmenter_config,
+        segmenter_cancel,
+    ));
+    let synth = tokio::spawn(run_server_tts_synth(
+        state.clone(),
+        tts_segment_rx,
+        out_tx.clone(),
+        cancel_rx.clone(),
+    ));
+
+    let _permit = permit;
+    let agent = state.agent.clone();
+    let _ = send_voice_json(&out_tx, json!({ "event": "status", "status": "resolving" })).await;
+    let _ = send_voice_json(
+        &out_tx,
+        json!({ "event": "status", "status": "retrieving" }),
+    )
+    .await;
+
+    let mut generating_sent = false;
+    let stream_future = agent.chat_stream_with_deltas(payload, |conversation_id, delta| {
+        let out_tx = out_tx.clone();
+        let tts_delta_tx = tts_delta_tx.clone();
+        let cancel_rx = cancel_rx.clone();
+        let should_send_generating = !generating_sent;
+        generating_sent = true;
+        async move {
+            if *cancel_rx.borrow() {
+                return false;
+            }
+            if should_send_generating
+                && !send_voice_json(
+                    &out_tx,
+                    json!({ "event": "status", "status": "generating" }),
+                )
+                .await
+            {
+                return false;
+            }
+            if !send_voice_json(
+                &out_tx,
+                json!({
+                    "event": "chunk",
+                    "conversationId": conversation_id,
+                    "delta": delta,
+                }),
+            )
+            .await
+            {
+                return false;
+            }
+            let _ = tts_delta_tx.send(delta);
+            true
+        }
+    });
+
+    let agent_result = tokio::time::timeout(agent_timeout_duration(), stream_future).await;
+    drop(tts_delta_tx);
+
+    match agent_result {
+        Ok(Ok(reply)) => {
+            if !generating_sent {
+                let _ = send_voice_json(
+                    &out_tx,
+                    json!({ "event": "status", "status": "generating" }),
+                )
+                .await;
+            }
+            let meta = if client_diagnostics_enabled() {
+                reply
+                    .diagnostics
+                    .as_ref()
+                    .map(|diagnostics| json!({ "diagnostics": diagnostics }))
+                    .unwrap_or_else(|| json!({}))
+            } else {
+                json!({})
+            };
+            let _ = send_voice_json(
+                &out_tx,
+                json!({
+                    "event": "message",
+                    "payload": ok_with_meta(reply, meta),
+                }),
+            )
+            .await;
+        }
+        Ok(Err(error)) => {
+            tracing::error!(error = %error, "voice chat request failed");
+            let _ = send_voice_json(
+                &out_tx,
+                json!(VoiceChatErrorPayload {
+                    event: "error",
+                    code: "CHAT_ERROR",
+                    message: "当前咨询人数较多，暂时无法完成本次查询，请稍后再试。",
+                }),
+            )
+            .await;
+        }
+        Err(_) => {
+            tracing::warn!("voice chat request timed out");
+            let _ = send_voice_json(
+                &out_tx,
+                json!(VoiceChatErrorPayload {
+                    event: "error",
+                    code: "CHAT_TIMEOUT",
+                    message: "本次查询耗时较长，请稍后重试。",
+                }),
+            )
+            .await;
+        }
+    }
+
+    let _ = segmenter.await;
+    let _ = synth.await;
+    let _ = send_voice_json(&out_tx, json!({ "event": "done" })).await;
+    let _ = cancel_tx.send(true);
+    drop(out_tx);
+    let _ = writer.await;
+    reader.abort();
+}
+
+async fn read_voice_chat_init(socket: &mut WebSocket) -> Result<ChatRequest, &'static str> {
+    let message = tokio::time::timeout(Duration::from_secs(10), socket.recv())
+        .await
+        .map_err(|_| "语音会话初始化超时，请重新发送问题。")?
+        .ok_or("语音连接已断开，请重新发送问题。")?
+        .map_err(|_| "语音连接异常，请重新发送问题。")?;
+
+    let text = match message {
+        Message::Text(text) => text.to_string(),
+        Message::Binary(bytes) => {
+            String::from_utf8(bytes.to_vec()).map_err(|_| "语音会话初始化数据格式不正确。")?
+        }
+        _ => return Err("语音会话初始化数据格式不正确。"),
+    };
+
+    serde_json::from_str::<ChatRequest>(&text).map_err(|_| "语音会话请求格式不正确。")
+}
+
+async fn send_voice_json(out_tx: &mpsc::Sender<VoiceWsOut>, value: serde_json::Value) -> bool {
+    out_tx.send(VoiceWsOut::Json(value)).await.is_ok()
+}
+
+async fn run_server_tts_segmenter(
+    mut delta_rx: mpsc::UnboundedReceiver<String>,
+    segment_tx: mpsc::Sender<String>,
+    config: ServerTtsSegmenterConfig,
+    cancel_rx: watch::Receiver<bool>,
+) {
+    let mut segmenter = ServerTtsSegmenter::new(config);
+    loop {
+        if *cancel_rx.borrow() {
+            break;
+        }
+
+        if segmenter.is_empty() {
+            match delta_rx.recv().await {
+                Some(delta) => {
+                    for segment in segmenter.push(&delta) {
+                        if segment_tx.send(segment).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+                None => break,
+            }
+            continue;
+        }
+
+        match tokio::time::timeout(config.flush_after, delta_rx.recv()).await {
+            Ok(Some(delta)) => {
+                for segment in segmenter.push(&delta) {
+                    if segment_tx.send(segment).await.is_err() {
+                        return;
+                    }
+                }
+            }
+            Ok(None) => break,
+            Err(_) => {
+                if let Some(segment) = segmenter.flush_latency() {
+                    if segment_tx.send(segment).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    for segment in segmenter.finish() {
+        if segment_tx.send(segment).await.is_err() {
+            return;
+        }
+    }
+}
+
+async fn run_server_tts_synth(
+    state: Arc<AppState>,
+    mut segment_rx: mpsc::Receiver<String>,
+    out_tx: mpsc::Sender<VoiceWsOut>,
+    cancel_rx: watch::Receiver<bool>,
+) {
+    while let Some(segment) = segment_rx.recv().await {
+        if *cancel_rx.borrow() {
+            break;
+        }
+        if let Err(error) = stream_tts_segment(&state, &segment, &out_tx, &cancel_rx).await {
+            tracing::warn!(error = %error, "server-side voice TTS segment failed");
+            let _ = send_voice_json(
+                &out_tx,
+                json!(VoiceChatErrorPayload {
+                    event: "tts_error",
+                    code: "TTS_STREAM_ERROR",
+                    message: "语音播报暂时不稳定，文字回答仍可正常查看。",
+                }),
+            )
+            .await;
+            break;
+        }
+    }
+}
+
+async fn stream_tts_segment(
+    state: &AppState,
+    segment: &str,
+    out_tx: &mpsc::Sender<VoiceWsOut>,
+    cancel_rx: &watch::Receiver<bool>,
+) -> anyhow::Result<()> {
+    let endpoint = local_tts_stream_url();
+    let response = state
+        .tts_http
+        .post(endpoint)
+        .json(&json!({
+            "model": local_tts_model(),
+            "voice": local_tts_voice(),
+            "input": segment,
+        }))
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body_len = response
+            .text()
+            .await
+            .map(|body| body.len())
+            .unwrap_or_default();
+        anyhow::bail!("local streaming TTS returned {status}; body_len={body_len}");
+    }
+
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        if *cancel_rx.borrow() {
+            break;
+        }
+        let chunk = chunk?;
+        if !chunk.is_empty()
+            && out_tx
+                .send(VoiceWsOut::Audio(chunk.to_vec()))
+                .await
+                .is_err()
+        {
+            break;
+        }
+    }
+
+    Ok(())
 }
 
 fn status_event(status: &'static str) -> Event {
@@ -616,6 +1031,484 @@ async fn tts_token(State(state): State<Arc<AppState>>, headers: HeaderMap) -> im
                 .into_response()
         }
     }
+}
+
+async fn tts_speech(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(payload): Json<TtsSpeechRequest>,
+) -> Response {
+    if !tts_auth_allowed(&headers) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(fail("UNAUTHORIZED", "TTS speech access is not authorized")),
+        )
+            .into_response();
+    }
+    let rate_key = client_rate_key(&headers);
+    if !state.tts_limiter.allow(&rate_key).await {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(fail(
+                "TTS_RATE_LIMITED",
+                "语音服务请求过于频繁，请稍后再试。",
+            )),
+        )
+            .into_response();
+    }
+
+    let input = payload.input.trim();
+    if input.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(fail("TTS_INPUT_EMPTY", "语音合成文本不能为空。")),
+        )
+            .into_response();
+    }
+    let max_chars = read_env_usize("TTS_SPEECH_MAX_CHARS", 1600);
+    if input.chars().count() > max_chars {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(fail(
+                "TTS_INPUT_TOO_LONG",
+                "语音合成文本过长，请缩短后重试。",
+            )),
+        )
+            .into_response();
+    }
+
+    let endpoint = std::env::var("LOCAL_TTS_SPEECH_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "http://127.0.0.1:50000/v1/audio/speech".to_owned());
+    let model = payload
+        .model
+        .or_else(|| std::env::var("LOCAL_TTS_MODEL").ok())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "cosyvoice3".to_owned());
+    let voice = payload
+        .voice
+        .or_else(|| std::env::var("LOCAL_TTS_VOICE").ok())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "default".to_owned());
+
+    let response = match state
+        .tts_http
+        .post(endpoint)
+        .json(&json!({
+            "model": model,
+            "voice": voice,
+            "input": input,
+        }))
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::error!(error = %error, "failed to request local TTS speech");
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(fail("TTS_SPEECH_ERROR", "语音服务暂时不可用，请稍后再试。")),
+            )
+                .into_response();
+        }
+    };
+
+    let status = response.status();
+    let content_type = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("audio/wav")
+        .to_owned();
+
+    if !status.is_success() {
+        let body_len = response
+            .text()
+            .await
+            .map(|body| body.len())
+            .unwrap_or_default();
+        tracing::error!(%status, body_len, "local TTS speech API returned an error");
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(fail("TTS_SPEECH_ERROR", "语音服务暂时不可用，请稍后再试。")),
+        )
+            .into_response();
+    }
+
+    let bytes = match response.bytes().await {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            tracing::error!(error = %error, "failed to read local TTS speech body");
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(fail("TTS_SPEECH_ERROR", "语音服务返回异常，请稍后再试。")),
+            )
+                .into_response();
+        }
+    };
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, content_type)
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(Body::from(bytes))
+        .unwrap_or_else(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(fail("TTS_SPEECH_ERROR", "语音响应生成失败。")),
+            )
+                .into_response()
+        })
+}
+
+async fn tts_stream(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(payload): Json<TtsSpeechRequest>,
+) -> Response {
+    if !tts_auth_allowed(&headers) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(fail("UNAUTHORIZED", "TTS stream access is not authorized")),
+        )
+            .into_response();
+    }
+    let rate_key = client_rate_key(&headers);
+    if !state.tts_limiter.allow(&rate_key).await {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(fail(
+                "TTS_RATE_LIMITED",
+                "语音服务请求过于频繁，请稍后再试。",
+            )),
+        )
+            .into_response();
+    }
+
+    let input = payload.input.trim();
+    if input.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(fail("TTS_INPUT_EMPTY", "语音合成文本不能为空。")),
+        )
+            .into_response();
+    }
+    let max_chars = read_env_usize("TTS_SPEECH_MAX_CHARS", 1600);
+    if input.chars().count() > max_chars {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(fail(
+                "TTS_INPUT_TOO_LONG",
+                "语音合成文本过长，请缩短后重试。",
+            )),
+        )
+            .into_response();
+    }
+
+    let endpoint = std::env::var("LOCAL_TTS_STREAM_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "http://127.0.0.1:50000/v1/audio/stream".to_owned());
+    let model = payload
+        .model
+        .or_else(|| std::env::var("LOCAL_TTS_MODEL").ok())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "cosyvoice3".to_owned());
+    let voice = payload
+        .voice
+        .or_else(|| std::env::var("LOCAL_TTS_VOICE").ok())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "default".to_owned());
+
+    let response = match state
+        .tts_http
+        .post(endpoint)
+        .json(&json!({
+            "model": model,
+            "voice": voice,
+            "input": input,
+        }))
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::error!(error = %error, "failed to request local streaming TTS");
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(fail("TTS_STREAM_ERROR", "语音服务暂时不可用，请稍后再试。")),
+            )
+                .into_response();
+        }
+    };
+
+    let status = response.status();
+    let content_type = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("application/octet-stream")
+        .to_owned();
+    let sample_rate = response
+        .headers()
+        .get("x-audio-sample-rate")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("24000")
+        .to_owned();
+
+    if !status.is_success() {
+        let body_len = response
+            .text()
+            .await
+            .map(|body| body.len())
+            .unwrap_or_default();
+        tracing::error!(%status, body_len, "local streaming TTS API returned an error");
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(fail("TTS_STREAM_ERROR", "语音服务暂时不可用，请稍后再试。")),
+        )
+            .into_response();
+    }
+
+    let stream = response.bytes_stream().map(|result| {
+        result.map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("streaming TTS chunk failed: {error}"),
+            )
+        })
+    });
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, content_type)
+        .header(header::CACHE_CONTROL, "no-store")
+        .header("x-audio-format", "pcm_s16le")
+        .header("x-audio-sample-rate", sample_rate)
+        .body(Body::from_stream(stream))
+        .unwrap_or_else(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(fail("TTS_STREAM_ERROR", "语音流响应生成失败。")),
+            )
+                .into_response()
+        })
+}
+
+impl ServerTtsSegmenterConfig {
+    fn from_env() -> Self {
+        Self {
+            first_min_chars: read_env_usize("SERVER_TTS_FIRST_MIN_SEGMENT_CHARS", 8),
+            first_max_chars: read_env_usize("SERVER_TTS_FIRST_MAX_SEGMENT_CHARS", 30),
+            min_chars: read_env_usize("SERVER_TTS_MIN_SEGMENT_CHARS", 22),
+            max_chars: read_env_usize("SERVER_TTS_MAX_SEGMENT_CHARS", 56),
+            flush_after: Duration::from_millis(read_env_u64("SERVER_TTS_FLUSH_AFTER_MS", 420)),
+        }
+    }
+}
+
+impl ServerTtsSegmenter {
+    fn new(config: ServerTtsSegmenterConfig) -> Self {
+        Self {
+            buffer: String::new(),
+            emitted_count: 0,
+            config,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        clean_tts_segment(&self.buffer).is_empty()
+    }
+
+    fn push(&mut self, delta: &str) -> Vec<String> {
+        let normalized = normalize_tts_delta(delta);
+        if !normalized.is_empty() {
+            if needs_space_between(&self.buffer, &normalized) {
+                self.buffer.push(' ');
+            }
+            self.buffer.push_str(&normalized);
+        }
+        self.drain_ready(false)
+    }
+
+    fn flush_latency(&mut self) -> Option<String> {
+        let min_chars = if self.emitted_count == 0 {
+            self.config.first_min_chars
+        } else {
+            self.config.min_chars
+        };
+        if clean_tts_segment(&self.buffer).chars().count() < min_chars {
+            return None;
+        }
+        self.take_prefix(best_latency_split_index(
+            &self.buffer,
+            self.effective_max_chars(),
+        ))
+    }
+
+    fn finish(&mut self) -> Vec<String> {
+        self.drain_ready(true)
+    }
+
+    fn drain_ready(&mut self, flush: bool) -> Vec<String> {
+        let mut segments = Vec::new();
+        loop {
+            self.trim_start();
+            if self.buffer.is_empty() {
+                break;
+            }
+
+            let min_chars = if self.emitted_count == 0 {
+                self.config.first_min_chars
+            } else {
+                self.config.min_chars
+            };
+
+            let split_index = find_sentence_split_index(&self.buffer, min_chars)
+                .or_else(|| find_max_split_index(&self.buffer, self.effective_max_chars()))
+                .or_else(|| if flush { Some(self.buffer.len()) } else { None });
+
+            let Some(split_index) = split_index else {
+                break;
+            };
+            let Some(segment) = self.take_prefix(split_index) else {
+                break;
+            };
+            segments.push(segment);
+        }
+        segments
+    }
+
+    fn take_prefix(&mut self, split_index: usize) -> Option<String> {
+        let split_index = split_index.min(self.buffer.len());
+        let remaining = self.buffer.split_off(split_index);
+        let segment = clean_tts_segment(&self.buffer);
+        self.buffer = remaining;
+        if segment.is_empty() {
+            return None;
+        }
+        self.emitted_count += 1;
+        Some(segment)
+    }
+
+    fn trim_start(&mut self) {
+        let trimmed = self.buffer.trim_start();
+        if trimmed.len() != self.buffer.len() {
+            self.buffer = trimmed.to_owned();
+        }
+    }
+
+    fn effective_max_chars(&self) -> usize {
+        if self.emitted_count == 0 {
+            self.config.first_max_chars
+        } else {
+            self.config.max_chars
+        }
+    }
+}
+
+fn server_tts_segmenter_config() -> ServerTtsSegmenterConfig {
+    ServerTtsSegmenterConfig::from_env()
+}
+
+fn normalize_tts_delta(delta: &str) -> String {
+    let mut out = String::new();
+    let mut previous_space = false;
+    for ch in delta.chars() {
+        if matches!(
+            ch,
+            '`' | '*' | '_' | '#' | '>' | '[' | ']' | '(' | ')' | '{' | '}'
+        ) {
+            continue;
+        }
+        if ch.is_whitespace() {
+            if !previous_space && !out.is_empty() {
+                out.push(' ');
+                previous_space = true;
+            }
+            continue;
+        }
+        out.push(ch);
+        previous_space = false;
+    }
+    out
+}
+
+fn clean_tts_segment(segment: &str) -> String {
+    let normalized = normalize_tts_delta(segment);
+    normalized
+        .trim_matches(|ch: char| matches!(ch, '-' | '|' | ':' | '：' | ',' | '，' | '、'))
+        .trim()
+        .to_owned()
+}
+
+fn needs_space_between(current: &str, next: &str) -> bool {
+    let Some(last) = current.chars().last() else {
+        return false;
+    };
+    let Some(first) = next.chars().next() else {
+        return false;
+    };
+    last.is_ascii_alphanumeric() && first.is_ascii_alphanumeric()
+}
+
+fn find_sentence_split_index(text: &str, min_chars: usize) -> Option<usize> {
+    let mut count = 0usize;
+    for (index, ch) in text.char_indices() {
+        count += 1;
+        if count >= min_chars && matches!(ch, '。' | '！' | '？' | '!' | '?' | '；' | ';' | '\n')
+        {
+            return Some(index + ch.len_utf8());
+        }
+    }
+    None
+}
+
+fn find_max_split_index(text: &str, max_chars: usize) -> Option<usize> {
+    let mut count = 0usize;
+    let mut fallback = None;
+    let mut natural = None;
+    for (index, ch) in text.char_indices() {
+        count += 1;
+        if count >= 12 && matches!(ch, '，' | ',' | '、' | '：' | ':' | ' ') {
+            natural = Some(index + ch.len_utf8());
+        }
+        if count == max_chars {
+            fallback = Some(index + ch.len_utf8());
+        }
+        if count > max_chars {
+            return natural.or(fallback);
+        }
+    }
+    None
+}
+
+fn best_latency_split_index(text: &str, max_chars: usize) -> usize {
+    find_sentence_split_index(text, 8)
+        .or_else(|| find_max_split_index(text, max_chars))
+        .unwrap_or(text.len())
+}
+
+fn local_tts_stream_url() -> String {
+    std::env::var("LOCAL_TTS_STREAM_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "http://127.0.0.1:50000/v1/audio/stream".to_owned())
+}
+
+fn local_tts_model() -> String {
+    std::env::var("LOCAL_TTS_MODEL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "cosyvoice3".to_owned())
+}
+
+fn local_tts_voice() -> String {
+    std::env::var("LOCAL_TTS_VOICE")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "default".to_owned())
 }
 
 impl TtsTokenLimiter {

@@ -67,13 +67,16 @@ export function ChatTranscript({ loading, messages, streamReply, streamStatus }:
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
               </svg>
             </div>
-            <div className="rounded-[26px] rounded-tl-md border border-white/80 bg-white px-5 py-4 shadow-[0_18px_60px_rgba(15,23,42,0.06)]">
-              <p className="mb-2 text-[11px] font-semibold uppercase tracking-[0.2em] text-school-600">智能招生顾问</p>
-              <p className="text-sm font-medium text-ink-500">{getStreamStatusText(streamStatus)}</p>
-              {streamReply ? (
-                <FormattedMessage className="mt-3 text-[15px] leading-8 text-ink-800" text={streamReply} />
-              ) : null}
-            </div>
+            {streamReply ? (
+              <div className="rounded-[26px] rounded-tl-md border border-white/80 bg-white px-5 py-4 shadow-[0_18px_60px_rgba(15,23,42,0.06)]">
+                <p className="mb-2 text-[11px] font-semibold uppercase tracking-[0.2em] text-school-600">智能招生顾问</p>
+                <FormattedMessage className="text-[15px] leading-8 text-ink-800" text={streamReply} />
+              </div>
+            ) : (
+              <div className="rounded-full border border-white/80 bg-white/80 px-4 py-2 text-xs font-semibold text-ink-500 shadow-[0_18px_60px_rgba(15,23,42,0.05)]">
+                {getStreamStatusText(streamStatus)}
+              </div>
+            )}
           </div>
         </div>
       ) : null}

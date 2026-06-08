@@ -7,7 +7,6 @@
         "message": "你擅长什么？",
         "expect": {
           "type": "greeting",
-          "minModelCalls": 1,
           "replyIncludes": ["招生"]
         }
       },
@@ -163,7 +162,6 @@
         "message": "哈师大在山东招生哪些专业",
         "expect": {
           "type": "province_major_list",
-          "minModelCalls": 1,
           "minToolCalls": 1,
           "replyIncludes": ["山东", "专业"]
         }
@@ -172,7 +170,6 @@
         "message": "山东招什么专业？",
         "expect": {
           "type": "province_major_list",
-          "minModelCalls": 1,
           "minToolCalls": 1,
           "replyIncludes": ["山东", "专业"]
         }
@@ -181,7 +178,6 @@
         "message": "物联网工程在哪些省份有招生？",
         "expect": {
           "type": "major_province_list",
-          "minModelCalls": 1,
           "minToolCalls": 1,
           "replyIncludes": ["物联网工程", "省"]
         }

@@ -713,7 +713,7 @@ impl AdmissionsAgent {
             )
             .await?;
         let citations = citations_from_structured_result(&structured);
-        let reply = render_province_major_list_answer(&structured);
+        let reply = render_province_major_list_answer_for_query(&structured, message);
         Ok((reply, structured, citations, 1))
     }
 
@@ -1005,6 +1005,22 @@ fn turn_synthesis_constraint(
     if is_compound_fact_question(user_message) {
         constraints.push("用户本轮同时问了多个事实点。最终回答必须逐项回应每个事实点；如果结构化证据只覆盖其中一部分，要明确说明未覆盖部分在当前证据中没有直接条款支持，不能把相近条款当成确定事实。");
     }
+    let policy_facets = policy_facets_in_message(user_message);
+    let policy_constraint = if !policy_facets.is_empty()
+        && matches!(
+            structured_result,
+            ChatStructuredResult::KnowledgeAnswer { .. }
+        ) {
+        Some(format!(
+            "用户本轮明确问到这些政策点：{}。最终回答必须逐项覆盖这些政策点，并保留这些原词或清晰同义词；证据没有直接覆盖的政策点，也要明确说明当前证据中未见直接条款支持。",
+            policy_facets.join("、")
+        ))
+    } else {
+        None
+    };
+    if let Some(policy_constraint) = &policy_constraint {
+        constraints.push(policy_constraint.as_str());
+    }
     if probability_uses_unspecified_subject_records(structured_result).is_some() {
         constraints.push("结构化结果的实际录取记录科类是“未区分”。如果用户提到了历史类、物理类、文科或理科，必须说明统计表未单列该科类，只能按未区分科类/普通类记录作参考；不得说暂未找到该专业录取记录。");
     }
@@ -1026,6 +1042,24 @@ fn is_compound_fact_question(message: &str) -> bool {
                 "限制", "要求", "规则", "安排", "课程", "学分", "实践", "实习",
             ],
         )
+}
+
+fn policy_facets_in_message(message: &str) -> Vec<&'static str> {
+    let candidates = [
+        ("外语语种", &["外语语种", "外语", "语种"][..]),
+        ("单科成绩", &["单科成绩", "单科", "英语成绩"][..]),
+        ("专业级差", &["专业级差", "级差"][..]),
+        ("服从调剂", &["服从调剂", "调剂"][..]),
+        ("退档", &["退档"][..]),
+        ("同分排序", &["同分", "分数相同", "成绩相同", "排序"][..]),
+        ("体检要求", &["体检", "身体健康"][..]),
+        ("选考科目", &["选考", "选科", "科目要求"][..]),
+        ("男女比例", &["男女比例", "性别比例", "男生", "女生"][..]),
+    ];
+    candidates
+        .iter()
+        .filter_map(|(facet, markers)| contains_any_text(message, markers).then_some(*facet))
+        .collect()
 }
 
 pub fn chunk_reply_text(reply: &str) -> Vec<String> {
@@ -2818,8 +2852,6 @@ fn should_synthesize(structured_result: &ChatStructuredResult) -> bool {
         ChatStructuredResult::ScoreQuery { .. }
             | ChatStructuredResult::ProbabilityAssessment { .. }
             | ChatStructuredResult::KnowledgeAnswer { .. }
-            | ChatStructuredResult::ProvinceMajorList { .. }
-            | ChatStructuredResult::MajorProvinceList { .. }
             | ChatStructuredResult::MajorDisambiguation { .. }
             | ChatStructuredResult::EvidenceBundle { .. }
             | ChatStructuredResult::GeneralAnswer { .. }
@@ -3526,6 +3558,25 @@ fn citations_from_structured_result(result: &ChatStructuredResult) -> Vec<ChatCi
 }
 
 fn render_province_major_list_answer(result: &ChatStructuredResult) -> String {
+    render_province_major_list_answer_with_limit(result, province_major_default_display_limit())
+}
+
+fn render_province_major_list_answer_for_query(
+    result: &ChatStructuredResult,
+    query: &str,
+) -> String {
+    let limit = if asks_expanded_list(query) {
+        province_major_expanded_display_limit()
+    } else {
+        province_major_default_display_limit()
+    };
+    render_province_major_list_answer_with_limit(result, limit)
+}
+
+fn render_province_major_list_answer_with_limit(
+    result: &ChatStructuredResult,
+    display_limit: usize,
+) -> String {
     let ChatStructuredResult::ProvinceMajorList {
         province,
         subject_type,
@@ -3548,9 +3599,19 @@ fn render_province_major_list_answer(result: &ChatStructuredResult) -> String {
         );
     }
 
+    let distinct_major_count = majors
+        .iter()
+        .map(|item| item.major_name.as_str())
+        .collect::<HashSet<_>>()
+        .len();
+    let effective_limit = if majors.len() <= display_limit {
+        majors.len()
+    } else {
+        display_limit
+    };
     let list = majors
         .iter()
-        .take(60)
+        .take(effective_limit)
         .map(|item| {
             let count = item
                 .admitted_count
@@ -3564,10 +3625,13 @@ fn render_province_major_list_answer(result: &ChatStructuredResult) -> String {
         })
         .collect::<Vec<_>>()
         .join("、");
-    let more = if majors.len() > 60 {
-        format!("等 {} 个专业/方向", majors.len())
+    let more = if majors.len() > effective_limit {
+        format!(
+            "我先列出前 {effective_limit} 条代表性专业/批次记录，完整记录共 {} 条",
+            majors.len(),
+        )
     } else {
-        format!("共 {} 个专业/方向", majors.len())
+        format!("共 {} 条专业/批次记录", majors.len())
     };
     let subject_text = subject_type
         .as_deref()
@@ -3576,9 +3640,14 @@ fn render_province_major_list_answer(result: &ChatStructuredResult) -> String {
     let year_text = year
         .map(|value| value.to_string())
         .unwrap_or_else(|| "最新一年".to_owned());
+    let continuation = if majors.len() > effective_limit {
+        "如果你需要完整名单，我可以继续按“本科批、专项计划、公费师范、艺术类、体育类”等批次分段列出来，读起来会更清楚。"
+    } else {
+        ""
+    };
 
     format!(
-        "我查到已导入录取统计中，{province}{year_text}年（{subject_text}）有录取记录的专业/方向{more}：{list}。\n\n需要说明：{note}如果你要填报志愿，最终仍要以所在省级招生考试机构公布的招生计划和学校官方招生章程为准。"
+        "我查到已导入录取统计中，{province}{year_text}年（{subject_text}）有录取记录的专业名去重后约 {distinct_major_count} 个；按专业名称、批次和统计口径展开，{more}：{list}。\n\n这里同一个专业在本科批、专项计划、公费师范生、艺术类或体育类等不同批次中可能会重复出现。{continuation}\n\n需要说明：{note}如果你要填报志愿，最终仍要以所在省级招生考试机构公布的招生计划和学校官方招生章程为准。"
     )
 }
 
@@ -3632,6 +3701,40 @@ fn render_major_province_list_answer(result: &ChatStructuredResult) -> String {
     format!(
         "我查到已导入录取统计中，{major_name}在{year_text}年（{subject_text}）有录取记录的省份/地区共 {} 个：{list}。\n\n需要说明：{note}如果你要填报志愿，最终仍要以所在省教育考试院公布的招生计划和学校官方招生章程为准。",
         provinces.len()
+    )
+}
+
+fn province_major_default_display_limit() -> usize {
+    std::env::var("PROVINCE_MAJOR_LIST_DEFAULT_LIMIT")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| (8..=80).contains(value))
+        .unwrap_or(36)
+}
+
+fn province_major_expanded_display_limit() -> usize {
+    std::env::var("PROVINCE_MAJOR_LIST_EXPANDED_LIMIT")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| (24..=220).contains(value))
+        .unwrap_or(120)
+}
+
+fn asks_expanded_list(message: &str) -> bool {
+    contains_any_text(
+        message,
+        &[
+            "全部",
+            "所有",
+            "完整",
+            "详细列",
+            "都列",
+            "全列",
+            "完整名单",
+            "全部名单",
+            "所有专业",
+            "所有省份",
+        ],
     )
 }
 

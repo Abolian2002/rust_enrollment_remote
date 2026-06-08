@@ -742,9 +742,20 @@ pub fn infer_knowledge_filters(query: &str) -> KnowledgeSearchFilters {
             "招生计划",
             "招生专业",
             "招生网站",
+            "本科招生网",
+            "招生网址",
+            "招生官网",
             "招生咨询",
+            "招生电话",
+            "招生办电话",
             "咨询电话",
             "联系电话",
+            "联系方式",
+            "官方网址",
+            "官方网站",
+            "学校官网",
+            "官网",
+            "网址",
             "录取规则",
             "专业级差",
             "级差",
@@ -1045,9 +1056,20 @@ fn is_knowledge_message(message: &str) -> bool {
             "体检",
             "语种",
             "招生网站",
+            "本科招生网",
+            "招生网址",
+            "招生官网",
             "招生咨询",
+            "招生电话",
+            "招生办电话",
             "咨询电话",
             "联系电话",
+            "联系方式",
+            "官方网址",
+            "官方网站",
+            "学校官网",
+            "官网",
+            "网址",
             "普通类",
             "艺术类",
             "综合分",
@@ -1563,6 +1585,17 @@ mod tests {
         assert_eq!(same_score.intent, RetrievalIntent::KnowledgeAnswer);
         assert!(same_score.must_use_tools);
 
+        for query in [
+            "学校官网和招生电话是多少？",
+            "学校官网和招生电话是？",
+            "哈尔滨师范大学官方网站和本科招生网是什么？",
+            "招生办电话和联系方式发我一下",
+        ] {
+            let contact = route_message(query);
+            assert_eq!(contact.intent, RetrievalIntent::KnowledgeAnswer, "{query}");
+            assert!(contact.must_use_tools, "{query}");
+        }
+
         let new_student = route_message("入学前需要自己选课吗？军训大概多久？新生可以带电脑吗？");
         assert_eq!(new_student.intent, RetrievalIntent::KnowledgeAnswer);
         assert!(new_student.must_use_tools);
@@ -1671,6 +1704,23 @@ mod tests {
         let filters = infer_knowledge_filters("简单介绍一下学校");
         assert_eq!(filters.category, Some("招生简章".to_owned()));
         assert_eq!(filters.document_kind, Some("admission_brochure".to_owned()));
+    }
+
+    #[test]
+    fn infers_admission_brochure_filter_for_contact_queries() {
+        for query in [
+            "学校官网和招生电话是多少？",
+            "本科招生网和招生办电话是什么？",
+            "官方联系方式在哪里看？",
+        ] {
+            let filters = infer_knowledge_filters(query);
+            assert_eq!(filters.category, Some("招生简章".to_owned()), "{query}");
+            assert_eq!(
+                filters.document_kind,
+                Some("admission_brochure".to_owned()),
+                "{query}"
+            );
+        }
     }
 
     #[test]

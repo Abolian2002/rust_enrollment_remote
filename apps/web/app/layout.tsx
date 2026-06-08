@@ -29,7 +29,7 @@ export default function RootLayout({
   children: ReactNode;
 }>) {
   return (
-    <html lang="zh-CN" className={`${notoSans.variable} ${notoSerif.variable}`}>
+    <html lang="zh-CN" className={`${notoSans.variable} ${notoSerif.variable}`} suppressHydrationWarning>
       <body className="antialiased font-sans">
         {children}
       </body>

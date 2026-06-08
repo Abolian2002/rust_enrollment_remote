@@ -21,6 +21,7 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::{
     convert::Infallible,
+    fmt,
     net::SocketAddr,
     sync::Arc,
     time::{Duration, Instant},
@@ -83,6 +84,39 @@ struct ServerTtsSegmenter {
     emitted_count: usize,
     config: ServerTtsSegmenterConfig,
 }
+
+#[derive(Debug)]
+struct TtsSegmentStreamError {
+    message: String,
+    audio_started: bool,
+    client_disconnected: bool,
+}
+
+impl TtsSegmentStreamError {
+    fn upstream(message: impl Into<String>, audio_started: bool) -> Self {
+        Self {
+            message: message.into(),
+            audio_started,
+            client_disconnected: false,
+        }
+    }
+
+    fn client_disconnected(audio_started: bool) -> Self {
+        Self {
+            message: "voice websocket client disconnected".to_owned(),
+            audio_started,
+            client_disconnected: true,
+        }
+    }
+}
+
+impl fmt::Display for TtsSegmentStreamError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for TtsSegmentStreamError {}
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -669,22 +703,72 @@ async fn run_server_tts_synth(
     out_tx: mpsc::Sender<VoiceWsOut>,
     cancel_rx: watch::Receiver<bool>,
 ) {
+    let max_retries = server_tts_segment_retries();
+    let max_consecutive_failures = server_tts_max_consecutive_failures();
+    let retry_delay = server_tts_retry_delay();
+    let mut consecutive_failures = 0usize;
+    let mut reported_instability = false;
+
     while let Some(segment) = segment_rx.recv().await {
         if *cancel_rx.borrow() {
             break;
         }
-        if let Err(error) = stream_tts_segment(&state, &segment, &out_tx, &cancel_rx).await {
-            tracing::warn!(error = %error, "server-side voice TTS segment failed");
-            let _ = send_voice_json(
-                &out_tx,
-                json!(VoiceChatErrorPayload {
-                    event: "tts_error",
-                    code: "TTS_STREAM_ERROR",
-                    message: "语音播报暂时不稳定，文字回答仍可正常查看。",
-                }),
-            )
-            .await;
-            break;
+
+        let mut attempt = 0usize;
+        loop {
+            match stream_tts_segment(&state, &segment, &out_tx, &cancel_rx).await {
+                Ok(()) => {
+                    consecutive_failures = 0;
+                    break;
+                }
+                Err(error) if *cancel_rx.borrow() || error.client_disconnected => {
+                    tracing::debug!(error = %error, "server-side voice TTS stopped after client disconnect");
+                    return;
+                }
+                Err(error) if !error.audio_started && attempt < max_retries => {
+                    attempt += 1;
+                    tracing::warn!(
+                        error = %error,
+                        attempt,
+                        max_retries,
+                        segment_chars = segment.chars().count(),
+                        "server-side voice TTS segment failed before audio; retrying"
+                    );
+                    tokio::time::sleep(retry_delay).await;
+                    continue;
+                }
+                Err(error) => {
+                    consecutive_failures += 1;
+                    tracing::warn!(
+                        error = %error,
+                        audio_started = error.audio_started,
+                        consecutive_failures,
+                        max_consecutive_failures,
+                        segment_chars = segment.chars().count(),
+                        "server-side voice TTS segment dropped"
+                    );
+                    if !reported_instability {
+                        reported_instability = true;
+                        let _ = send_voice_json(
+                            &out_tx,
+                            json!(VoiceChatErrorPayload {
+                                event: "tts_error",
+                                code: "TTS_STREAM_ERROR",
+                                message: "语音播报暂时不稳定，文字回答仍可正常查看。",
+                            }),
+                        )
+                        .await;
+                    }
+                    if consecutive_failures >= max_consecutive_failures {
+                        tracing::warn!(
+                            consecutive_failures,
+                            "server-side voice TTS stopped after repeated segment failures"
+                        );
+                        return;
+                    }
+                    break;
+                }
+            }
         }
     }
 }
@@ -694,7 +778,7 @@ async fn stream_tts_segment(
     segment: &str,
     out_tx: &mpsc::Sender<VoiceWsOut>,
     cancel_rx: &watch::Receiver<bool>,
-) -> anyhow::Result<()> {
+) -> Result<(), TtsSegmentStreamError> {
     let endpoint = local_tts_stream_url();
     let response = state
         .tts_http
@@ -705,7 +789,13 @@ async fn stream_tts_segment(
             "input": segment,
         }))
         .send()
-        .await?;
+        .await
+        .map_err(|error| {
+            TtsSegmentStreamError::upstream(
+                format!("failed to request local streaming TTS: {error}"),
+                false,
+            )
+        })?;
 
     if !response.status().is_success() {
         let status = response.status();
@@ -714,22 +804,34 @@ async fn stream_tts_segment(
             .await
             .map(|body| body.len())
             .unwrap_or_default();
-        anyhow::bail!("local streaming TTS returned {status}; body_len={body_len}");
+        return Err(TtsSegmentStreamError::upstream(
+            format!("local streaming TTS returned {status}; body_len={body_len}"),
+            false,
+        ));
     }
 
     let mut stream = response.bytes_stream();
+    let mut audio_started = false;
     while let Some(chunk) = stream.next().await {
         if *cancel_rx.borrow() {
             break;
         }
-        let chunk = chunk?;
+        let chunk = chunk.map_err(|error| {
+            TtsSegmentStreamError::upstream(
+                format!("error decoding streaming TTS response body: {error}"),
+                audio_started,
+            )
+        })?;
         if !chunk.is_empty()
             && out_tx
                 .send(VoiceWsOut::Audio(chunk.to_vec()))
                 .await
                 .is_err()
         {
-            break;
+            return Err(TtsSegmentStreamError::client_disconnected(audio_started));
+        }
+        if !chunk.is_empty() {
+            audio_started = true;
         }
     }
 
@@ -1509,6 +1611,18 @@ fn local_tts_voice() -> String {
         .ok()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| "default".to_owned())
+}
+
+fn server_tts_segment_retries() -> usize {
+    read_env_usize("SERVER_TTS_SEGMENT_RETRIES", 1)
+}
+
+fn server_tts_max_consecutive_failures() -> usize {
+    read_env_usize("SERVER_TTS_MAX_CONSECUTIVE_FAILURES", 3).max(1)
+}
+
+fn server_tts_retry_delay() -> Duration {
+    Duration::from_millis(read_env_u64("SERVER_TTS_RETRY_DELAY_MS", 160))
 }
 
 impl TtsTokenLimiter {

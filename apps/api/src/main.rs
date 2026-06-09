@@ -103,6 +103,7 @@ struct TtsSegmentStreamError {
     message: String,
     audio_started: bool,
     client_disconnected: bool,
+    queue_timeout: bool,
 }
 
 impl TtsSegmentStreamError {
@@ -111,6 +112,16 @@ impl TtsSegmentStreamError {
             message: message.into(),
             audio_started,
             client_disconnected: false,
+            queue_timeout: false,
+        }
+    }
+
+    fn queue_timeout(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            audio_started: false,
+            client_disconnected: false,
+            queue_timeout: true,
         }
     }
 
@@ -119,6 +130,26 @@ impl TtsSegmentStreamError {
             message: "voice websocket client disconnected".to_owned(),
             audio_started,
             client_disconnected: true,
+            queue_timeout: false,
+        }
+    }
+}
+
+#[derive(Debug)]
+enum VoiceTtsQueueWaitError {
+    Cancelled,
+    Closed,
+    TimedOut,
+}
+
+impl fmt::Display for VoiceTtsQueueWaitError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            VoiceTtsQueueWaitError::Cancelled => f.write_str("voice TTS queue wait cancelled"),
+            VoiceTtsQueueWaitError::Closed => f.write_str("voice TTS concurrency limiter closed"),
+            VoiceTtsQueueWaitError::TimedOut => {
+                f.write_str("语音合成排队时间较长，已跳过本段语音。")
+            }
         }
     }
 }
@@ -884,6 +915,7 @@ async fn run_server_tts_synth(
     let mut consecutive_failures = 0usize;
     let mut reported_instability = false;
     let mut segment_cancel_rx = cancel_rx.clone();
+    let mut next_segment_index = 0usize;
 
     loop {
         if *cancel_rx.borrow() {
@@ -903,6 +935,8 @@ async fn run_server_tts_synth(
             break;
         };
 
+        let segment_index = next_segment_index;
+        next_segment_index += 1;
         let mut attempt = 0usize;
         loop {
             match stream_tts_segment(
@@ -912,6 +946,7 @@ async fn run_server_tts_synth(
                 &mut segment_cancel_rx,
                 conversation_id.as_deref(),
                 voice_session_id,
+                segment_index,
             )
             .await
             {
@@ -923,12 +958,15 @@ async fn run_server_tts_synth(
                     tracing::debug!(error = %error, "server-side voice TTS stopped after client disconnect");
                     return;
                 }
-                Err(error) if !error.audio_started && attempt < max_retries => {
+                Err(error)
+                    if !error.audio_started && !error.queue_timeout && attempt < max_retries =>
+                {
                     attempt += 1;
                     tracing::warn!(
                         error = %error,
                         attempt,
                         max_retries,
+                        segment_index,
                         segment_chars = segment.chars().count(),
                         "server-side voice TTS segment failed before audio; retrying"
                     );
@@ -951,6 +989,7 @@ async fn run_server_tts_synth(
                         audio_started = error.audio_started,
                         consecutive_failures,
                         max_consecutive_failures,
+                        segment_index,
                         segment_chars = segment.chars().count(),
                         "server-side voice TTS segment dropped"
                     );
@@ -987,21 +1026,33 @@ async fn stream_tts_segment(
     cancel_rx: &mut watch::Receiver<bool>,
     conversation_id: Option<&str>,
     voice_session_id: u64,
+    segment_index: usize,
 ) -> Result<(), TtsSegmentStreamError> {
     if *cancel_rx.borrow() {
         return Err(TtsSegmentStreamError::client_disconnected(false));
     }
 
     let queue_started_at = Instant::now();
-    let _permit = acquire_voice_tts_permit(state, cancel_rx, conversation_id, voice_session_id)
-        .await
-        .map_err(|error| TtsSegmentStreamError::upstream(error, false))?;
+    let _permit = acquire_voice_tts_permit(
+        state,
+        cancel_rx,
+        conversation_id,
+        voice_session_id,
+        segment_index,
+    )
+    .await
+    .map_err(|error| match error {
+        VoiceTtsQueueWaitError::TimedOut => TtsSegmentStreamError::queue_timeout(error.to_string()),
+        _ => TtsSegmentStreamError::upstream(error.to_string(), false),
+    })?;
     let queue_wait = queue_started_at.elapsed();
     let endpoint = local_tts_stream_url();
     let started_at = Instant::now();
     tracing::info!(
         conversation_id,
         voice_session_id,
+        segment_index,
+        is_first_segment = segment_index == 0,
         segment_chars = segment.chars().count(),
         queue_wait_ms = queue_wait.as_millis() as u64,
         segment_preview = %tts_log_preview_for_env(segment),
@@ -1106,6 +1157,8 @@ async fn stream_tts_segment(
     tracing::info!(
         conversation_id,
         voice_session_id,
+        segment_index,
+        is_first_segment = segment_index == 0,
         segment_chars = segment.chars().count(),
         queue_wait_ms = queue_wait.as_millis() as u64,
         first_audio_ms,
@@ -1123,8 +1176,10 @@ async fn acquire_voice_tts_permit<'a>(
     cancel_rx: &mut watch::Receiver<bool>,
     conversation_id: Option<&str>,
     voice_session_id: u64,
-) -> Result<tokio::sync::SemaphorePermit<'a>, String> {
-    let queue_timeout = server_tts_queue_timeout();
+    segment_index: usize,
+) -> Result<tokio::sync::SemaphorePermit<'a>, VoiceTtsQueueWaitError> {
+    let is_first_segment = segment_index == 0;
+    let queue_timeout = server_tts_queue_timeout(is_first_segment);
     let acquire = state.voice_tts_semaphore.acquire();
     tokio::pin!(acquire);
 
@@ -1132,21 +1187,23 @@ async fn acquire_voice_tts_permit<'a>(
         biased;
         changed = cancel_rx.changed() => {
             if changed.is_ok() && *cancel_rx.borrow() {
-                return Err("voice TTS queue wait cancelled".to_owned());
+                return Err(VoiceTtsQueueWaitError::Cancelled);
             }
-            Err("voice TTS queue wait cancelled".to_owned())
+            Err(VoiceTtsQueueWaitError::Cancelled)
         }
         result = &mut acquire => {
-            result.map_err(|_| "voice TTS concurrency limiter closed".to_owned())
+            result.map_err(|_| VoiceTtsQueueWaitError::Closed)
         }
         _ = tokio::time::sleep(queue_timeout) => {
             tracing::warn!(
                 conversation_id,
                 voice_session_id,
+                segment_index,
+                is_first_segment,
                 queue_timeout_ms = queue_timeout.as_millis() as u64,
                 "server-side voice TTS queue wait timed out"
             );
-            Err("语音合成排队时间较长，已跳过本段语音。".to_owned())
+            Err(VoiceTtsQueueWaitError::TimedOut)
         }
     }
 }
@@ -2091,8 +2148,15 @@ fn server_tts_max_concurrent_synth() -> usize {
     read_env_usize("SERVER_TTS_MAX_CONCURRENT_SYNTH", 2).max(1)
 }
 
-fn server_tts_queue_timeout() -> Duration {
-    Duration::from_millis(read_env_u64("SERVER_TTS_QUEUE_TIMEOUT_MS", 20_000))
+fn server_tts_queue_timeout(is_first_segment: bool) -> Duration {
+    let legacy = read_env_u64("SERVER_TTS_QUEUE_TIMEOUT_MS", 20_000);
+    let key = if is_first_segment {
+        "SERVER_TTS_FIRST_QUEUE_TIMEOUT_MS"
+    } else {
+        "SERVER_TTS_CONTINUATION_QUEUE_TIMEOUT_MS"
+    };
+    let fallback = if is_first_segment { legacy } else { 120_000 };
+    Duration::from_millis(read_env_u64(key, fallback))
 }
 
 impl TtsTokenLimiter {

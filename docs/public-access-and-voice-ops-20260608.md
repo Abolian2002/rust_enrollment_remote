@@ -287,3 +287,80 @@ curl -fsS --max-time 20 https://cpa.abolian.online/api/v1/health
 HTTP/2 200
 database: ok
 ```
+
+## 2026-06-09 语音并发与取消链路修复
+
+多人同时访问时出现过“首音之后没有声音”的现象。日志显示根因不是单纯浏览器播放问题，而是几处并发策略叠加：
+
+- Rust API 的全局 TTS semaphore 只有 2 个许可，且所有段落统一排队 20 秒；后续段落在高并发下会被直接丢弃。
+- `model_lb.py` 在客户端断开时把 `BrokenPipeError` 当成 upstream 失败并重试下一个 CosyVoice worker，导致用户切换问题后旧语音可能继续占用 worker。
+- CosyVoice FastAPI worker 内部允许同一个模型对象同时被多个请求迭代，RTF 会被拉高，首包和后续段都会变慢。
+
+已做的修复：
+
+1. Rust API：
+   - `SERVER_TTS_MAX_CONCURRENT_SYNTH=4`
+   - `SERVER_TTS_FIRST_QUEUE_TIMEOUT_MS=20000`
+   - `SERVER_TTS_CONTINUATION_QUEUE_TIMEOUT_MS=120000`
+   - 首段保持快速失败，后续段落允许更长等待，并且仍可被新问题取消。
+   - TTS 日志增加 `segment_index` 和 `is_first_segment`，方便定位是否是首段还是后续段排队。
+
+2. `model_lb.py`：
+   - CosyVoice upstream 扩到 `50001/50002/50003/50004`。
+   - downstream 断开时关闭当前 upstream 连接并返回，不再 retry 其他 worker。
+   - upstream 选择从简单轮询改为 least-inflight，优先选择当前负载更低的 worker。
+
+3. CosyVoice FastAPI：
+   - `/tts_stream` 的 streaming generator 检查 `request.is_disconnected()`。
+   - 客户端取消时尝试 close 生成器。
+   - 每个 worker 内加 `INFERENCE_LOCK`，保证单 worker 内模型推理串行；总并发由多个 worker 承接。
+
+4. 模型服务运行状态：
+   - Qwen：`18081/18082/18083`，每个 `--parallel 1`，总 LLM 并发约 3。
+   - Embedding：`8115/8116`，LB 入口 `8114`。
+   - CosyVoice：`50001/50003` 在 GPU 8，`50002/50004` 在 GPU 9，LB 入口 `50000`。
+   - CosyVoice 每张 A100 约 7.8GB 显存，显存不是瓶颈。
+
+验证命令：
+
+```bash
+curl -fsS http://127.0.0.1:4000/api/v1/health
+ss -ltnp | grep -E '(:18080|:8114|:50000|:50001|:50002|:50003|:50004|:4000)'
+nvidia-smi --query-gpu=index,memory.used,memory.total,utilization.gpu --format=csv,noheader,nounits
+tail -120 /home/t2_enroll_ai/rust_enrollment/.run/api.log
+tail -120 /home/t2_enroll_ai/model-service-logs/model-lb.log
+```
+
+直接 TTS 流烟测：
+
+```bash
+python3 - <<'PY'
+import requests, time
+url = 'http://127.0.0.1:50000/v1/audio/stream'
+t0 = time.time()
+r = requests.post(url, json={'input': '你好，我是哈尔滨师范大学招生智能顾问，很高兴为你解答问题。'}, stream=True, timeout=60)
+print('status', r.status_code, 'upstream', r.headers.get('X-Model-Upstream'))
+for chunk in r.iter_content(4096):
+    if chunk:
+        print('first_audio_s', round(time.time() - t0, 3))
+        break
+r.close()
+PY
+```
+
+取消链路验证点：
+
+```text
+[cosyvoice] client disconnected while proxying to 127.0.0.1:5000x; not retrying
+```
+
+如果再次出现“首音后静音”，优先检查：
+
+- API 日志是否还有 `server-side voice TTS queue wait timed out`。
+- LB 日志是否又出现大量 502 或 BrokenPipe traceback。
+- CosyVoice worker 日志的 RTF 是否持续大于 5。
+- 是否有旧请求没有被取消，导致 4 个 worker 长时间全满。
+
+LLM 并发说明：
+
+当前大模型服务实际并发约为 3，因为三路 llama-server 都是 `--parallel 1`。Rust API 的 `CHAT_MAX_CONCURRENT_REQUESTS` 是 HTTP/WS 请求闸门，不等同于 LLM 并发闸门。后续如果几十个家长同时访问，建议新增独立的 LLM stage semaphore，或把 llama-server `--parallel` 小步提升到 2 并压测首 token、总耗时和显存，再决定是否扩大。

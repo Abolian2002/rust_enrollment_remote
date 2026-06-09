@@ -47,6 +47,7 @@ struct AppState {
     chat_semaphore: Arc<Semaphore>,
     tts_limiter: Arc<TtsTokenLimiter>,
     tts_http: reqwest::Client,
+    voice_tts_semaphore: Arc<Semaphore>,
     active_voice_sessions: Arc<Mutex<HashMap<String, VoiceSessionCancel>>>,
     next_voice_session_id: Arc<AtomicU64>,
 }
@@ -158,6 +159,7 @@ async fn main() -> anyhow::Result<()> {
             20,
         ))),
         tts_http: build_tts_http_client(),
+        voice_tts_semaphore: Arc::new(Semaphore::new(server_tts_max_concurrent_synth())),
         active_voice_sessions: Arc::new(Mutex::new(HashMap::new())),
         next_voice_session_id: Arc::new(AtomicU64::new(1)),
     });
@@ -990,11 +992,18 @@ async fn stream_tts_segment(
         return Err(TtsSegmentStreamError::client_disconnected(false));
     }
 
+    let queue_started_at = Instant::now();
+    let _permit = acquire_voice_tts_permit(state, cancel_rx, conversation_id, voice_session_id)
+        .await
+        .map_err(|error| TtsSegmentStreamError::upstream(error, false))?;
+    let queue_wait = queue_started_at.elapsed();
     let endpoint = local_tts_stream_url();
+    let started_at = Instant::now();
     tracing::info!(
         conversation_id,
         voice_session_id,
         segment_chars = segment.chars().count(),
+        queue_wait_ms = queue_wait.as_millis() as u64,
         segment_preview = %tts_log_preview_for_env(segment),
         "server-side voice TTS segment started"
     );
@@ -1047,6 +1056,9 @@ async fn stream_tts_segment(
 
     let mut stream = response.bytes_stream();
     let mut audio_started = false;
+    let mut first_audio_ms = None;
+    let mut audio_chunks = 0usize;
+    let mut audio_bytes = 0usize;
     loop {
         let Some(chunk) = (tokio::select! {
             biased;
@@ -1082,11 +1094,61 @@ async fn stream_tts_segment(
             return Err(TtsSegmentStreamError::client_disconnected(audio_started));
         }
         if !chunk.is_empty() {
+            if first_audio_ms.is_none() {
+                first_audio_ms = Some(started_at.elapsed().as_millis() as u64);
+            }
+            audio_chunks += 1;
+            audio_bytes += chunk.len();
             audio_started = true;
         }
     }
 
+    tracing::info!(
+        conversation_id,
+        voice_session_id,
+        segment_chars = segment.chars().count(),
+        queue_wait_ms = queue_wait.as_millis() as u64,
+        first_audio_ms,
+        duration_ms = started_at.elapsed().as_millis() as u64,
+        audio_chunks,
+        audio_bytes,
+        "server-side voice TTS segment completed"
+    );
+
     Ok(())
+}
+
+async fn acquire_voice_tts_permit<'a>(
+    state: &'a AppState,
+    cancel_rx: &mut watch::Receiver<bool>,
+    conversation_id: Option<&str>,
+    voice_session_id: u64,
+) -> Result<tokio::sync::SemaphorePermit<'a>, String> {
+    let queue_timeout = server_tts_queue_timeout();
+    let acquire = state.voice_tts_semaphore.acquire();
+    tokio::pin!(acquire);
+
+    tokio::select! {
+        biased;
+        changed = cancel_rx.changed() => {
+            if changed.is_ok() && *cancel_rx.borrow() {
+                return Err("voice TTS queue wait cancelled".to_owned());
+            }
+            Err("voice TTS queue wait cancelled".to_owned())
+        }
+        result = &mut acquire => {
+            result.map_err(|_| "voice TTS concurrency limiter closed".to_owned())
+        }
+        _ = tokio::time::sleep(queue_timeout) => {
+            tracing::warn!(
+                conversation_id,
+                voice_session_id,
+                queue_timeout_ms = queue_timeout.as_millis() as u64,
+                "server-side voice TTS queue wait timed out"
+            );
+            Err("语音合成排队时间较长，已跳过本段语音。".to_owned())
+        }
+    }
 }
 
 fn tts_log_preview(segment: &str) -> String {
@@ -1815,7 +1877,7 @@ fn clean_tts_segment(segment: &str) -> String {
 }
 
 fn record_spoken_tts_delta(buffer: &Arc<std::sync::Mutex<String>>, delta: &str) {
-    let cleaned = clean_tts_segment(delta);
+    let cleaned = normalize_tts_delta(delta).trim().to_owned();
     if cleaned.is_empty() {
         return;
     }
@@ -1847,6 +1909,9 @@ fn unspoken_tts_suffix(
         return Some(final_cleaned);
     }
     if final_cleaned == spoken_cleaned {
+        return None;
+    }
+    if effectively_same_tts_text(&spoken_cleaned, &final_cleaned) {
         return None;
     }
     if let Some(suffix) = final_cleaned.strip_prefix(&spoken_cleaned) {
@@ -1881,6 +1946,65 @@ fn longest_suffix_prefix_overlap(left: &str, right: &str, min_chars: usize) -> O
         }
     }
     best
+}
+
+fn effectively_same_tts_text(left: &str, right: &str) -> bool {
+    let left_compact = compact_tts_match_text(left);
+    let right_compact = compact_tts_match_text(right);
+    if !left_compact.is_empty() && left_compact == right_compact {
+        return true;
+    }
+
+    let left_len = left.chars().count();
+    let right_len = right.chars().count();
+    let max_len = left_len.max(right_len);
+    if max_len == 0 || left_len.abs_diff(right_len) > 4 {
+        return false;
+    }
+
+    common_prefix_chars(left, right) + 4 >= max_len
+}
+
+fn common_prefix_chars(left: &str, right: &str) -> usize {
+    left.chars()
+        .zip(right.chars())
+        .take_while(|(left, right)| left == right)
+        .count()
+}
+
+fn compact_tts_match_text(text: &str) -> String {
+    text.chars()
+        .filter(|ch| {
+            !ch.is_whitespace()
+                && !matches!(
+                    ch,
+                    '。' | '，'
+                        | '、'
+                        | '；'
+                        | '：'
+                        | '！'
+                        | '？'
+                        | '.'
+                        | ','
+                        | ';'
+                        | ':'
+                        | '!'
+                        | '?'
+                        | '-'
+                        | '|'
+                        | '"'
+                        | '\''
+                        | '“'
+                        | '”'
+                        | '‘'
+                        | '’'
+                        | '（'
+                        | '）'
+                        | '('
+                        | ')'
+                )
+        })
+        .collect()
 }
 
 fn needs_space_between(current: &str, next: &str) -> bool {
@@ -1961,6 +2085,14 @@ fn server_tts_max_consecutive_failures() -> usize {
 
 fn server_tts_retry_delay() -> Duration {
     Duration::from_millis(read_env_u64("SERVER_TTS_RETRY_DELAY_MS", 160))
+}
+
+fn server_tts_max_concurrent_synth() -> usize {
+    read_env_usize("SERVER_TTS_MAX_CONCURRENT_SYNTH", 2).max(1)
+}
+
+fn server_tts_queue_timeout() -> Duration {
+    Duration::from_millis(read_env_u64("SERVER_TTS_QUEUE_TIMEOUT_MS", 20_000))
 }
 
 impl TtsTokenLimiter {
@@ -2185,5 +2317,25 @@ mod tests {
         let spoken = spoken_buffer("已经完整播报。");
 
         assert_eq!(unspoken_tts_suffix(&spoken, "已经完整播报。"), None);
+    }
+
+    #[test]
+    fn unspoken_tts_suffix_treats_tiny_tail_differences_as_complete() {
+        let spoken = spoken_buffer("这段内容基本已经播报完成");
+
+        assert_eq!(
+            unspoken_tts_suffix(&spoken, "这段内容基本已经播报完成。"),
+            None
+        );
+    }
+
+    #[test]
+    fn unspoken_tts_suffix_ignores_internal_punctuation_differences() {
+        let spoken = spoken_buffer("你好我是招生助手可以帮你查分数线");
+
+        assert_eq!(
+            unspoken_tts_suffix(&spoken, "你好，我是招生助手，可以帮你查分数线。"),
+            None
+        );
     }
 }

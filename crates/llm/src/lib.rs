@@ -5,7 +5,10 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
+use std::time::Instant;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -68,6 +71,13 @@ pub struct OpenAiCompatibleClient {
     base_url: String,
     api_key: String,
     model: String,
+    concurrency: Arc<LlmConcurrencyLimiter>,
+}
+
+struct LlmConcurrencyLimiter {
+    semaphore: Arc<Semaphore>,
+    max_concurrent: usize,
+    queue_timeout: Duration,
 }
 
 #[derive(Debug, Serialize)]
@@ -123,6 +133,7 @@ impl OpenAiCompatibleClient {
             base_url: base_url.into().trim_end_matches('/').to_owned(),
             api_key: api_key.into(),
             model: model.into(),
+            concurrency: Arc::new(LlmConcurrencyLimiter::from_env()),
         }
     }
 
@@ -144,6 +155,38 @@ impl OpenAiCompatibleClient {
     pub fn model(&self) -> &str {
         &self.model
     }
+
+    async fn acquire_llm_permit(&self, operation: &'static str) -> Result<OwnedSemaphorePermit> {
+        let started_at = Instant::now();
+        let acquire = self.concurrency.semaphore.clone().acquire_owned();
+        tokio::pin!(acquire);
+
+        tokio::select! {
+            result = &mut acquire => {
+                let permit = result.context("llm concurrency limiter closed")?;
+                tracing::info!(
+                    operation,
+                    model = %self.model,
+                    queue_wait_ms = started_at.elapsed().as_millis() as u64,
+                    available_permits = self.concurrency.semaphore.available_permits(),
+                    max_concurrent = self.concurrency.max_concurrent,
+                    "llm concurrency permit acquired"
+                );
+                Ok(permit)
+            }
+            _ = tokio::time::sleep(self.concurrency.queue_timeout) => {
+                tracing::warn!(
+                    operation,
+                    model = %self.model,
+                    queue_timeout_ms = self.concurrency.queue_timeout.as_millis() as u64,
+                    "llm concurrency queue wait timed out"
+                );
+                Err(anyhow!(
+                    "LLM 当前排队时间较长，已跳过本轮模型润色。"
+                ))
+            }
+        }
+    }
 }
 
 fn read_env_u64(key: &str, default: u64) -> u64 {
@@ -154,9 +197,29 @@ fn read_env_u64(key: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
+fn read_env_usize(key: &str, default: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+impl LlmConcurrencyLimiter {
+    fn from_env() -> Self {
+        let max_concurrent = read_env_usize("LLM_MAX_CONCURRENT_REQUESTS", 3);
+        Self {
+            semaphore: Arc::new(Semaphore::new(max_concurrent)),
+            max_concurrent,
+            queue_timeout: Duration::from_millis(read_env_u64("LLM_QUEUE_TIMEOUT_MS", 20_000)),
+        }
+    }
+}
+
 #[async_trait]
 impl LlmProvider for OpenAiCompatibleClient {
     async fn complete(&self, messages: &[LlmMessage]) -> Result<LlmResponse> {
+        let _permit = self.acquire_llm_permit("complete").await?;
         let url = format!("{}/chat/completions", self.base_url);
         let response = self
             .http
@@ -198,6 +261,7 @@ impl LlmProvider for OpenAiCompatibleClient {
     }
 
     async fn stream_complete(&self, messages: &[LlmMessage]) -> Result<LlmDeltaStream> {
+        let permit = self.acquire_llm_permit("stream_complete").await?;
         let url = format!("{}/chat/completions", self.base_url);
         let response = self
             .http
@@ -224,6 +288,7 @@ impl LlmProvider for OpenAiCompatibleClient {
 
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<String>>(32);
         tokio::spawn(async move {
+            let _permit = permit;
             let mut bytes = response.bytes_stream();
             let mut buffer = String::new();
 

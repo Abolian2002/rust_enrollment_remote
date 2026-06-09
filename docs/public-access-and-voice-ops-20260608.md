@@ -364,3 +364,46 @@ PY
 LLM 并发说明：
 
 当前大模型服务实际并发约为 3，因为三路 llama-server 都是 `--parallel 1`。Rust API 的 `CHAT_MAX_CONCURRENT_REQUESTS` 是 HTTP/WS 请求闸门，不等同于 LLM 并发闸门。后续如果几十个家长同时访问，建议新增独立的 LLM stage semaphore，或把 llama-server `--parallel` 小步提升到 2 并压测首 token、总耗时和显存，再决定是否扩大。
+
+## 2026-06-09 LLM 并发控制策略
+
+目标是支持约 10-20 位家长同时访问，同时不破坏当前回答质量、首 token 速度和语音链路。
+
+当前选择：
+
+- 保留 `CHAT_MAX_CONCURRENT_REQUESTS` 作为入口级总请求闸门。
+- 新增独立 LLM synthesis 闸门：
+  - `LLM_MAX_CONCURRENT_REQUESTS=3`
+  - `LLM_QUEUE_TIMEOUT_MS=20000`
+- 只限制真正调用模型的 `llm.complete()` / `llm.stream_complete()`。
+- 不限制数据库、FAQ、Excel、PDF chunk、embedding、TTS。
+
+原因：
+
+- 当前 Qwen 服务是 3 个 `llama-server` 实例，每个 `--parallel 1`，实际 LLM 并发约 3。
+- 如果只提高 `CHAT_MAX_CONCURRENT_REQUESTS`，LLM 请求会在模型服务内部堆积，首 token 变慢，也会拖慢语音首音。
+- 如果直接把 `--parallel` 提到 2，可能改变单请求速度、KV cache 显存、输出稳定性和首 token；必须压测后再决定。
+
+推荐线上初始配置：
+
+```text
+CHAT_MAX_CONCURRENT_REQUESTS=20
+LLM_MAX_CONCURRENT_REQUESTS=3
+LLM_QUEUE_TIMEOUT_MS=20000
+```
+
+观测指标：
+
+- API 日志中的 `llm concurrency permit acquired`：
+  - `queue_wait_ms` 长期接近 0：LLM 容量充足。
+  - `queue_wait_ms` 经常超过 5000：LLM 开始成为瓶颈。
+  - 出现 `llm concurrency queue wait timed out`：并发超出当前模型容量。
+- 用户侧首 token 与语音 first audio 是否明显变慢。
+- Qwen 三个 llama-server 的 GPU 利用率、显存和请求耗时。
+
+下一步调优顺序：
+
+1. 先保持 `LLM_MAX_CONCURRENT_REQUESTS=3`，压测 10/15/20 位并发。
+2. 如果 LLM 队列等待过高，再单独测试其中一路 llama-server 的 `--parallel 2`。
+3. `--parallel 2` 稳定后，再把 `LLM_MAX_CONCURRENT_REQUESTS` 小步提高到 4 或 5。
+4. 不建议直接把 LLM 并发拉到 20；20 位访客并不等于 20 个同时生成中的 LLM 请求。

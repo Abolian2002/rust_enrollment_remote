@@ -676,8 +676,12 @@ export async function streamVoiceChatMessage(
         }
         result = envelope.data;
         if (!settled) {
-          settled = true;
-          resolve(result);
+          void yieldToBrowser().then(() => {
+            if (!settled && result) {
+              settled = true;
+              resolve(result);
+            }
+          });
         }
         return;
       }
@@ -701,11 +705,11 @@ export async function streamVoiceChatMessage(
         if (activeVoiceSocket === socket) {
           activeVoiceSocket = null;
         }
-        handlers.onAudioDone?.();
         if (!result && !settled) {
           failOnce(new Error("API request failed: voice stream completed without a final message"));
           return;
         }
+        handlers.onAudioDone?.();
         socket.close();
       }
     };

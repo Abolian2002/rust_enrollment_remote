@@ -389,7 +389,7 @@ export function useTTS() {
         }
 
         try {
-          if (isLocalStreamTransport()) {
+          if (isLocalStreamTransport() || isServerVoiceTransport()) {
             await streamLocalSpeech(
               segment,
               (chunk) => {
@@ -474,7 +474,7 @@ export function useTTS() {
       clientRef.current.close();
       clientRef.current = null;
     }
-    if (playerRef.current) {
+    if (!isServerVoiceTransport() && playerRef.current) {
       await playerRef.current.stop();
       playerRef.current = null;
     }
@@ -497,6 +497,20 @@ export function useTTS() {
     }
 
     if (isLocalStreamTransport() || isServerVoiceTransport()) {
+      const existingServerPlayer = isServerVoiceTransport() ? playerRef.current : null;
+      if (existingServerPlayer?.ready) {
+        existingServerPlayer.clear();
+        localTextBuffer.current = "";
+        localSynthesisQueue.current = [];
+        localReadyAudioQueue.current = [];
+        localFinishRequested.current = false;
+        localError.current = null;
+        setIsSpeaking(false);
+        setState("speaking");
+        sessionActive.current = true;
+        return;
+      }
+
       const player = new PCMAudioPlayer(LOCAL_TTS_SAMPLE_RATE, {
         onPlaybackComplete: () => {
           setIsSpeaking(false);
@@ -644,6 +658,19 @@ export function useTTS() {
     sessionActive.current = false;
     clientRef.current?.close();
     clientRef.current = null;
+    if (isServerVoiceTransport()) {
+      playerRef.current?.clear();
+      localSpeechAbortRef.current?.abort();
+      localSpeechAbortRef.current = null;
+      localTextBuffer.current = "";
+      localSynthesisQueue.current = [];
+      localReadyAudioQueue.current = [];
+      localFinishRequested.current = false;
+      localError.current = null;
+      setIsSpeaking(false);
+      setState("idle");
+      return;
+    }
     if (playerRef.current) {
       await playerRef.current.stop();
       playerRef.current = null;
@@ -664,6 +691,41 @@ export function useTTS() {
     setIsMuted((prev) => !prev);
   }, []);
 
+  const speakStandaloneText = useCallback(
+    async (text: string) => {
+      const cleaned = text.trim();
+      if (!cleaned || isMutedRef.current) {
+        return;
+      }
+
+      await startSession();
+
+      if (isServerVoiceTransport() || isLocalTransport()) {
+        localFinishRequested.current = true;
+        enqueueLocalSpeech(cleaned, true);
+        await localSynthesisPromise.current;
+        if (isLocalStreamTransport() || isServerVoiceTransport()) {
+          playerRef.current?.sendTtsFinished();
+        } else {
+          await localPlaybackPromise.current;
+        }
+
+        if (localError.current) {
+          const error = localError.current;
+          localError.current = null;
+          throw error;
+        }
+        return;
+      }
+
+      if (clientRef.current?.connected) {
+        clientRef.current.sendText(cleaned);
+        await clientRef.current.stop();
+      }
+    },
+    [enqueueLocalSpeech, startSession]
+  );
+
   return {
     state,
     isSpeaking,
@@ -671,6 +733,7 @@ export function useTTS() {
     startSession,
     sendText,
     pushAudioData,
+    speakStandaloneText,
     usesServerVoice: isServerVoiceTransport(),
     finishText,
     interrupt,

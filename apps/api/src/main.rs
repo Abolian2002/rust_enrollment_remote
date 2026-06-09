@@ -23,10 +23,14 @@ use std::{
     convert::Infallible,
     fmt,
     net::SocketAddr,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 use tokio::sync::{Mutex, Semaphore, mpsc, watch};
+use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 use tower_http::{
     cors::{AllowOrigin, Any, CorsLayer},
@@ -43,6 +47,14 @@ struct AppState {
     chat_semaphore: Arc<Semaphore>,
     tts_limiter: Arc<TtsTokenLimiter>,
     tts_http: reqwest::Client,
+    active_voice_sessions: Arc<Mutex<HashMap<String, VoiceSessionCancel>>>,
+    next_voice_session_id: Arc<AtomicU64>,
+}
+
+#[derive(Clone)]
+struct VoiceSessionCancel {
+    id: u64,
+    cancel_tx: watch::Sender<bool>,
 }
 
 struct TtsRateBucket {
@@ -146,6 +158,8 @@ async fn main() -> anyhow::Result<()> {
             20,
         ))),
         tts_http: build_tts_http_client(),
+        active_voice_sessions: Arc::new(Mutex::new(HashMap::new())),
+        next_voice_session_id: Arc::new(AtomicU64::new(1)),
     });
     let app = build_router(state);
     let port = std::env::var("PORT")
@@ -469,6 +483,26 @@ async fn handle_voice_socket(mut socket: WebSocket, state: Arc<AppState>) {
     let (mut sender, mut receiver) = socket.split();
     let (out_tx, mut out_rx) = mpsc::channel::<VoiceWsOut>(64);
     let (cancel_tx, cancel_rx) = watch::channel(false);
+    let voice_session_key = payload.conversation_id.clone();
+    let voice_session_id = state.next_voice_session_id.fetch_add(1, Ordering::Relaxed);
+    if let Some(key) = voice_session_key.as_deref().filter(|key| !key.is_empty()) {
+        let previous = state.active_voice_sessions.lock().await.insert(
+            key.to_owned(),
+            VoiceSessionCancel {
+                id: voice_session_id,
+                cancel_tx: cancel_tx.clone(),
+            },
+        );
+        if let Some(previous) = previous {
+            let _ = previous.cancel_tx.send(true);
+            tracing::info!(
+                conversation_id = key,
+                previous_session_id = previous.id,
+                voice_session_id,
+                "cancelled previous active voice session for conversation"
+            );
+        }
+    }
 
     let writer_cancel = cancel_tx.clone();
     let writer = tokio::spawn(async move {
@@ -513,6 +547,8 @@ async fn handle_voice_socket(mut socket: WebSocket, state: Arc<AppState>) {
         tts_segment_rx,
         out_tx.clone(),
         cancel_rx.clone(),
+        voice_session_key.clone(),
+        voice_session_id,
     ));
 
     let _permit = permit;
@@ -525,53 +561,80 @@ async fn handle_voice_socket(mut socket: WebSocket, state: Arc<AppState>) {
     .await;
 
     let mut generating_sent = false;
-    let stream_future = agent.chat_stream_with_deltas(payload, |conversation_id, delta| {
-        let out_tx = out_tx.clone();
-        let tts_delta_tx = tts_delta_tx.clone();
-        let cancel_rx = cancel_rx.clone();
-        let should_send_generating = !generating_sent;
-        generating_sent = true;
-        async move {
-            if *cancel_rx.borrow() {
-                return false;
-            }
-            if should_send_generating
-                && !send_voice_json(
+    let spoken_tts_text = Arc::new(std::sync::Mutex::new(String::new()));
+    let agent_result = {
+        let stream_future = agent.chat_stream_with_deltas(payload, |conversation_id, delta| {
+            let out_tx = out_tx.clone();
+            let tts_delta_tx = tts_delta_tx.clone();
+            let cancel_rx = cancel_rx.clone();
+            let spoken_tts_text = spoken_tts_text.clone();
+            let should_send_generating = !generating_sent;
+            generating_sent = true;
+            async move {
+                if *cancel_rx.borrow() {
+                    return false;
+                }
+                if should_send_generating
+                    && !send_voice_json(
+                        &out_tx,
+                        json!({ "event": "status", "status": "generating" }),
+                    )
+                    .await
+                {
+                    return false;
+                }
+                if !send_voice_json(
                     &out_tx,
-                    json!({ "event": "status", "status": "generating" }),
+                    json!({
+                        "event": "chunk",
+                        "conversationId": conversation_id,
+                        "delta": delta,
+                    }),
                 )
                 .await
-            {
-                return false;
+                {
+                    return false;
+                }
+                if tts_delta_tx.send(delta.clone()).is_ok() {
+                    record_spoken_tts_delta(&spoken_tts_text, &delta);
+                }
+                true
             }
-            if !send_voice_json(
-                &out_tx,
-                json!({
-                    "event": "chunk",
-                    "conversationId": conversation_id,
-                    "delta": delta,
-                }),
-            )
-            .await
-            {
-                return false;
+        });
+
+        tokio::pin!(stream_future);
+        let mut agent_cancel_rx = cancel_rx.clone();
+        tokio::select! {
+            biased;
+            changed = agent_cancel_rx.changed() => {
+                if changed.is_ok() && *agent_cancel_rx.borrow() {
+                    tracing::debug!("voice chat stream cancelled after client disconnect");
+                }
+                None
             }
-            let _ = tts_delta_tx.send(delta);
-            true
+            result = tokio::time::timeout(agent_timeout_duration(), &mut stream_future) => Some(result),
         }
-    });
+    };
 
-    let agent_result = tokio::time::timeout(agent_timeout_duration(), stream_future).await;
-    drop(tts_delta_tx);
-
+    let mut should_cancel_tts = false;
     match agent_result {
-        Ok(Ok(reply)) => {
+        Some(Ok(Ok(reply))) => {
             if !generating_sent {
                 let _ = send_voice_json(
                     &out_tx,
                     json!({ "event": "status", "status": "generating" }),
                 )
                 .await;
+            }
+            if let Some(suffix) = unspoken_tts_suffix(&spoken_tts_text, &reply.reply) {
+                tracing::info!(
+                    voice_session_id,
+                    suffix_chars = suffix.chars().count(),
+                    "server-side voice queued unspoken final reply suffix"
+                );
+                if tts_delta_tx.send(suffix.clone()).is_ok() {
+                    record_spoken_tts_delta(&spoken_tts_text, &suffix);
+                }
             }
             let meta = if client_diagnostics_enabled() {
                 reply
@@ -591,7 +654,8 @@ async fn handle_voice_socket(mut socket: WebSocket, state: Arc<AppState>) {
             )
             .await;
         }
-        Ok(Err(error)) => {
+        Some(Ok(Err(error))) => {
+            should_cancel_tts = true;
             tracing::error!(error = %error, "voice chat request failed");
             let _ = send_voice_json(
                 &out_tx,
@@ -603,7 +667,8 @@ async fn handle_voice_socket(mut socket: WebSocket, state: Arc<AppState>) {
             )
             .await;
         }
-        Err(_) => {
+        Some(Err(_)) => {
+            should_cancel_tts = true;
             tracing::warn!("voice chat request timed out");
             let _ = send_voice_json(
                 &out_tx,
@@ -615,15 +680,37 @@ async fn handle_voice_socket(mut socket: WebSocket, state: Arc<AppState>) {
             )
             .await;
         }
+        None => {
+            should_cancel_tts = true;
+        }
     }
+    drop(tts_delta_tx);
 
-    let _ = segmenter.await;
-    let _ = synth.await;
+    let tts_cancelled = if should_cancel_tts {
+        let _ = cancel_tx.send(true);
+        abort_voice_task(segmenter);
+        abort_voice_task(synth);
+        true
+    } else {
+        wait_voice_tasks_or_cancel(segmenter, synth, cancel_rx.clone()).await
+    };
     let _ = send_voice_json(&out_tx, json!({ "event": "done" })).await;
-    let _ = cancel_tx.send(true);
+    if !tts_cancelled {
+        let _ = cancel_tx.send(true);
+    }
     drop(out_tx);
     let _ = writer.await;
     reader.abort();
+    if let Some(key) = voice_session_key.as_deref().filter(|key| !key.is_empty()) {
+        let mut sessions = state.active_voice_sessions.lock().await;
+        if sessions
+            .get(key)
+            .map(|session| session.id == voice_session_id)
+            .unwrap_or(false)
+        {
+            sessions.remove(key);
+        }
+    }
 }
 
 async fn read_voice_chat_init(socket: &mut WebSocket) -> Result<ChatRequest, &'static str> {
@@ -648,20 +735,82 @@ async fn send_voice_json(out_tx: &mpsc::Sender<VoiceWsOut>, value: serde_json::V
     out_tx.send(VoiceWsOut::Json(value)).await.is_ok()
 }
 
+fn abort_voice_task(task: JoinHandle<()>) {
+    if !task.is_finished() {
+        task.abort();
+    }
+}
+
+async fn wait_voice_tasks_or_cancel(
+    mut segmenter: JoinHandle<()>,
+    mut synth: JoinHandle<()>,
+    mut cancel_rx: watch::Receiver<bool>,
+) -> bool {
+    let mut segmenter_done = false;
+    let mut synth_done = false;
+
+    loop {
+        if segmenter_done && synth_done {
+            return false;
+        }
+
+        tokio::select! {
+            biased;
+            changed = cancel_rx.changed() => {
+                if changed.is_ok() && *cancel_rx.borrow() {
+                    tracing::info!("server-side voice tasks aborted after cancellation");
+                    abort_voice_task(segmenter);
+                    abort_voice_task(synth);
+                    return true;
+                }
+                tracing::info!("server-side voice tasks aborted after cancellation channel closed");
+                abort_voice_task(segmenter);
+                abort_voice_task(synth);
+                return true;
+            }
+            result = &mut segmenter, if !segmenter_done => {
+                segmenter_done = true;
+                if let Err(error) = result
+                    && !error.is_cancelled()
+                {
+                    tracing::warn!(error = %error, "server-side voice segmenter task failed");
+                }
+            }
+            result = &mut synth, if !synth_done => {
+                synth_done = true;
+                if let Err(error) = result
+                    && !error.is_cancelled()
+                {
+                    tracing::warn!(error = %error, "server-side voice synth task failed");
+                }
+            }
+        }
+    }
+}
+
 async fn run_server_tts_segmenter(
     mut delta_rx: mpsc::UnboundedReceiver<String>,
     segment_tx: mpsc::Sender<String>,
     config: ServerTtsSegmenterConfig,
-    cancel_rx: watch::Receiver<bool>,
+    mut cancel_rx: watch::Receiver<bool>,
 ) {
     let mut segmenter = ServerTtsSegmenter::new(config);
     loop {
         if *cancel_rx.borrow() {
-            break;
+            return;
         }
 
         if segmenter.is_empty() {
-            match delta_rx.recv().await {
+            match tokio::select! {
+                biased;
+                changed = cancel_rx.changed() => {
+                    if changed.is_ok() && *cancel_rx.borrow() {
+                        return;
+                    }
+                    None
+                }
+                delta = delta_rx.recv() => delta,
+            } {
                 Some(delta) => {
                     for segment in segmenter.push(&delta) {
                         if segment_tx.send(segment).await.is_err() {
@@ -674,16 +823,29 @@ async fn run_server_tts_segmenter(
             continue;
         }
 
-        match tokio::time::timeout(config.flush_after, delta_rx.recv()).await {
-            Ok(Some(delta)) => {
+        match tokio::select! {
+            biased;
+            changed = cancel_rx.changed() => {
+                if changed.is_ok() && *cancel_rx.borrow() {
+                    return;
+                }
+                SegmenterReceive::Closed
+            }
+            delta = delta_rx.recv() => match delta {
+                Some(delta) => SegmenterReceive::Delta(delta),
+                None => SegmenterReceive::Closed,
+            },
+            _ = tokio::time::sleep(config.flush_after) => SegmenterReceive::Flush,
+        } {
+            SegmenterReceive::Delta(delta) => {
                 for segment in segmenter.push(&delta) {
                     if segment_tx.send(segment).await.is_err() {
                         return;
                     }
                 }
             }
-            Ok(None) => break,
-            Err(_) => {
+            SegmenterReceive::Closed => break,
+            SegmenterReceive::Flush => {
                 if let Some(segment) = segmenter.flush_latency() {
                     if segment_tx.send(segment).await.is_err() {
                         return;
@@ -700,11 +862,19 @@ async fn run_server_tts_segmenter(
     }
 }
 
+enum SegmenterReceive {
+    Delta(String),
+    Flush,
+    Closed,
+}
+
 async fn run_server_tts_synth(
     state: Arc<AppState>,
     mut segment_rx: mpsc::Receiver<String>,
     out_tx: mpsc::Sender<VoiceWsOut>,
-    cancel_rx: watch::Receiver<bool>,
+    mut cancel_rx: watch::Receiver<bool>,
+    conversation_id: Option<String>,
+    voice_session_id: u64,
 ) {
     let max_retries = server_tts_segment_retries();
     let max_consecutive_failures = server_tts_max_consecutive_failures();
@@ -713,14 +883,36 @@ async fn run_server_tts_synth(
     let mut reported_instability = false;
     let mut segment_cancel_rx = cancel_rx.clone();
 
-    while let Some(segment) = segment_rx.recv().await {
+    loop {
         if *cancel_rx.borrow() {
             break;
         }
 
+        let Some(segment) = (tokio::select! {
+            biased;
+            changed = cancel_rx.changed() => {
+                if changed.is_ok() && *cancel_rx.borrow() {
+                    break;
+                }
+                None
+            }
+            segment = segment_rx.recv() => segment,
+        }) else {
+            break;
+        };
+
         let mut attempt = 0usize;
         loop {
-            match stream_tts_segment(&state, &segment, &out_tx, &mut segment_cancel_rx).await {
+            match stream_tts_segment(
+                &state,
+                &segment,
+                &out_tx,
+                &mut segment_cancel_rx,
+                conversation_id.as_deref(),
+                voice_session_id,
+            )
+            .await
+            {
                 Ok(()) => {
                     consecutive_failures = 0;
                     break;
@@ -738,7 +930,16 @@ async fn run_server_tts_synth(
                         segment_chars = segment.chars().count(),
                         "server-side voice TTS segment failed before audio; retrying"
                     );
-                    tokio::time::sleep(retry_delay).await;
+                    tokio::select! {
+                        biased;
+                        changed = cancel_rx.changed() => {
+                            if changed.is_ok() && *cancel_rx.borrow() {
+                                return;
+                            }
+                            return;
+                        }
+                        _ = tokio::time::sleep(retry_delay) => {}
+                    }
                     continue;
                 }
                 Err(error) => {
@@ -782,12 +983,21 @@ async fn stream_tts_segment(
     segment: &str,
     out_tx: &mpsc::Sender<VoiceWsOut>,
     cancel_rx: &mut watch::Receiver<bool>,
+    conversation_id: Option<&str>,
+    voice_session_id: u64,
 ) -> Result<(), TtsSegmentStreamError> {
     if *cancel_rx.borrow() {
         return Err(TtsSegmentStreamError::client_disconnected(false));
     }
 
     let endpoint = local_tts_stream_url();
+    tracing::info!(
+        conversation_id,
+        voice_session_id,
+        segment_chars = segment.chars().count(),
+        segment_preview = %tts_log_preview_for_env(segment),
+        "server-side voice TTS segment started"
+    );
     let request = state
         .tts_http
         .post(endpoint)
@@ -877,6 +1087,24 @@ async fn stream_tts_segment(
     }
 
     Ok(())
+}
+
+fn tts_log_preview(segment: &str) -> String {
+    const MAX_PREVIEW_CHARS: usize = 48;
+    let cleaned = clean_tts_segment(segment);
+    let mut preview = cleaned.chars().take(MAX_PREVIEW_CHARS).collect::<String>();
+    if cleaned.chars().count() > MAX_PREVIEW_CHARS {
+        preview.push_str("...");
+    }
+    preview
+}
+
+fn tts_log_preview_for_env(segment: &str) -> String {
+    if read_env_bool("VOICE_TTS_LOG_SEGMENT_PREVIEW").unwrap_or(false) {
+        tts_log_preview(segment)
+    } else {
+        String::new()
+    }
 }
 
 fn status_event(status: &'static str) -> Event {
@@ -1586,6 +1814,75 @@ fn clean_tts_segment(segment: &str) -> String {
         .to_owned()
 }
 
+fn record_spoken_tts_delta(buffer: &Arc<std::sync::Mutex<String>>, delta: &str) {
+    let cleaned = clean_tts_segment(delta);
+    if cleaned.is_empty() {
+        return;
+    }
+
+    let Ok(mut spoken) = buffer.lock() else {
+        return;
+    };
+    if needs_space_between(&spoken, &cleaned) {
+        spoken.push(' ');
+    }
+    spoken.push_str(&cleaned);
+}
+
+fn unspoken_tts_suffix(
+    spoken_tts_text: &Arc<std::sync::Mutex<String>>,
+    final_reply: &str,
+) -> Option<String> {
+    let final_cleaned = clean_tts_segment(final_reply);
+    if final_cleaned.is_empty() {
+        return None;
+    }
+
+    let spoken = spoken_tts_text
+        .lock()
+        .map(|value| value.clone())
+        .unwrap_or_default();
+    let spoken_cleaned = clean_tts_segment(&spoken);
+    if spoken_cleaned.is_empty() {
+        return Some(final_cleaned);
+    }
+    if final_cleaned == spoken_cleaned {
+        return None;
+    }
+    if let Some(suffix) = final_cleaned.strip_prefix(&spoken_cleaned) {
+        let suffix = clean_tts_segment(suffix);
+        return (!suffix.is_empty()).then_some(suffix);
+    }
+
+    let Some(overlap_len) = longest_suffix_prefix_overlap(&spoken_cleaned, &final_cleaned, 12)
+    else {
+        tracing::warn!(
+            spoken_chars = spoken_cleaned.chars().count(),
+            final_chars = final_cleaned.chars().count(),
+            "server-side voice final reply did not align with streamed TTS text; skipped replay to avoid duplicate speech"
+        );
+        return None;
+    };
+
+    let suffix = clean_tts_segment(&final_cleaned[overlap_len..]);
+    (!suffix.is_empty()).then_some(suffix)
+}
+
+fn longest_suffix_prefix_overlap(left: &str, right: &str, min_chars: usize) -> Option<usize> {
+    let mut best = None;
+    for (byte_index, _) in left.char_indices() {
+        let suffix = &left[byte_index..];
+        if suffix.chars().count() < min_chars {
+            break;
+        }
+        if right.starts_with(suffix) {
+            best = Some(suffix.len());
+            break;
+        }
+    }
+    best
+}
+
 fn needs_space_between(current: &str, next: &str) -> bool {
     let Some(last) = current.chars().last() else {
         return false;
@@ -1843,4 +2140,50 @@ fn is_valid_conversation_id(value: &str) -> bool {
         && value
             .chars()
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spoken_buffer(text: &str) -> Arc<std::sync::Mutex<String>> {
+        Arc::new(std::sync::Mutex::new(text.to_owned()))
+    }
+
+    #[test]
+    fn unspoken_tts_suffix_returns_full_reply_when_nothing_was_streamed() {
+        let spoken = spoken_buffer("");
+
+        assert_eq!(
+            unspoken_tts_suffix(&spoken, "欢迎咨询哈尔滨师范大学招生信息。"),
+            Some("欢迎咨询哈尔滨师范大学招生信息。".to_owned())
+        );
+    }
+
+    #[test]
+    fn unspoken_tts_suffix_returns_only_missing_tail() {
+        let spoken = spoken_buffer("前半段已经播报。");
+
+        assert_eq!(
+            unspoken_tts_suffix(&spoken, "前半段已经播报。后半段需要补上。"),
+            Some("后半段需要补上。".to_owned())
+        );
+    }
+
+    #[test]
+    fn unspoken_tts_suffix_ignores_markdown_noise_for_matching() {
+        let spoken = spoken_buffer("这是第一句。");
+
+        assert_eq!(
+            unspoken_tts_suffix(&spoken, "**这是第一句。** 这是第二句。"),
+            Some("这是第二句。".to_owned())
+        );
+    }
+
+    #[test]
+    fn unspoken_tts_suffix_avoids_duplicate_replay_when_already_complete() {
+        let spoken = spoken_buffer("已经完整播报。");
+
+        assert_eq!(unspoken_tts_suffix(&spoken, "已经完整播报。"), None);
+    }
 }

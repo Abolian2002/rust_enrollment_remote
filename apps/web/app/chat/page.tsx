@@ -282,7 +282,13 @@ export default function ChatPage() {
   const submit = useCallback(
     async (message: string) => {
       setLocalRichMessages([]);
-      await voice.interrupt();
+      if (voice.usesServerVoice) {
+        stopActiveVoiceStream();
+        void voice.interrupt();
+        await voice.prepare();
+      } else {
+        await voice.interrupt();
+      }
       await submitMessage(message);
     },
     [submitMessage, voice]
@@ -309,12 +315,16 @@ export default function ChatPage() {
       ]);
       void (async () => {
         try {
+          if (voice.usesServerVoice) {
+            await voice.speakText(localAnswer.answer);
+            return;
+          }
+
           await voice.interrupt();
           const ready = await voice.prepare();
           if (!ready) {
             return;
           }
-
           for (const chunk of chunkTextForTts(localAnswer.answer)) {
             voice.speakChunk(`${chunk} `);
             await wait(120);
@@ -393,8 +403,12 @@ export default function ChatPage() {
                       latestAssistant={latestAssistant ?? null}
                       onReplay={() => {
                         if (latestAssistant) {
-                          voice.speakChunk(latestAssistant);
-                          void voice.complete();
+                          if (voice.usesServerVoice) {
+                            void voice.speakText(latestAssistant);
+                          } else {
+                            voice.speakChunk(latestAssistant);
+                            void voice.complete();
+                          }
                         }
                       }}
                     />

@@ -1,9 +1,11 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use domain::{
-    AdmissionScoreRecord, ChatCitation, ChatStructuredResult, ConversationHistory,
-    ConversationMessage, FaqEvidence, LatestScore, MajorAdmissionProvince, PolicyEvidence,
-    ProvinceAdmissionMajor, ResolvedMemory, ScoreSummary, VectorChunkEvidence,
+    AdminChartDatum, AdminConversationDetail, AdminConversationList, AdminConversationListItem,
+    AdminDashboardSnapshot, AdminFaqItem, AdminFaqList, AdminKnowledgeChunkItem,
+    AdminKnowledgeChunkList, AdminStat, AdmissionScoreRecord, ChatCitation, ChatStructuredResult,
+    ConversationHistory, ConversationMessage, FaqEvidence, LatestScore, MajorAdmissionProvince,
+    PolicyEvidence, ProvinceAdmissionMajor, ResolvedMemory, ScoreSummary, VectorChunkEvidence,
 };
 use serde_json::Value;
 use sqlx::{PgPool, Row, postgres::PgPoolOptions};
@@ -66,6 +68,481 @@ impl Database {
     pub async fn health_check(&self) -> Result<()> {
         sqlx::query("SELECT 1").execute(&self.pool).await?;
         Ok(())
+    }
+
+    pub async fn admin_dashboard_snapshot(&self) -> Result<AdminDashboardSnapshot> {
+        let counts = sqlx::query(
+            r#"
+            SELECT
+              (SELECT COUNT(*)::bigint FROM conversations) AS conversation_count,
+              (SELECT COUNT(*)::bigint FROM conversation_messages WHERE role = 'user') AS user_message_count,
+              (SELECT COUNT(*)::bigint FROM conversation_messages WHERE role = 'assistant') AS assistant_message_count,
+              (SELECT COUNT(*)::bigint FROM faq_knowledge WHERE status = 'PUBLISHED') AS faq_count,
+              (SELECT COUNT(*)::bigint FROM knowledge_chunks WHERE data_version = 'official-pdf-knowledge-v2') AS chunk_count,
+              (SELECT COUNT(DISTINCT province_id)::bigint FROM admission_scores) AS province_count,
+              to_char(now(), 'YYYY-MM-DD HH24:MI') AS updated_at
+            "#,
+        )
+        .fetch_one(&self.pool)
+        .await?;
+
+        let conversation_count = counts.get::<i64, _>("conversation_count");
+        let user_message_count = counts.get::<i64, _>("user_message_count");
+        let assistant_message_count = counts.get::<i64, _>("assistant_message_count");
+        let faq_count = counts.get::<i64, _>("faq_count");
+        let chunk_count = counts.get::<i64, _>("chunk_count");
+        let province_count = counts.get::<i64, _>("province_count");
+        let avg_questions = if conversation_count > 0 {
+            format!(
+                "{:.1}",
+                user_message_count as f64 / conversation_count as f64
+            )
+        } else {
+            "0.0".to_owned()
+        };
+
+        let trend_rows = sqlx::query(
+            r#"
+            SELECT
+              to_char(day::date, 'MM-DD') AS label,
+              COALESCE(COUNT(m.id), 0)::bigint AS value
+            FROM generate_series(current_date - interval '13 days', current_date, interval '1 day') AS day
+            LEFT JOIN conversation_messages m
+              ON m.role = 'user'
+             AND m.created_at >= day
+             AND m.created_at < day + interval '1 day'
+            GROUP BY day
+            ORDER BY day
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let trend_days = trend_rows
+            .iter()
+            .map(|row| row.get::<String, _>("label"))
+            .collect::<Vec<_>>();
+        let trend_values = trend_rows
+            .iter()
+            .map(|row| row.get::<i64, _>("value"))
+            .collect::<Vec<_>>();
+
+        let hourly_rows = sqlx::query(
+            r#"
+            SELECT
+              hour,
+              COALESCE(COUNT(m.id), 0)::bigint AS value
+            FROM generate_series(0, 23) AS hour
+            LEFT JOIN conversation_messages m
+              ON m.role = 'user'
+             AND EXTRACT(hour FROM m.created_at)::int = hour
+             AND m.created_at >= now() - interval '30 days'
+            GROUP BY hour
+            ORDER BY hour
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let hourly_values = hourly_rows
+            .into_iter()
+            .map(|row| row.get::<i64, _>("value"))
+            .collect::<Vec<_>>();
+
+        let hot_rows = sqlx::query(
+            r#"
+            SELECT
+              left(regexp_replace(trim(content), '\s+', ' ', 'g'), 80) AS question,
+              COUNT(*)::bigint AS count
+            FROM conversation_messages
+            WHERE role = 'user'
+              AND trim(content) <> ''
+            GROUP BY left(regexp_replace(trim(content), '\s+', ' ', 'g'), 80)
+            ORDER BY count DESC, max(created_at) DESC
+            LIMIT 20
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let hot_questions = hot_rows
+            .into_iter()
+            .map(|row| {
+                (
+                    row.get::<String, _>("question"),
+                    format!("{}次", row.get::<i64, _>("count")),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let category_rows = sqlx::query(
+            r#"
+            SELECT category, COUNT(*)::bigint AS count
+            FROM (
+              SELECT CASE
+                WHEN content ILIKE '%分数%' OR content ILIKE '%录取线%' OR content ILIKE '%位次%' OR content ILIKE '%多少分%' THEN '分数位次'
+                WHEN content ILIKE '%调剂%' OR content ILIKE '%同分%' OR content ILIKE '%录取规则%' OR content ILIKE '%投档%' THEN '录取规则'
+                WHEN content ILIKE '%专业%' OR content ILIKE '%课程%' OR content ILIKE '%培养方案%' OR content ILIKE '%学院%' THEN '专业介绍'
+                WHEN content ILIKE '%公费师范%' OR content ILIKE '%免费师范%' THEN '公费师范'
+                WHEN content ILIKE '%优师%' THEN '优师专项'
+                ELSE '其他'
+              END AS category
+              FROM conversation_messages
+              WHERE role = 'user'
+            ) categorized
+            GROUP BY category
+            ORDER BY count DESC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let category_stats = category_rows
+            .into_iter()
+            .map(|row| AdminChartDatum {
+                name: row.get("category"),
+                value: row.get("count"),
+            })
+            .collect::<Vec<_>>();
+
+        let province_rows = sqlx::query(
+            r#"
+            SELECT
+              COALESCE(p.name, NULLIF(c.province_code, ''), '未知') AS province,
+              COUNT(*)::bigint AS count
+            FROM conversations c
+            LEFT JOIN provinces p ON p.code = c.province_code OR p.name = c.province_code
+            GROUP BY COALESCE(p.name, NULLIF(c.province_code, ''), '未知')
+            ORDER BY count DESC, province
+            LIMIT 12
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let province_bars = province_rows
+            .into_iter()
+            .map(|row| (row.get::<String, _>("province"), row.get::<i64, _>("count")))
+            .collect::<Vec<_>>();
+
+        Ok(AdminDashboardSnapshot {
+            updated_at: counts.get("updated_at"),
+            stats: vec![
+                AdminStat {
+                    label: "会话总数".to_owned(),
+                    value: format_number(conversation_count),
+                    delta: None,
+                    tone: Some("blue".to_owned()),
+                },
+                AdminStat {
+                    label: "咨询用户数".to_owned(),
+                    value: format_number(conversation_count),
+                    delta: None,
+                    tone: Some("green".to_owned()),
+                },
+                AdminStat {
+                    label: "用户提问数".to_owned(),
+                    value: format_number(user_message_count),
+                    delta: None,
+                    tone: Some("cyan".to_owned()),
+                },
+                AdminStat {
+                    label: "智能回答数".to_owned(),
+                    value: format_number(assistant_message_count),
+                    delta: None,
+                    tone: Some("purple".to_owned()),
+                },
+                AdminStat {
+                    label: "人均提问次数".to_owned(),
+                    value: avg_questions,
+                    delta: None,
+                    tone: Some("amber".to_owned()),
+                },
+                AdminStat {
+                    label: "FAQ/文档片段".to_owned(),
+                    value: format!(
+                        "{}/{}",
+                        format_number(faq_count),
+                        format_number(chunk_count)
+                    ),
+                    delta: Some(format!("覆盖{}省", province_count)),
+                    tone: Some("blue".to_owned()),
+                },
+            ],
+            trend_days,
+            trend_values,
+            hourly_values,
+            hot_questions,
+            category_stats,
+            province_bars,
+        })
+    }
+
+    pub async fn admin_list_conversations(
+        &self,
+        query: &str,
+        page: i64,
+        page_size: i64,
+    ) -> Result<AdminConversationList> {
+        let page = page.max(1);
+        let page_size = page_size.clamp(1, 100);
+        let offset = (page - 1) * page_size;
+        let pattern = format!("%{}%", query.trim());
+        let total = sqlx::query(
+            r#"
+            SELECT COUNT(DISTINCT c.id)::bigint AS total
+            FROM conversations c
+            WHERE $1 = '%%'
+               OR c.id ILIKE $1
+               OR c.session_key ILIKE $1
+               OR EXISTS (
+                 SELECT 1 FROM conversation_messages m
+                 WHERE m.conversation_id = c.id AND m.content ILIKE $1
+               )
+            "#,
+        )
+        .bind(&pattern)
+        .fetch_one(&self.pool)
+        .await?
+        .get::<i64, _>("total");
+
+        let rows = sqlx::query(
+            r#"
+            SELECT
+              c.id,
+              COALESCE(p.name, NULLIF(c.province_code, ''), '未知') AS province,
+              to_char(c.updated_at, 'YYYY-MM-DD HH24:MI') AS updated_at,
+              COUNT(m.id)::bigint AS message_count,
+              COALESCE(
+                (
+                  SELECT left(regexp_replace(trim(um.content), '\s+', ' ', 'g'), 120)
+                  FROM conversation_messages um
+                  WHERE um.conversation_id = c.id AND um.role = 'user'
+                  ORDER BY um.created_at DESC
+                  LIMIT 1
+                ),
+                ''
+              ) AS last_message
+            FROM conversations c
+            LEFT JOIN provinces p ON p.code = c.province_code OR p.name = c.province_code
+            LEFT JOIN conversation_messages m ON m.conversation_id = c.id
+            WHERE $1 = '%%'
+               OR c.id ILIKE $1
+               OR c.session_key ILIKE $1
+               OR EXISTS (
+                 SELECT 1 FROM conversation_messages sm
+                 WHERE sm.conversation_id = c.id AND sm.content ILIKE $1
+               )
+            GROUP BY c.id, p.name, c.province_code, c.updated_at
+            ORDER BY c.updated_at DESC
+            LIMIT $2 OFFSET $3
+            "#,
+        )
+        .bind(&pattern)
+        .bind(page_size)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(AdminConversationList {
+            items: rows
+                .into_iter()
+                .map(|row| AdminConversationListItem {
+                    id: row.get("id"),
+                    province: row.get("province"),
+                    updated_at: row.get("updated_at"),
+                    message_count: row.get("message_count"),
+                    status: "待审核".to_owned(),
+                    manual_intervention: false,
+                    last_message: row.get("last_message"),
+                })
+                .collect(),
+            total,
+            page,
+            page_size,
+        })
+    }
+
+    pub async fn admin_get_conversation_detail(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<AdminConversationDetail>> {
+        let Some(history) = self.get_conversation_history(conversation_id).await? else {
+            return Ok(None);
+        };
+        let row = sqlx::query(
+            r#"
+            SELECT COALESCE(p.name, NULLIF(c.province_code, ''), '未知') AS province
+            FROM conversations c
+            LEFT JOIN provinces p ON p.code = c.province_code OR p.name = c.province_code
+            WHERE c.id = $1 OR c.session_key = $1
+            LIMIT 1
+            "#,
+        )
+        .bind(conversation_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        let province = row
+            .map(|row| row.get::<String, _>("province"))
+            .unwrap_or_else(|| "未知".to_owned());
+        Ok(Some(AdminConversationDetail {
+            id: history.id,
+            province,
+            status: "待审核".to_owned(),
+            manual_intervention: false,
+            message_count: history.messages.len(),
+            messages: history.messages,
+        }))
+    }
+
+    pub async fn admin_list_faqs(
+        &self,
+        query: &str,
+        page: i64,
+        page_size: i64,
+    ) -> Result<AdminFaqList> {
+        let page = page.max(1);
+        let page_size = page_size.clamp(1, 100);
+        let offset = (page - 1) * page_size;
+        let pattern = format!("%{}%", query.trim());
+        let total = sqlx::query(
+            r#"
+            SELECT COUNT(*)::bigint AS total
+            FROM faq_knowledge
+            WHERE $1 = '%%'
+               OR question ILIKE $1
+               OR answer ILIKE $1
+               OR category ILIKE $1
+            "#,
+        )
+        .bind(&pattern)
+        .fetch_one(&self.pool)
+        .await?
+        .get::<i64, _>("total");
+        let rows = sqlx::query(
+            r#"
+            SELECT
+              fk.id,
+              fk.question,
+              fk.answer,
+              fk.category,
+              fk.source_label,
+              CASE WHEN fk.status::text = 'PUBLISHED' THEN '启用' ELSE '禁用' END AS status,
+              to_char(fk.updated_at, 'YYYY-MM-DD') AS updated_at,
+              COALESCE(
+                (
+                  SELECT string_agg(value, '|')
+                  FROM jsonb_array_elements_text(COALESCE(fk.tags, '[]'::jsonb)) AS value
+                ),
+                ''
+              ) AS similar,
+              COUNT(kc.id)::bigint AS hits
+            FROM faq_knowledge fk
+            LEFT JOIN knowledge_chunks kc ON kc.faq_knowledge_id = fk.id
+            WHERE $1 = '%%'
+               OR fk.question ILIKE $1
+               OR fk.answer ILIKE $1
+               OR fk.category ILIKE $1
+            GROUP BY fk.id
+            ORDER BY fk.updated_at DESC
+            LIMIT $2 OFFSET $3
+            "#,
+        )
+        .bind(&pattern)
+        .bind(page_size)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(AdminFaqList {
+            items: rows
+                .into_iter()
+                .map(|row| AdminFaqItem {
+                    id: row.get("id"),
+                    question: row.get("question"),
+                    similar: row.get("similar"),
+                    answer: row.get("answer"),
+                    source: row.get::<String, _>("source_label"),
+                    updated_at: row.get("updated_at"),
+                    status: row.get("status"),
+                    hits: row.get("hits"),
+                })
+                .collect(),
+            total,
+            page,
+            page_size,
+        })
+    }
+
+    pub async fn admin_list_knowledge_chunks(
+        &self,
+        query: &str,
+        page: i64,
+        page_size: i64,
+    ) -> Result<AdminKnowledgeChunkList> {
+        let page = page.max(1);
+        let page_size = page_size.clamp(1, 100);
+        let offset = (page - 1) * page_size;
+        let pattern = format!("%{}%", query.trim());
+        let total = sqlx::query(
+            r#"
+            SELECT COUNT(*)::bigint AS total
+            FROM knowledge_chunks kc
+            WHERE kc.data_version = 'official-pdf-knowledge-v2'
+              AND (
+                $1 = '%%'
+                OR kc.title ILIKE $1
+                OR kc.content ILIKE $1
+                OR kc.metadata::text ILIKE $1
+              )
+            "#,
+        )
+        .bind(&pattern)
+        .fetch_one(&self.pool)
+        .await?
+        .get::<i64, _>("total");
+        let rows = sqlx::query(
+            r#"
+            SELECT
+              kc.id,
+              kc.title,
+              left(regexp_replace(trim(kc.content), '\s+', ' ', 'g'), 180) AS excerpt,
+              kc.source_type::text AS source_type,
+              kc.metadata->>'documentKind' AS document_kind,
+              kc.metadata->>'college' AS college,
+              kc.metadata->>'majorName' AS major_name,
+              to_char(kc.updated_at, 'YYYY-MM-DD') AS updated_at
+            FROM knowledge_chunks kc
+            WHERE kc.data_version = 'official-pdf-knowledge-v2'
+              AND (
+                $1 = '%%'
+                OR kc.title ILIKE $1
+                OR kc.content ILIKE $1
+                OR kc.metadata::text ILIKE $1
+              )
+            ORDER BY kc.updated_at DESC, kc.chunk_index ASC
+            LIMIT $2 OFFSET $3
+            "#,
+        )
+        .bind(&pattern)
+        .bind(page_size)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(AdminKnowledgeChunkList {
+            items: rows
+                .into_iter()
+                .map(|row| AdminKnowledgeChunkItem {
+                    id: row.get("id"),
+                    title: row.try_get("title").ok(),
+                    excerpt: row.get("excerpt"),
+                    document_kind: row.try_get("document_kind").ok(),
+                    college: row.try_get("college").ok(),
+                    major_name: row.try_get("major_name").ok(),
+                    source_type: row.get("source_type"),
+                    updated_at: row.get("updated_at"),
+                })
+                .collect(),
+            total,
+            page,
+            page_size,
+        })
     }
 
     pub async fn resolve_province(&self, value: &str) -> Result<Option<ProvinceRecord>> {
@@ -968,6 +1445,22 @@ fn read_env_u32(key: &str, default: u32) -> u32 {
         .and_then(|value| value.parse::<u32>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(default)
+}
+
+fn format_number(value: i64) -> String {
+    let raw = value.abs().to_string();
+    let mut formatted = String::new();
+    for (index, ch) in raw.chars().rev().enumerate() {
+        if index > 0 && index % 3 == 0 {
+            formatted.push(',');
+        }
+        formatted.push(ch);
+    }
+    let mut result = formatted.chars().rev().collect::<String>();
+    if value < 0 {
+        result.insert(0, '-');
+    }
+    result
 }
 
 fn read_env_u64(key: &str, default: u64) -> u64 {

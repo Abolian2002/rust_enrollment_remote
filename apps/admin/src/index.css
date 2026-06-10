@@ -645,6 +645,41 @@ td {
   color: #344054;
   line-height: 1.8;
 }
+.dialog-thread {
+  display: grid;
+  gap: 12px;
+}
+.dialog-bubble {
+  max-width: 86%;
+  padding: 12px 14px;
+  border-radius: 10px;
+  background: #f8fafc;
+  color: #172033;
+  line-height: 1.7;
+}
+.dialog-bubble.user {
+  justify-self: flex-end;
+  background: #eaf2ff;
+}
+.dialog-bubble.assistant {
+  justify-self: flex-start;
+  background: #f6fef9;
+}
+.dialog-bubble b {
+  display: block;
+  margin-bottom: 5px;
+  color: #101828;
+}
+.dialog-bubble p {
+  margin: 0;
+  white-space: pre-wrap;
+}
+.dialog-bubble time {
+  display: block;
+  margin-top: 8px;
+  color: #98a2b3;
+  font-size: 12px;
+}
 .unknown-list { display: grid; gap: 14px; }
 .unknown-list > div {
   display: flex;
@@ -657,6 +692,44 @@ td {
 }
 .unknown-list b { display: block; margin-bottom: 8px; }
 .unknown-list span { margin-right: 10px; color: #667085; font-size: 13px; }
+.chunk-list {
+  display: grid;
+  gap: 12px;
+}
+.chunk-list article {
+  padding: 14px;
+  border: 1px solid #e7ecf3;
+  border-radius: 10px;
+  background: #fbfdff;
+}
+.chunk-list p {
+  margin: 10px 0 0;
+  color: #344054;
+  line-height: 1.75;
+}
+.chunk-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+.chunk-meta b {
+  margin-right: auto;
+  color: #101828;
+}
+.chunk-meta span,
+.chunk-meta time {
+  border-radius: 999px;
+  padding: 4px 8px;
+  background: #eef4ff;
+  color: #475467;
+  font-size: 12px;
+}
+.soft-note {
+  margin: 0 0 12px;
+  color: #667085;
+  line-height: 1.7;
+}
 .upload-drop {
   display: grid;
   place-items: center;
@@ -708,6 +781,9 @@ td {
   color: #667085;
   background: #f8fafc;
   border-radius: 12px;
+}
+.empty-state.compact {
+  min-height: 96px;
 }
 .modal-layer {
   position: fixed;

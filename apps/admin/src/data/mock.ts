@@ -21,7 +21,7 @@ export type EvaluationRecord = {
 };
 
 export type KnowledgeItem = {
-  id: number;
+  id: string | number;
   question: string;
   similar: string;
   answer: string;

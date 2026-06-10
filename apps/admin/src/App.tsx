@@ -1,4 +1,4 @@
-import { useState, type FormEvent, type ReactNode } from 'react';
+import { useEffect, useState, type FormEvent, type ReactNode } from 'react';
 import { BrowserRouter, Link, Navigate, Route, Routes, useLocation, useNavigate } from 'react-router-dom';
 import ReactECharts from 'echarts-for-react';
 import * as echarts from 'echarts';
@@ -62,6 +62,19 @@ import {
   type Stat,
   type Ticket,
 } from './data/mock';
+import {
+  fetchAdminConversationDetail,
+  fetchAdminConversations,
+  fetchAdminDashboard,
+  fetchAdminFaqs,
+  fetchAdminKnowledgeChunks,
+} from './api/admin';
+import type {
+  AdminConversationDetail,
+  AdminConversationListItem,
+  AdminDashboardSnapshot,
+  AdminKnowledgeChunkItem,
+} from './types/admin';
 
 echarts.registerMap('china', chinaMap as never);
 
@@ -312,25 +325,54 @@ function Modal({ title, children, onClose }: { title: string; children: ReactNod
 }
 
 function DashboardPage() {
+  const [dashboard, setDashboard] = useState<AdminDashboardSnapshot | null>(null);
+  const [loadError, setLoadError] = useState('');
+
+  useEffect(() => {
+    let alive = true;
+    fetchAdminDashboard()
+      .then((data) => {
+        if (alive) {
+          setDashboard(data);
+          setLoadError('');
+        }
+      })
+      .catch((error: Error) => {
+        if (alive) {
+          setLoadError(error.message);
+        }
+      });
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  const stats = dashboard?.stats ?? dashboardStats;
+  const dashboardTrendDays = dashboard?.trendDays ?? trendDays;
+  const dashboardTrendValues = dashboard?.trendValues ?? trendValues;
+  const dashboardHourlyValues = dashboard?.hourlyValues ?? hourlyValues;
+  const dashboardHotQuestions = dashboard?.hotQuestions ?? hotQuestions;
+
   return (
     <>
       <div className="page-meta">
         <SelectLike>近7天</SelectLike>
-        <span><Clock3 size={16} /> 数据更新时间：2024-06-14 08:00</span>
+        <span><Clock3 size={16} /> 数据更新时间：{dashboard?.updatedAt ?? 'mock 数据'}</span>
+        {loadError ? <span className="soft-pill amber">真实数据暂不可用，已显示本地样例</span> : null}
       </div>
-      <StatGrid stats={dashboardStats} />
+      <StatGrid stats={stats} />
       <div className="grid-two">
         <Card title="咨询量趋势" action={<span className="soft-pill">↗ 上涨趋势</span>}>
-          <Chart option={lineOption(trendDays, trendValues, '#2161ff')} height={290} />
+          <Chart option={lineOption(dashboardTrendDays, dashboardTrendValues, '#2161ff')} height={290} />
         </Card>
         <Card title="24小时咨询时段分布">
-          <Chart option={barOption(Array.from({ length: 24 }, (_, index) => `${index.toString().padStart(2, '0')}`), hourlyValues, '#34c8c2')} height={290} />
+          <Chart option={barOption(Array.from({ length: 24 }, (_, index) => `${index.toString().padStart(2, '0')}`), dashboardHourlyValues, '#34c8c2')} height={290} />
         </Card>
       </div>
       <div className="grid-two">
         <Card title="近期热点问题 TOP5" action={<a className="linkish" href="/insights">查看全部</a>}>
           <ol className="rank-list">
-            {hotQuestions.map(([question, count], index) => <li key={question}><b>{index + 1}</b><span>{question}</span><em>{count}</em></li>)}
+            {dashboardHotQuestions.slice(0, 5).map(([question, count], index) => <li key={question}><b>{index + 1}</b><span>{question}</span><em>{count}</em></li>)}
           </ol>
         </Card>
         <Card title="预警信息与快捷入口">
@@ -463,8 +505,51 @@ function EvaluationPage() {
 
 function ConversationsPage() {
   const [query, setQuery] = useState('');
-  const [selected, setSelected] = useState<(typeof conversations)[number] | null>(null);
-  const rows = conversations.filter((item) => item.join('').includes(query));
+  const [apiRows, setApiRows] = useState<AdminConversationListItem[] | null>(null);
+  const [selected, setSelected] = useState<AdminConversationListItem | null>(null);
+  const [detail, setDetail] = useState<AdminConversationDetail | null>(null);
+  const [loadError, setLoadError] = useState('');
+  const mockRows = conversations
+    .filter((item) => item.join('').includes(query))
+    .map(([id, province, updatedAt, messageCount, status, manualIntervention]) => ({
+      id: id as string,
+      province: province as string,
+      updatedAt: updatedAt as string,
+      messageCount: messageCount as number,
+      status: status as string,
+      manualIntervention: manualIntervention === '是',
+      lastMessage: '本地样例对话',
+    }));
+  const rows = apiRows ?? mockRows;
+
+  useEffect(() => {
+    let alive = true;
+    fetchAdminConversations(query)
+      .then((data) => {
+        if (alive) {
+          setApiRows(data.items);
+          setLoadError('');
+        }
+      })
+      .catch((error: Error) => {
+        if (alive) {
+          setApiRows(null);
+          setLoadError(error.message);
+        }
+      });
+    return () => {
+      alive = false;
+    };
+  }, [query]);
+
+  function openConversation(row: AdminConversationListItem) {
+    setSelected(row);
+    setDetail(null);
+    fetchAdminConversationDetail(row.id)
+      .then(setDetail)
+      .catch(() => setDetail(null));
+  }
+
   return (
     <>
       <Toolbar>
@@ -472,10 +557,40 @@ function ConversationsPage() {
         <SearchBox value={query} onChange={setQuery} placeholder="搜索对话内容..." />
         <PrimaryButton ghost><Download size={16} />导出</PrimaryButton>
       </Toolbar>
+      {loadError ? <div className="warning-box"><AlertCircle size={18} />真实对话数据暂不可用，已显示本地样例</div> : null}
       <Card title={`对话记录列表 ${rows.length} 条`}>
-        <DataTable headers={['会话ID', '用户省份', '对话时间', '问题数', '状态', '人工介入', '操作']} rows={rows.map((row) => [...row.slice(0, 4), <StatusBadge value={row[4] as string} />, row[5], <button className="table-action" type="button" onClick={() => setSelected(row)}>查看</button>])} />
+        <DataTable
+          headers={['会话ID', '用户省份', '对话时间', '问题数', '状态', '人工介入', '最近问题', '操作']}
+          rows={rows.map((row) => [
+            row.id,
+            row.province,
+            row.updatedAt,
+            row.messageCount,
+            <StatusBadge value={row.status} />,
+            row.manualIntervention ? '是' : '否',
+            row.lastMessage,
+            <button className="table-action" type="button" onClick={() => openConversation(row)}>查看</button>,
+          ])}
+        />
       </Card>
-      {selected ? <Modal title={`会话审计 ${selected[0]}`} onClose={() => setSelected(null)}><p className="dialog-text">用户来自{selected[1]}，共提问 {selected[3]} 次。系统回答命中知识库 4 次，人工介入：{selected[5]}。</p></Modal> : null}
+      {selected ? (
+        <Modal title={`会话审计 ${selected.id}`} onClose={() => { setSelected(null); setDetail(null); }}>
+          <p className="dialog-text">用户来自{selected.province}，共记录 {detail?.messageCount ?? selected.messageCount} 条消息。人工介入：{selected.manualIntervention ? '是' : '否'}。</p>
+          {detail ? (
+            <div className="dialog-thread">
+              {detail.messages.map((message, index) => (
+                <div className={`dialog-bubble ${message.role}`} key={`${message.role}-${index}`}>
+                  <b>{message.role === 'assistant' ? '助手' : '用户'}</b>
+                  <p>{message.content}</p>
+                  {message.createdAt ? <time>{message.createdAt}</time> : null}
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div className="empty-state">正在读取对话详情，或当前为本地样例数据。</div>
+          )}
+        </Modal>
+      ) : null}
     </>
   );
 }
@@ -483,8 +598,42 @@ function ConversationsPage() {
 function KnowledgePage() {
   const [query, setQuery] = useState('');
   const [items, setItems] = useState(knowledgeBase);
+  const [apiItems, setApiItems] = useState<KnowledgeItem[] | null>(null);
+  const [chunks, setChunks] = useState<AdminKnowledgeChunkItem[]>([]);
+  const [faqTotal, setFaqTotal] = useState<number | null>(null);
+  const [chunkTotal, setChunkTotal] = useState<number | null>(null);
+  const [loadError, setLoadError] = useState('');
   const [modal, setModal] = useState<'new' | 'import' | null>(null);
-  const rows = items.filter((item) => `${item.question}${item.answer}${item.similar}`.includes(query));
+  const rows = apiItems ?? items.filter((item) => `${item.question}${item.answer}${item.similar}`.includes(query));
+
+  useEffect(() => {
+    let alive = true;
+    Promise.all([
+      fetchAdminFaqs(query),
+      fetchAdminKnowledgeChunks(query),
+    ])
+      .then(([faqList, chunkList]) => {
+        if (alive) {
+          setApiItems(faqList.items);
+          setChunks(chunkList.items);
+          setFaqTotal(faqList.total);
+          setChunkTotal(chunkList.total);
+          setLoadError('');
+        }
+      })
+      .catch((error: Error) => {
+        if (alive) {
+          setApiItems(null);
+          setChunks([]);
+          setFaqTotal(null);
+          setChunkTotal(null);
+          setLoadError(error.message);
+        }
+      });
+    return () => {
+      alive = false;
+    };
+  }, [query]);
 
   function addUnknown(question: string) {
     setItems((current) => [...current, {
@@ -506,12 +655,33 @@ function KnowledgePage() {
         <SearchBox value={query} onChange={setQuery} placeholder="搜索问答内容..." />
         <PrimaryButton ghost onClick={() => setModal('import')}><Upload size={16} />批量导入</PrimaryButton>
         <PrimaryButton ghost><Download size={16} />导出</PrimaryButton>
-        <PrimaryButton onClick={() => setModal('new')}><Plus size={16} />新增问答</PrimaryButton>
+        <PrimaryButton onClick={() => setModal('new')}><Plus size={16} />本地新增预览</PrimaryButton>
       </Toolbar>
-      <Card title={`标准问答库 ${rows.length} 条`}>
+      {loadError ? <div className="warning-box"><AlertCircle size={18} />真实知识库暂不可用，已显示本地样例</div> : null}
+      <Card title={`标准问答库 ${faqTotal ?? rows.length} 条`}>
         <DataTable headers={['ID', '标准问题', '相似问法', '标准答案', '来源', '更新时间', '状态', '命中']} rows={rows.map((item) => [item.id, item.question, item.similar, item.answer, item.source, item.updatedAt, <StatusBadge value={item.status} />, item.hits])} />
       </Card>
-      <Card title="未知问题归集池" action={<span className="soft-pill amber">4 条待处理</span>}>
+      <Card title={`PDF 文档片段审计 ${chunkTotal ?? chunks.length} 条`} action={<span className="soft-pill">招生简章 / 培养方案</span>}>
+        {chunks.length ? (
+          <div className="chunk-list">
+            {chunks.map((chunk) => (
+              <article key={chunk.id}>
+                <div className="chunk-meta">
+                  <b>{chunk.title || chunk.documentKind || '未命名片段'}</b>
+                  <span>{chunk.college || '全校'}</span>
+                  {chunk.majorName ? <span>{chunk.majorName}</span> : null}
+                  <time>{chunk.updatedAt}</time>
+                </div>
+                <p>{chunk.excerpt}</p>
+              </article>
+            ))}
+          </div>
+        ) : (
+          <div className="empty-state compact">没有匹配到文档片段。</div>
+        )}
+      </Card>
+      <Card title="未知问题归集池" action={<span className="soft-pill amber">本地样例</span>}>
+        <p className="soft-note">第一阶段先接真实 FAQ 和文档片段只读数据；未覆盖问题、审核状态、命中统计会在后续接入事件日志后改为真实分析。</p>
         <div className="unknown-list">
           {unknownQuestions.map(([question, count, status]) => (
             <div key={question as string}>

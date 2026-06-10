@@ -236,6 +236,17 @@ fn build_router(state: Arc<AppState>) -> Router {
         )
         .route("/api/v1/knowledge/faq", get(knowledge_faq))
         .route("/api/v1/knowledge/policies", get(knowledge_policies))
+        .route("/api/v1/admin/dashboard/summary", get(admin_dashboard))
+        .route("/api/v1/admin/conversations", get(admin_conversations))
+        .route(
+            "/api/v1/admin/conversations/{conversation_id}",
+            get(admin_conversation_detail),
+        )
+        .route("/api/v1/admin/knowledge/faqs", get(admin_knowledge_faqs))
+        .route(
+            "/api/v1/admin/knowledge/chunks",
+            get(admin_knowledge_chunks),
+        )
         .route("/api/v1/tts/token", post(tts_token))
         .route("/api/v1/tts/speech", post(tts_speech))
         .route("/api/v1/tts/stream", post(tts_stream))
@@ -1406,6 +1417,199 @@ async fn knowledge_policies(
             )
                 .into_response()
         }
+    }
+}
+
+async fn admin_dashboard(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(response) = require_admin_token(&headers) {
+        return response;
+    }
+    match state.db.admin_dashboard_snapshot().await {
+        Ok(snapshot) => (StatusCode::OK, Json(ok(snapshot))).into_response(),
+        Err(error) => {
+            tracing::error!(error = %error, "failed to load admin dashboard");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(fail("ADMIN_DASHBOARD_ERROR", "无法读取后台看板数据。")),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn admin_conversations(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    if let Err(response) = require_admin_token(&headers) {
+        return response;
+    }
+    let query = params.get("q").cloned().unwrap_or_default();
+    let (page, page_size) = pagination_from_params(&params);
+    match state
+        .db
+        .admin_list_conversations(&query, page, page_size)
+        .await
+    {
+        Ok(list) => (StatusCode::OK, Json(ok(list))).into_response(),
+        Err(error) => {
+            tracing::error!(error = %error, "failed to list admin conversations");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(fail("ADMIN_CONVERSATIONS_ERROR", "无法读取对话审计列表。")),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn admin_conversation_detail(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(conversation_id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(response) = require_admin_token(&headers) {
+        return response;
+    }
+    if !is_valid_conversation_id(&conversation_id) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(fail("BAD_REQUEST", "Invalid conversation id")),
+        )
+            .into_response();
+    }
+    match state
+        .db
+        .admin_get_conversation_detail(&conversation_id)
+        .await
+    {
+        Ok(Some(detail)) => (StatusCode::OK, Json(ok(detail))).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(fail("NOT_FOUND", "Conversation not found")),
+        )
+            .into_response(),
+        Err(error) => {
+            tracing::error!(error = %error, "failed to load admin conversation detail");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(fail("ADMIN_CONVERSATION_ERROR", "无法读取对话详情。")),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn admin_knowledge_faqs(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    if let Err(response) = require_admin_token(&headers) {
+        return response;
+    }
+    let query = params.get("q").cloned().unwrap_or_default();
+    let (page, page_size) = pagination_from_params(&params);
+    match state.db.admin_list_faqs(&query, page, page_size).await {
+        Ok(list) => (StatusCode::OK, Json(ok(list))).into_response(),
+        Err(error) => {
+            tracing::error!(error = %error, "failed to list admin faqs");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(fail("ADMIN_FAQ_ERROR", "无法读取后台 FAQ。")),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn admin_knowledge_chunks(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    if let Err(response) = require_admin_token(&headers) {
+        return response;
+    }
+    let query = params.get("q").cloned().unwrap_or_default();
+    let (page, page_size) = pagination_from_params(&params);
+    match state
+        .db
+        .admin_list_knowledge_chunks(&query, page, page_size)
+        .await
+    {
+        Ok(list) => (StatusCode::OK, Json(ok(list))).into_response(),
+        Err(error) => {
+            tracing::error!(error = %error, "failed to list admin knowledge chunks");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(fail("ADMIN_CHUNKS_ERROR", "无法读取后台知识片段。")),
+            )
+                .into_response()
+        }
+    }
+}
+
+fn pagination_from_params(params: &HashMap<String, String>) -> (i64, i64) {
+    let page = params
+        .get("page")
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(1)
+        .max(1);
+    let page_size = params
+        .get("pageSize")
+        .or_else(|| params.get("page_size"))
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(20)
+        .clamp(1, 100);
+    (page, page_size)
+}
+
+fn require_admin_token(headers: &HeaderMap) -> Result<(), Response> {
+    let Ok(expected) = std::env::var("ADMIN_API_TOKEN") else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(fail(
+                "ADMIN_TOKEN_NOT_CONFIGURED",
+                "后台管理接口尚未配置 ADMIN_API_TOKEN。",
+            )),
+        )
+            .into_response());
+    };
+    let expected = expected.trim();
+    if expected.is_empty() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(fail(
+                "ADMIN_TOKEN_NOT_CONFIGURED",
+                "后台管理接口尚未配置 ADMIN_API_TOKEN。",
+            )),
+        )
+            .into_response());
+    }
+
+    let bearer = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::trim);
+    let header_token = headers
+        .get("x-admin-token")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim);
+
+    if bearer == Some(expected) || header_token == Some(expected) {
+        Ok(())
+    } else {
+        Err((
+            StatusCode::UNAUTHORIZED,
+            Json(fail("UNAUTHORIZED", "后台管理接口未授权。")),
+        )
+            .into_response())
     }
 }
 

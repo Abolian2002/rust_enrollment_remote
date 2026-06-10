@@ -360,6 +360,117 @@ pub struct ConversationHistory {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
+pub struct AdminStat {
+    pub label: String,
+    pub value: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delta: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tone: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminChartDatum {
+    pub name: String,
+    pub value: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminDashboardSnapshot {
+    pub updated_at: String,
+    pub stats: Vec<AdminStat>,
+    pub trend_days: Vec<String>,
+    pub trend_values: Vec<i64>,
+    pub hourly_values: Vec<i64>,
+    pub hot_questions: Vec<(String, String)>,
+    pub category_stats: Vec<AdminChartDatum>,
+    pub province_bars: Vec<(String, i64)>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminConversationListItem {
+    pub id: String,
+    pub province: String,
+    pub updated_at: String,
+    pub message_count: i64,
+    pub status: String,
+    pub manual_intervention: bool,
+    pub last_message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminConversationList {
+    pub items: Vec<AdminConversationListItem>,
+    pub total: i64,
+    pub page: i64,
+    pub page_size: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminConversationDetail {
+    pub id: String,
+    pub province: String,
+    pub status: String,
+    pub manual_intervention: bool,
+    pub message_count: usize,
+    pub messages: Vec<ConversationMessage>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminFaqItem {
+    pub id: String,
+    pub question: String,
+    pub similar: String,
+    pub answer: String,
+    pub source: String,
+    pub updated_at: String,
+    pub status: String,
+    pub hits: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminFaqList {
+    pub items: Vec<AdminFaqItem>,
+    pub total: i64,
+    pub page: i64,
+    pub page_size: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminKnowledgeChunkItem {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    pub excerpt: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub document_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub college: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub major_name: Option<String>,
+    pub source_type: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminKnowledgeChunkList {
+    pub items: Vec<AdminKnowledgeChunkItem>,
+    pub total: i64,
+    pub page: i64,
+    pub page_size: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
 pub struct ApiEnvelope<T>
 where
     T: Serialize,

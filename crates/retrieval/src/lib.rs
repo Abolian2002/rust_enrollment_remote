@@ -699,14 +699,23 @@ pub fn route_message(message: &str) -> RouteDecision {
             reason: "用户寒暄，不需要查数据。".to_owned(),
         };
     }
-    if is_probability_message(trimmed) {
+    let asks_score = is_score_message(trimmed);
+    let asks_probability = is_probability_message(trimmed);
+    if asks_score && (!asks_probability || is_admission_threshold_score_message(trimmed)) {
+        return RouteDecision {
+            intent: RetrievalIntent::ScoreQuery,
+            must_use_tools: true,
+            reason: "分数线问题必须查询录取统计表。".to_owned(),
+        };
+    }
+    if asks_probability {
         return RouteDecision {
             intent: RetrievalIntent::ProbabilityAssessment,
             must_use_tools: true,
             reason: "录取概率必须基于真实录取统计。".to_owned(),
         };
     }
-    if is_score_message(trimmed) {
+    if asks_score {
         return RouteDecision {
             intent: RetrievalIntent::ScoreQuery,
             must_use_tools: true,
@@ -1026,13 +1035,88 @@ fn is_score_message(message: &str) -> bool {
             "录取线",
             "录取分数",
             "最低分",
+            "最低位次",
+            "投档线",
+            "投档分",
             "分数线",
             "位次",
             "排名",
             "近三年",
+            "近五年",
             "历年分数",
+            "历年分",
+        ],
+    ) || is_admission_threshold_score_message(message)
+        || is_admission_statistics_message(message)
+}
+
+fn is_admission_threshold_score_message(message: &str) -> bool {
+    contains_any(
+        message,
+        &[
+            "多少分",
+            "几分",
+            "要多少分",
+            "需要多少分",
+            "大概多少分",
+            "最低多少分",
+            "多少位次",
+            "多少名",
+        ],
+    ) && contains_any(
+        message,
+        &[
+            "能进",
+            "能上",
+            "可以进",
+            "可以上",
+            "能报",
+            "可以报",
+            "能录取",
+            "够",
+            "哈师大",
+            "哈尔滨师范大学",
+            "专业",
         ],
     )
+}
+
+fn is_admission_statistics_message(message: &str) -> bool {
+    contains_any(message, &["录取情况", "录取数据", "录取统计"])
+        && (contains_supported_admission_year(message)
+            || contains_any(
+                message,
+                &[
+                    "最低分",
+                    "最低位次",
+                    "分数",
+                    "位次",
+                    "省",
+                    "市",
+                    "本科批",
+                    "专业",
+                ],
+            ))
+}
+
+fn contains_supported_admission_year(message: &str) -> bool {
+    (2021..=2025).any(|year| message.contains(&year.to_string()))
+        || contains_any(
+            message,
+            &[
+                "2021到2025",
+                "2021年到2025年",
+                "2021-2025",
+                "2021年-2025年",
+                "2021—2025",
+                "2021年—2025年",
+                "2021至2025",
+                "2021年至2025年",
+                "21到25",
+                "21-25",
+                "近五年",
+            ],
+        )
 }
 
 fn is_knowledge_message(message: &str) -> bool {
@@ -1610,6 +1694,24 @@ mod tests {
         let fit = route_message("生物科学专业适合喜欢实验、以后想当老师的学生吗？");
         assert_eq!(fit.intent, RetrievalIntent::KnowledgeAnswer);
         assert!(fit.must_use_tools);
+    }
+
+    #[test]
+    fn routes_natural_admission_threshold_questions_to_score_tools() {
+        for query in [
+            "我是想问一下，2025年多少分能进哈师大计算机科学与技术专业",
+            "2021-2025年多少分能上汉语言文学师范类？",
+            "音乐学专业近五年大概多少分可以报？",
+            "山西2025年计算机科学与技术和软件工程的录取情况怎么样？",
+        ] {
+            let route = route_message(query);
+            assert_eq!(route.intent, RetrievalIntent::ScoreQuery, "{query}");
+            assert!(route.must_use_tools, "{query}");
+        }
+
+        let probability = route_message("河北500分能上汉语言文学吗？");
+        assert_eq!(probability.intent, RetrievalIntent::ProbabilityAssessment);
+        assert!(probability.must_use_tools);
     }
 
     #[test]

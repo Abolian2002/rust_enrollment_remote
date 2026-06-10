@@ -293,6 +293,8 @@ impl AdmissionsAgent {
 
         let route = apply_contextual_route(route_message(&input.message), &input.message, &memory);
         let route_intent = to_chat_intent(&route.intent);
+        let score_query_year =
+            resolve_admission_score_year_for_turn(&input.message, &history, &route.intent);
         let compressed =
             compress_context(&history, &input.message, &memory, &self.compression_config);
         let mut trace = vec![domain::AgentTraceStep {
@@ -312,7 +314,7 @@ impl AdmissionsAgent {
         let (reply, structured_result, citations, tool_call_count) = if let Some(plan) =
             combined_plan
         {
-            self.handle_combined_request(&input.message, &memory, plan)
+            self.handle_combined_request(&input.message, &memory, plan, score_query_year)
                 .await?
         } else {
             match route.intent {
@@ -391,7 +393,9 @@ impl AdmissionsAgent {
                             0,
                         )
                     } else {
-                        let structured = self.query_scores_from_memory(&memory).await?;
+                        let structured = self
+                            .query_scores_from_memory(&memory, score_query_year)
+                            .await?;
                         let citations = citations_from_structured_result(&structured);
                         let reply = render_score_answer(&structured);
                         (reply, structured, citations, 1)
@@ -403,7 +407,9 @@ impl AdmissionsAgent {
                     let missing = if missing.len() == 1
                         && missing.first().is_some_and(|field| field == "subjectType")
                     {
-                        let score_records = self.query_scores_from_memory(&memory).await?;
+                        let score_records = self
+                            .query_scores_from_memory(&memory, score_query_year)
+                            .await?;
                         if score_query_uses_only_unspecified_subject(&score_records) {
                             preloaded_score_records = Some(score_records);
                             Vec::new()
@@ -428,7 +434,10 @@ impl AdmissionsAgent {
                     } else {
                         let score_records = match preloaded_score_records {
                             Some(score_records) => score_records,
-                            None => self.query_scores_from_memory(&memory).await?,
+                            None => {
+                                self.query_scores_from_memory(&memory, score_query_year)
+                                    .await?
+                            }
                         };
                         let structured = build_probability_from_memory(&memory, &score_records);
                         let reply = render_probability_answer(&structured);
@@ -553,6 +562,7 @@ impl AdmissionsAgent {
     async fn query_scores_from_memory(
         &self,
         memory: &ResolvedMemory,
+        year: Option<i32>,
     ) -> Result<ChatStructuredResult> {
         let major_slug = memory
             .major_slug
@@ -572,7 +582,7 @@ impl AdmissionsAgent {
                 &major_slug,
                 &major_name,
                 memory.subject_type.as_deref(),
-                None,
+                year,
             )
             .await
     }
@@ -582,6 +592,7 @@ impl AdmissionsAgent {
         message: &str,
         memory: &ResolvedMemory,
         plan: CombinedRequestPlan,
+        score_query_year: Option<i32>,
     ) -> Result<(String, ChatStructuredResult, Vec<ChatCitation>, usize)> {
         let mut results = Vec::new();
         let mut citations = Vec::new();
@@ -621,14 +632,14 @@ impl AdmissionsAgent {
                         &first.slug,
                         &first.name,
                         subject_type.as_deref(),
-                        None,
+                        score_query_year,
                     ),
                     self.retrieval.query_scores(
                         &province,
                         &second.slug,
                         &second.name,
                         subject_type.as_deref(),
-                        None,
+                        score_query_year,
                     )
                 )?;
                 citations.extend(citations_from_structured_result(&first_result));
@@ -664,7 +675,9 @@ impl AdmissionsAgent {
                 ));
             }
 
-            let score_result = self.query_scores_from_memory(memory).await?;
+            let score_result = self
+                .query_scores_from_memory(memory, score_query_year)
+                .await?;
             score_had_records = score_result_has_records(&score_result);
             citations.extend(citations_from_structured_result(&score_result));
             tool_count += 1;
@@ -1239,11 +1252,29 @@ fn asks_score_line(message: &str) -> bool {
         "录取线",
         "分数线",
         "最低分",
+        "最低位次",
+        "投档线",
+        "投档分",
         "录取分",
+        "录取情况",
+        "录取数据",
+        "录取统计",
         "历年分",
         "近三年",
+        "近五年",
         "2021到2025",
+        "2021年到2025年",
+        "2021-2025",
+        "2021年-2025年",
+        "2021—2025",
+        "2021年—2025年",
+        "2021至2025",
+        "2021年至2025年",
         "21到25",
+        "21-25",
+        "多少分",
+        "几分",
+        "多少位次",
     ]
     .iter()
     .any(|item| message.contains(item))
@@ -1263,6 +1294,8 @@ fn asks_explicit_score_result_with_probability(message: &str) -> bool {
                 "列出",
                 "是多少",
                 "分别是多少",
+                "多少分",
+                "几分",
             ],
         )
 }
@@ -2904,8 +2937,18 @@ fn should_extract_major_phrase(message: &str) -> bool {
         "录取线",
         "分数线",
         "近三年",
+        "近五年",
+        "多少分",
+        "几分",
         "能上",
+        "能进",
         "能报",
+        "可以上",
+        "可以进",
+        "可以报",
+        "录取情况",
+        "录取数据",
+        "录取统计",
         "培养方案",
         "培养目标",
         "毕业条件",
@@ -3129,6 +3172,68 @@ fn extract_year_from_message(message: &str) -> Option<i32> {
         }
     }
     None
+}
+
+fn resolve_admission_score_year_for_turn(
+    message: &str,
+    history: &[ConversationMessage],
+    route_intent: &RetrievalIntent,
+) -> Option<i32> {
+    if let Some(year) = extract_supported_admission_year(message) {
+        return Some(year);
+    }
+    if !matches!(
+        route_intent,
+        RetrievalIntent::ScoreQuery | RetrievalIntent::ProbabilityAssessment
+    ) {
+        return None;
+    }
+    if !(is_short_follow_up(message)
+        || extract_known_province(message).is_some()
+        || extract_subject_type(message).is_some())
+    {
+        return None;
+    }
+    latest_supported_admission_year_from_history(history)
+}
+
+fn latest_supported_admission_year_from_history(history: &[ConversationMessage]) -> Option<i32> {
+    history
+        .iter()
+        .rev()
+        .filter(|message| message.role == "user")
+        .find_map(|message| extract_supported_admission_year(&message.content))
+}
+
+fn extract_supported_admission_year(message: &str) -> Option<i32> {
+    if contains_supported_admission_year_range(message) {
+        return None;
+    }
+    for year in 2021..=2025 {
+        if message.contains(&year.to_string()) {
+            return Some(year);
+        }
+    }
+    None
+}
+
+fn contains_supported_admission_year_range(message: &str) -> bool {
+    [
+        "2021到2025",
+        "2021年到2025年",
+        "2021-2025",
+        "2021年-2025年",
+        "2021—2025",
+        "2021年—2025年",
+        "2021至2025",
+        "2021年至2025年",
+        "21到25",
+        "21-25",
+        "近五年",
+        "五年",
+    ]
+    .iter()
+    .any(|item| message.contains(item))
 }
 
 fn extract_major_phrase(message: &str) -> Option<String> {
@@ -4000,6 +4105,50 @@ mod tests {
         .expect("combined score and probability plan");
         assert!(explicit.include_probability);
         assert!(explicit.include_score);
+    }
+
+    #[test]
+    fn admission_score_year_inherits_only_single_supported_years_for_followups() {
+        assert_eq!(
+            extract_supported_admission_year("2025年多少分能进计算机科学与技术专业？"),
+            Some(2025)
+        );
+        assert_eq!(
+            extract_supported_admission_year("2021到2025年汉语言文学录取线是多少？"),
+            None
+        );
+        assert_eq!(
+            extract_supported_admission_year("2021年到2025年汉语言文学录取线是多少？"),
+            None
+        );
+
+        let history = vec![ConversationMessage {
+            role: "user".to_owned(),
+            content: "2025年多少分能进哈师大计算机科学与技术专业？".to_owned(),
+            structured_payload: None,
+            citations: Vec::new(),
+            created_at: None,
+        }];
+        assert_eq!(
+            resolve_admission_score_year_for_turn("河北", &history, &RetrievalIntent::ScoreQuery),
+            Some(2025)
+        );
+
+        let range_history = vec![ConversationMessage {
+            role: "user".to_owned(),
+            content: "黑龙江物理类计算机科学与技术2021到2025录取线是多少？".to_owned(),
+            structured_payload: None,
+            citations: Vec::new(),
+            created_at: None,
+        }];
+        assert_eq!(
+            resolve_admission_score_year_for_turn(
+                "河北",
+                &range_history,
+                &RetrievalIntent::ScoreQuery
+            ),
+            None
+        );
     }
 
     #[test]

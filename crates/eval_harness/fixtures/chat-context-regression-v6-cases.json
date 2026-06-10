@@ -238,5 +238,20 @@
         }
       }
     ]
+  },
+  {
+    "name": "g7-natural-threshold-score-routing-with-2021-2025-years",
+    "requiresLiveProvider": true,
+    "turns": [
+      {
+        "message": "我是想问一下，2025年多少分能进哈师大计算机科学与技术专业？",
+        "expect": {
+          "type": "follow_up",
+          "missingFields": ["province"],
+          "replyIncludes": ["计算机科学与技术", "省份"],
+          "replyExcludes": ["尚未发布", "高考尚未结束", "未公布", "没有发布"]
+        }
+      }
+    ]
   }
 ]

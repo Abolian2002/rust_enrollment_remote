@@ -67,6 +67,20 @@ source ~/.nvm/nvm.sh
 npm run preview -- --host 127.0.0.1 --port 5173
 ```
 
+Current runtime files on the project server:
+
+```text
+/home/t2_enroll_ai/rust_enrollment/.run/admin-web.env
+/home/t2_enroll_ai/rust_enrollment/.run/admin-web.pid
+/home/t2_enroll_ai/rust_enrollment/.run/admin-web.log
+```
+
+As of 2026-06-10, the preview process is running on:
+
+```text
+127.0.0.1:5173
+```
+
 Recommended `.run/admin-web.env`:
 
 ```text
@@ -104,6 +118,16 @@ On the jump-to-Hong-Kong reverse tunnel, add:
 ```
 
 Do not modify other Kubernetes or model services.
+
+Hong Kong `/root/.ssh/authorized_keys` has already been prepared for this extra reverse port. The two existing tunnel keys now allow:
+
+```text
+permitlisten="127.0.0.1:13000"
+permitlisten="127.0.0.1:14000"
+permitlisten="127.0.0.1:15173"
+```
+
+The jump host currently requires Tailscale SSH browser confirmation. If Codex cannot access it non-interactively, manually authenticate or edit the two systemd units on the jump host from an authorized shell.
 
 ## Hong Kong Nginx
 

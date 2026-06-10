@@ -3,7 +3,7 @@
 This project has two public-facing web surfaces:
 
 - `cpa.abolian.online`: student/parent chat frontend.
-- `admin.cpa.abolian.online`: admissions admin dashboard.
+- `admin.abolian.online`: admissions admin dashboard.
 
 The admin dashboard must not be exposed as a normal public page. Put Cloudflare Access in front of it before publishing the hostname.
 
@@ -11,12 +11,11 @@ The admin dashboard must not be exposed as a normal public page. Put Cloudflare 
 
 ```text
 Browser
-  -> Cloudflare Access policy for admin.cpa.abolian.online
+  -> Cloudflare Access policy for admin.abolian.online
   -> Cloudflare Tunnel on Hong Kong server
   -> Hong Kong Nginx 127.0.0.1:8317
-  -> SSH reverse tunnels
-  -> project server admin preview 127.0.0.1:5173
-  -> project server Rust API 127.0.0.1:4000
+  -> static admin files in /var/www/hnu-enrollment-admin
+  -> project server Rust API through existing Hong Kong 127.0.0.1:14000 tunnel
 ```
 
 Nginx should keep the admin API token server-side:
@@ -36,7 +35,7 @@ In Cloudflare Zero Trust:
 1. Go to `Access controls` -> `Applications`.
 2. Create a `Self-hosted` application.
 3. Add public hostname:
-   - Subdomain: `admin.cpa`
+   - Subdomain: `admin`
    - Domain: `abolian.online`
    - Path: leave empty, or `/` if required by the UI.
 4. Add an allow policy for the real administrator emails only.
@@ -46,12 +45,30 @@ In Cloudflare Zero Trust:
 In Cloudflare Tunnel public hostnames, add:
 
 ```text
-admin.cpa.abolian.online -> http://127.0.0.1:8317
+admin.abolian.online -> http://127.0.0.1:8317
 ```
 
 This reuses the existing Hong Kong `cloudflared` process and lets Nginx route by hostname.
 
-## Project Server Admin Frontend
+As of 2026-06-10, the existing `cpa` tunnel configuration has already been updated through the Cloudflare API:
+
+```text
+cpa.abolian.online       -> http://127.0.0.1:8317
+admin.abolian.online -> http://127.0.0.1:8317
+catch-all                -> http_status:404
+```
+
+As of 2026-06-10, DNS and Access have also been configured through a temporary Cloudflare API token:
+
+```text
+admin.abolian.online CNAME cc120d3e-7559-40dc-9fb2-a7934bb13575.cfargotunnel.com proxied=true
+Access application: HNU Enrollment Admin
+Access policy: allow cunmingsong2002@gmail.com via One-time PIN
+```
+
+Revoke the temporary Cloudflare API token after verification.
+
+## Admin Static Frontend
 
 The admin app is built at:
 
@@ -59,33 +76,26 @@ The admin app is built at:
 /home/t2_enroll_ai/rust_enrollment/apps/admin/dist
 ```
 
-Run it with Vite preview on localhost only:
+Deploy the built files to the Hong Kong Nginx static root:
 
 ```bash
 cd /home/t2_enroll_ai/rust_enrollment/apps/admin
-source ~/.nvm/nvm.sh
-npm run preview -- --host 127.0.0.1 --port 5173
+tar -czf /tmp/hnu-admin-dist.tgz -C dist .
+scp /tmp/hnu-admin-dist.tgz root@47.86.43.227:/tmp/hnu-admin-dist.tgz
+ssh root@47.86.43.227 '
+  rm -rf /var/www/hnu-enrollment-admin.new
+  mkdir -p /var/www/hnu-enrollment-admin.new
+  tar -xzf /tmp/hnu-admin-dist.tgz -C /var/www/hnu-enrollment-admin.new
+  rm -rf /var/www/hnu-enrollment-admin.prev
+  [ -d /var/www/hnu-enrollment-admin ] && mv /var/www/hnu-enrollment-admin /var/www/hnu-enrollment-admin.prev
+  mv /var/www/hnu-enrollment-admin.new /var/www/hnu-enrollment-admin
+'
 ```
 
-Current runtime files on the project server:
+As of 2026-06-10, this has been deployed and verified on the Hong Kong server:
 
 ```text
-/home/t2_enroll_ai/rust_enrollment/.run/admin-web.env
-/home/t2_enroll_ai/rust_enrollment/.run/admin-web.pid
-/home/t2_enroll_ai/rust_enrollment/.run/admin-web.log
-```
-
-As of 2026-06-10, the preview process is running on:
-
-```text
-127.0.0.1:5173
-```
-
-Recommended `.run/admin-web.env`:
-
-```text
-PATH=/home/t2_enroll_ai/.nvm/versions/node/v22.22.3/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-VITE_ADMIN_API_BASE_URL=
+/var/www/hnu-enrollment-admin
 ```
 
 `VITE_ADMIN_API_BASE_URL` should stay empty in production so the browser calls same-origin `/api/v1/admin/*`.
@@ -99,27 +109,9 @@ project 3000 -> jump 23000 -> Hong Kong 13000 -> student frontend
 project 4000 -> jump 24000 -> Hong Kong 14000 -> Rust API
 ```
 
-Add admin frontend:
+No new SSH tunnel is required for the admin frontend because the admin app is served as static files on the Hong Kong Nginx server. The admin API reuses the existing `14000 -> 24000 -> 4000` API tunnel.
 
-```text
-project 5173 -> jump 25173 -> Hong Kong 15173 -> admin frontend
-```
-
-On the project-to-jump local tunnel, add:
-
-```text
--L 127.0.0.1:25173:127.0.0.1:5173
-```
-
-On the jump-to-Hong-Kong reverse tunnel, add:
-
-```text
--R 127.0.0.1:15173:127.0.0.1:25173
-```
-
-Do not modify other Kubernetes or model services.
-
-Hong Kong `/root/.ssh/authorized_keys` has already been prepared for this extra reverse port. The two existing tunnel keys now allow:
+Note: Hong Kong `/root/.ssh/authorized_keys` was prepared for a possible `15173` reverse port during an earlier approach:
 
 ```text
 permitlisten="127.0.0.1:13000"
@@ -127,7 +119,7 @@ permitlisten="127.0.0.1:14000"
 permitlisten="127.0.0.1:15173"
 ```
 
-The jump host currently requires Tailscale SSH browser confirmation. If Codex cannot access it non-interactively, manually authenticate or edit the two systemd units on the jump host from an authorized shell.
+This extra permission is currently unused. It can be removed later if the static-hosting approach remains final.
 
 ## Hong Kong Nginx
 
@@ -136,7 +128,7 @@ Add a second server block:
 ```nginx
 server {
     listen 127.0.0.1:8317;
-    server_name admin.cpa.abolian.online;
+    server_name admin.abolian.online;
 
     client_max_body_size 20m;
     proxy_connect_timeout 10s;
@@ -155,10 +147,8 @@ server {
     }
 
     location / {
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection "upgrade";
-        proxy_pass http://127.0.0.1:15173;
+        root /var/www/hnu-enrollment-admin;
+        try_files $uri $uri/ /index.html;
     }
 }
 ```
@@ -170,16 +160,18 @@ Keep `/api/v1/admin/*` separate from the student `/api/` routes. The student dom
 Before enabling Access publicly:
 
 ```bash
-curl -fsS http://127.0.0.1:5173/ >/dev/null
-curl -fsS -H "Authorization: Bearer $ADMIN_API_TOKEN" \
-  http://127.0.0.1:4000/api/v1/admin/dashboard/summary >/dev/null
+ssh root@47.86.43.227 \
+  'curl -fsS -H "Host: admin.abolian.online" http://127.0.0.1:8317/ >/dev/null'
+
+ssh root@47.86.43.227 \
+  'curl -fsS -H "Host: admin.abolian.online" http://127.0.0.1:8317/api/v1/admin/dashboard/summary >/dev/null'
 ```
 
 After Cloudflare Access is configured:
 
 ```bash
-curl -I --max-time 20 https://admin.cpa.abolian.online/
-curl -I --max-time 20 https://admin.cpa.abolian.online/api/v1/admin/dashboard/summary
+curl -I --max-time 20 https://admin.abolian.online/
+curl -I --max-time 20 https://admin.abolian.online/api/v1/admin/dashboard/summary
 ```
 
 Expected unauthenticated result is a Cloudflare Access login or redirect, not raw admin JSON.
@@ -194,7 +186,7 @@ After logging in from a browser:
 
 The current production-safe minimum is:
 
-- Cloudflare Access protects `admin.cpa.abolian.online`.
+- Cloudflare Access protects `admin.abolian.online`.
 - Nginx injects `ADMIN_API_TOKEN` server-side.
 - Browser bundle contains no admin API token.
 

@@ -69,7 +69,7 @@ a { color: inherit; text-decoration: none; }
   font-size: 14px;
   margin-bottom: 18px;
 }
-.login-card input, .field input, .field textarea {
+.login-card input, .field input, .field textarea, .field select {
   width: 100%;
   border: 1px solid #d8dee8;
   border-radius: 8px;
@@ -331,6 +331,12 @@ a { color: inherit; text-decoration: none; }
 .card h2 {
   margin: 0;
   font-size: 18px;
+  font-weight: 800;
+}
+.subsection-title {
+  margin: 0 0 10px;
+  color: #344054;
+  font-size: 15px;
   font-weight: 800;
 }
 .soft-pill {
@@ -648,6 +654,22 @@ td {
 .dialog-thread {
   display: grid;
   gap: 12px;
+}
+.feedback-panel {
+  margin-top: 18px;
+  border-top: 1px solid #e7ecf3;
+  padding-top: 18px;
+}
+.feedback-panel h3 {
+  margin: 0 0 14px;
+  color: #101828;
+  font-size: 16px;
+}
+.feedback-grid {
+  display: grid;
+  grid-template-columns: 220px minmax(0, 1fr);
+  gap: 16px;
+  align-items: start;
 }
 .dialog-bubble {
   max-width: 86%;

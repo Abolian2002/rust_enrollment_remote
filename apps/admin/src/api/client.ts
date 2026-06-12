@@ -38,3 +38,35 @@ export async function apiGet<T>(path: string, params?: Record<string, string | n
   }
   return envelope.data;
 }
+
+async function apiWrite<T>(method: 'POST' | 'PATCH', path: string, body: unknown): Promise<T> {
+  const base = import.meta.env.VITE_ADMIN_API_BASE_URL?.trim() || defaultApiBase();
+  const url = new URL(path, base.endsWith('/') ? base : `${base}/`);
+  const headers: Record<string, string> = {
+    Accept: 'application/json',
+    'Content-Type': 'application/json',
+  };
+  const token = import.meta.env.VITE_ADMIN_API_TOKEN?.trim();
+  if (token) {
+    headers.Authorization = `Bearer ${token}`;
+  }
+
+  const response = await fetch(url, {
+    method,
+    headers,
+    body: JSON.stringify(body),
+  });
+  const envelope = (await response.json()) as ApiEnvelope<T>;
+  if (!response.ok || !envelope.success || envelope.data === undefined) {
+    throw new Error(envelope.error?.message || `请求失败：${response.status}`);
+  }
+  return envelope.data;
+}
+
+export function apiPost<T>(path: string, body: unknown): Promise<T> {
+  return apiWrite<T>('POST', path, body);
+}
+
+export function apiPatch<T>(path: string, body: unknown): Promise<T> {
+  return apiWrite<T>('PATCH', path, body);
+}

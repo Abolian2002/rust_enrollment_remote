@@ -11,13 +11,13 @@ use axum::{
         IntoResponse, Response,
         sse::{Event, Sse},
     },
-    routing::{get, post},
+    routing::{get, patch, post, put},
 };
 use db::Database;
-use domain::{ChatRequest, fail, ok, ok_with_meta};
+use domain::{ChatReply, ChatRequest, fail, ok, ok_with_meta};
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::{
     convert::Infallible,
@@ -170,6 +170,44 @@ struct VoiceChatErrorPayload {
     message: &'static str,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AdminFeedbackRequest {
+    conversation_id: Option<String>,
+    message_id: Option<String>,
+    feedback_type: String,
+    comment: Option<String>,
+    handled_by: Option<String>,
+    status: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AdminTicketUpdateRequest {
+    status: Option<String>,
+    resolution: Option<String>,
+    handled_by: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AdminSettingsUpdateRequest {
+    welcome_message: String,
+    fallback_message: String,
+    updated_by: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AdminFaqWriteRequest {
+    question: Option<String>,
+    answer: Option<String>,
+    category: Option<String>,
+    tags: Option<Vec<String>>,
+    status: Option<String>,
+    source_label: Option<String>,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     load_env();
@@ -237,16 +275,39 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/v1/knowledge/faq", get(knowledge_faq))
         .route("/api/v1/knowledge/policies", get(knowledge_policies))
         .route("/api/v1/admin/dashboard/summary", get(admin_dashboard))
+        .route("/api/v1/admin/analytics/insights", get(admin_insights))
+        .route("/api/v1/admin/analytics/special", get(admin_special))
+        .route(
+            "/api/v1/admin/analytics/admissions",
+            get(admin_admissions_analytics),
+        )
+        .route(
+            "/api/v1/admin/analytics/knowledge",
+            get(admin_knowledge_coverage),
+        )
+        .route("/api/v1/admin/analytics/big-screen", get(admin_big_screen))
         .route("/api/v1/admin/conversations", get(admin_conversations))
         .route(
             "/api/v1/admin/conversations/{conversation_id}",
             get(admin_conversation_detail),
         )
         .route("/api/v1/admin/knowledge/faqs", get(admin_knowledge_faqs))
+        .route("/api/v1/admin/knowledge/faqs", post(admin_create_faq))
+        .route("/api/v1/admin/knowledge/faqs/{faq_id}", patch(admin_update_faq))
         .route(
             "/api/v1/admin/knowledge/chunks",
             get(admin_knowledge_chunks),
         )
+        .route("/api/v1/admin/faq", get(admin_knowledge_faqs))
+        .route("/api/v1/admin/faq", post(admin_create_faq))
+        .route("/api/v1/admin/faq/{faq_id}", put(admin_update_faq))
+        .route("/api/v1/admin/faq/{faq_id}", patch(admin_update_faq))
+        .route("/api/v1/admin/feedback", post(admin_create_feedback))
+        .route("/api/v1/admin/tickets", get(admin_tickets))
+        .route("/api/v1/admin/tickets/{ticket_id}", patch(admin_update_ticket))
+        .route("/api/v1/admin/settings", get(admin_settings))
+        .route("/api/v1/admin/settings", patch(admin_update_settings))
+        .route("/api/v1/admin/audit-logs", get(admin_audit_logs))
         .route("/api/v1/tts/token", post(tts_token))
         .route("/api/v1/tts/speech", post(tts_speech))
         .route("/api/v1/tts/stream", post(tts_stream))
@@ -272,6 +333,20 @@ async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     })))
 }
 
+fn public_chat_reply(mut reply: ChatReply) -> (ChatReply, Value) {
+    if client_diagnostics_enabled() {
+        let meta = reply
+            .diagnostics
+            .as_ref()
+            .map(|diagnostics| json!({ "diagnostics": diagnostics }))
+            .unwrap_or_else(|| json!({}));
+        (reply, meta)
+    } else {
+        reply.diagnostics = None;
+        (reply, json!({}))
+    }
+}
+
 async fn chat(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<ChatRequest>,
@@ -286,15 +361,7 @@ async fn chat(
 
     match tokio::time::timeout(agent_timeout_duration(), state.agent.chat(payload)).await {
         Ok(Ok(reply)) => {
-            let meta = if client_diagnostics_enabled() {
-                reply
-                    .diagnostics
-                    .as_ref()
-                    .map(|diagnostics| json!({ "diagnostics": diagnostics }))
-                    .unwrap_or_else(|| json!({}))
-            } else {
-                json!({})
-            };
+            let (reply, meta) = public_chat_reply(reply);
             (StatusCode::OK, Json(ok_with_meta(reply, meta))).into_response()
         }
         Ok(Err(error)) => {
@@ -404,15 +471,7 @@ async fn chat_stream(
                     return;
                 }
 
-                let meta = if client_diagnostics_enabled() {
-                    reply
-                        .diagnostics
-                        .as_ref()
-                        .map(|diagnostics| json!({ "diagnostics": diagnostics }))
-                        .unwrap_or_else(|| json!({}))
-                } else {
-                    json!({})
-                };
+                let (reply, meta) = public_chat_reply(reply);
                 let event = Event::default().event("message").data(
                     serde_json::to_string(&ok_with_meta(reply, meta))
                         .unwrap_or_else(|_| "{}".to_owned()),
@@ -680,15 +739,7 @@ async fn handle_voice_socket(mut socket: WebSocket, state: Arc<AppState>) {
                     record_spoken_tts_delta(&spoken_tts_text, &suffix);
                 }
             }
-            let meta = if client_diagnostics_enabled() {
-                reply
-                    .diagnostics
-                    .as_ref()
-                    .map(|diagnostics| json!({ "diagnostics": diagnostics }))
-                    .unwrap_or_else(|| json!({}))
-            } else {
-                json!({})
-            };
+            let (reply, meta) = public_chat_reply(reply);
             let _ = send_voice_json(
                 &out_tx,
                 json!({
@@ -1440,6 +1491,106 @@ async fn admin_dashboard(
     }
 }
 
+async fn admin_insights(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(response) = require_admin_token(&headers) {
+        return response;
+    }
+    match state.db.admin_insights_snapshot().await {
+        Ok(snapshot) => (StatusCode::OK, Json(ok(snapshot))).into_response(),
+        Err(error) => {
+            tracing::error!(error = %error, "failed to load admin insights");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(fail("ADMIN_INSIGHTS_ERROR", "无法读取热点分析数据。")),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn admin_special(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(response) = require_admin_token(&headers) {
+        return response;
+    }
+    match state.db.admin_special_snapshot().await {
+        Ok(snapshot) => (StatusCode::OK, Json(ok(snapshot))).into_response(),
+        Err(error) => {
+            tracing::error!(error = %error, "failed to load admin special analytics");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(fail("ADMIN_SPECIAL_ERROR", "无法读取专项招生看板数据。")),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn admin_admissions_analytics(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(response) = require_admin_token(&headers) {
+        return response;
+    }
+    match state.db.admin_admissions_analytics_snapshot().await {
+        Ok(snapshot) => (StatusCode::OK, Json(ok(snapshot))).into_response(),
+        Err(error) => {
+            tracing::error!(error = %error, "failed to load admin admissions analytics");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(fail("ADMIN_ADMISSIONS_ERROR", "无法读取录取统计数据。")),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn admin_knowledge_coverage(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(response) = require_admin_token(&headers) {
+        return response;
+    }
+    match state.db.admin_knowledge_coverage_snapshot().await {
+        Ok(snapshot) => (StatusCode::OK, Json(ok(snapshot))).into_response(),
+        Err(error) => {
+            tracing::error!(error = %error, "failed to load admin knowledge coverage");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(fail("ADMIN_KNOWLEDGE_COVERAGE_ERROR", "无法读取知识库覆盖数据。")),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn admin_big_screen(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(response) = require_admin_token(&headers) {
+        return response;
+    }
+    match state.db.admin_big_screen_snapshot().await {
+        Ok(snapshot) => (StatusCode::OK, Json(ok(snapshot))).into_response(),
+        Err(error) => {
+            tracing::error!(error = %error, "failed to load admin big screen");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(fail("ADMIN_BIG_SCREEN_ERROR", "无法读取全国咨询态势数据。")),
+            )
+                .into_response()
+        }
+    }
+}
+
 async fn admin_conversations(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -1527,6 +1678,126 @@ async fn admin_knowledge_faqs(
     }
 }
 
+async fn admin_create_faq(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(payload): Json<AdminFaqWriteRequest>,
+) -> impl IntoResponse {
+    if let Err(response) = require_admin_token(&headers) {
+        return response;
+    }
+    let Some(question) = payload.question.as_deref().map(str::trim).filter(|value| !value.is_empty()) else {
+        return (StatusCode::BAD_REQUEST, Json(fail("BAD_REQUEST", "FAQ 问题不能为空。"))).into_response();
+    };
+    let Some(answer) = payload.answer.as_deref().map(str::trim).filter(|value| !value.is_empty()) else {
+        return (StatusCode::BAD_REQUEST, Json(fail("BAD_REQUEST", "FAQ 答案不能为空。"))).into_response();
+    };
+    if question.chars().count() > 300 || answer.chars().count() > 3000 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(fail("BAD_REQUEST", "FAQ 问题或答案过长。")),
+        )
+            .into_response();
+    }
+    let category = payload
+        .category
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("招生咨询");
+    let source_label = payload
+        .source_label
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("管理后台录入");
+    match state
+        .db
+        .admin_create_faq(
+            question,
+            answer,
+            category,
+            payload.tags.unwrap_or_default(),
+            payload.status.as_deref().unwrap_or("draft"),
+            source_label,
+        )
+        .await
+    {
+        Ok(item) => (StatusCode::OK, Json(ok(item))).into_response(),
+        Err(error) => {
+            tracing::error!(error = %error, "failed to create admin faq");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(fail("ADMIN_FAQ_CREATE_ERROR", "无法创建 FAQ。")),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn admin_update_faq(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(faq_id): Path<String>,
+    Json(payload): Json<AdminFaqWriteRequest>,
+) -> impl IntoResponse {
+    if let Err(response) = require_admin_token(&headers) {
+        return response;
+    }
+    if faq_id.trim().is_empty() || faq_id.len() > 160 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(fail("BAD_REQUEST", "Invalid FAQ id")),
+        )
+            .into_response();
+    }
+    if payload
+        .question
+        .as_deref()
+        .map(|value| value.chars().count() > 300)
+        .unwrap_or(false)
+        || payload
+            .answer
+            .as_deref()
+            .map(|value| value.chars().count() > 3000)
+            .unwrap_or(false)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(fail("BAD_REQUEST", "FAQ 问题或答案过长。")),
+        )
+            .into_response();
+    }
+    match state
+        .db
+        .admin_update_faq(
+            &faq_id,
+            payload.question.as_deref(),
+            payload.answer.as_deref(),
+            payload.category.as_deref(),
+            payload.tags,
+            payload.status.as_deref(),
+            payload.source_label.as_deref(),
+        )
+        .await
+    {
+        Ok(Some(item)) => (StatusCode::OK, Json(ok(item))).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(fail("NOT_FOUND", "FAQ not found")),
+        )
+            .into_response(),
+        Err(error) => {
+            tracing::error!(error = %error, "failed to update admin faq");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(fail("ADMIN_FAQ_UPDATE_ERROR", "无法更新 FAQ。")),
+            )
+                .into_response()
+        }
+    }
+}
+
 async fn admin_knowledge_chunks(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -1548,6 +1819,196 @@ async fn admin_knowledge_chunks(
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(fail("ADMIN_CHUNKS_ERROR", "无法读取后台知识片段。")),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn admin_create_feedback(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(payload): Json<AdminFeedbackRequest>,
+) -> impl IntoResponse {
+    if let Err(response) = require_admin_token(&headers) {
+        return response;
+    }
+    let comment = payload.comment.as_deref().map(str::trim).filter(|value| !value.is_empty());
+    if comment.map(|value| value.chars().count()).unwrap_or(0) > 2000 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(fail("BAD_REQUEST", "反馈备注过长，请控制在 2000 字以内。")),
+        )
+            .into_response();
+    }
+    match state
+        .db
+        .admin_create_feedback(
+            payload.conversation_id.as_deref(),
+            payload.message_id.as_deref(),
+            &payload.feedback_type,
+            comment,
+            payload.handled_by.as_deref(),
+            payload.status.as_deref().unwrap_or("open"),
+        )
+        .await
+    {
+        Ok(item) => (StatusCode::OK, Json(ok(item))).into_response(),
+        Err(error) => {
+            tracing::error!(error = %error, "failed to create admin feedback");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(fail("ADMIN_FEEDBACK_ERROR", "无法写入人工反馈。")),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn admin_tickets(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    if let Err(response) = require_admin_token(&headers) {
+        return response;
+    }
+    let query = params.get("q").cloned().unwrap_or_default();
+    let status = params.get("status").map(String::as_str);
+    let (page, page_size) = pagination_from_params(&params);
+    match state
+        .db
+        .admin_list_tickets(&query, status, page, page_size)
+        .await
+    {
+        Ok(list) => (StatusCode::OK, Json(ok(list))).into_response(),
+        Err(error) => {
+            tracing::error!(error = %error, "failed to list admin tickets");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(fail("ADMIN_TICKETS_ERROR", "无法读取留言工单。")),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn admin_update_ticket(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(ticket_id): Path<String>,
+    Json(payload): Json<AdminTicketUpdateRequest>,
+) -> impl IntoResponse {
+    if let Err(response) = require_admin_token(&headers) {
+        return response;
+    }
+    if ticket_id.trim().is_empty() || ticket_id.len() > 128 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(fail("BAD_REQUEST", "Invalid ticket id")),
+        )
+            .into_response();
+    }
+    match state
+        .db
+        .admin_update_ticket(
+            &ticket_id,
+            payload.status.as_deref(),
+            payload.resolution.as_deref(),
+            payload.handled_by.as_deref(),
+        )
+        .await
+    {
+        Ok(Some(item)) => (StatusCode::OK, Json(ok(item))).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(fail("NOT_FOUND", "Ticket not found")),
+        )
+            .into_response(),
+        Err(error) => {
+            tracing::error!(error = %error, "failed to update admin ticket");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(fail("ADMIN_TICKET_UPDATE_ERROR", "无法更新留言工单。")),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn admin_settings(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl IntoResponse {
+    if let Err(response) = require_admin_token(&headers) {
+        return response;
+    }
+    match state.db.admin_get_settings().await {
+        Ok(settings) => (StatusCode::OK, Json(ok(settings))).into_response(),
+        Err(error) => {
+            tracing::error!(error = %error, "failed to load admin settings");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(fail("ADMIN_SETTINGS_ERROR", "无法读取系统配置。")),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn admin_update_settings(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(payload): Json<AdminSettingsUpdateRequest>,
+) -> impl IntoResponse {
+    if let Err(response) = require_admin_token(&headers) {
+        return response;
+    }
+    if payload.welcome_message.trim().is_empty()
+        || payload.fallback_message.trim().is_empty()
+        || payload.welcome_message.chars().count() > 1000
+        || payload.fallback_message.chars().count() > 1000
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(fail("BAD_REQUEST", "配置内容不能为空，且单项不超过 1000 字。")),
+        )
+            .into_response();
+    }
+    match state
+        .db
+        .admin_update_settings(
+            &payload.welcome_message,
+            &payload.fallback_message,
+            payload.updated_by.as_deref(),
+        )
+        .await
+    {
+        Ok(settings) => (StatusCode::OK, Json(ok(settings))).into_response(),
+        Err(error) => {
+            tracing::error!(error = %error, "failed to update admin settings");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(fail("ADMIN_SETTINGS_UPDATE_ERROR", "无法保存系统配置。")),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn admin_audit_logs(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    if let Err(response) = require_admin_token(&headers) {
+        return response;
+    }
+    let (page, page_size) = pagination_from_params(&params);
+    match state.db.admin_list_audit_logs(page, page_size).await {
+        Ok(list) => (StatusCode::OK, Json(ok(list))).into_response(),
+        Err(error) => {
+            tracing::error!(error = %error, "failed to list admin audit logs");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(fail("ADMIN_AUDIT_LOG_ERROR", "无法读取操作日志。")),
             )
                 .into_response()
         }

@@ -232,7 +232,9 @@ impl RetrievalService {
         forced_major_focus: Option<&str>,
     ) -> Result<KnowledgeRetrievalResult> {
         let filters = infer_knowledge_filters(query);
-        let major_focus = if filters.document_kind.as_deref() == Some("training_plan") {
+        let major_focus = if filters.document_kind.as_deref() == Some("training_plan")
+            && !asks_program_comparison_knowledge(query)
+        {
             if let Some(major_focus) = forced_major_focus
                 .and_then(sanitize_major_focus_for_retrieval)
                 .filter(|value| !value.trim().is_empty())
@@ -253,6 +255,17 @@ impl RetrievalService {
         let (mut faq, mut policies, mut chunks) = self
             .retrieve_knowledge_once(query, &filters, major_focus.as_deref())
             .await?;
+        if faq.is_empty() {
+            for fallback_query in fallback_knowledge_queries(query) {
+                let (fallback_faq, _, _) = self
+                    .retrieve_knowledge_once(&fallback_query, &filters, major_focus.as_deref())
+                    .await?;
+                merge_faq(&mut faq, fallback_faq);
+                if !faq.is_empty() {
+                    break;
+                }
+            }
+        }
         if faq.is_empty() && policies.is_empty() && chunks.is_empty() {
             for fallback_query in fallback_knowledge_queries(query) {
                 let (fallback_faq, fallback_policies, fallback_chunks) = self
@@ -466,6 +479,21 @@ fn fallback_knowledge_queries(query: &str) -> Vec<String> {
         "住宿",
         "食堂",
         "校区",
+        "校训",
+        "校风",
+        "校规",
+        "学校章程",
+        "办学定位",
+        "办学特色",
+        "学校特色",
+        "学院特色",
+        "特色学院",
+        "中外合作",
+        "联合培养",
+        "普通话",
+        "学术不端",
+        "校园网",
+        "创意市集",
     ] {
         if query.contains(term) && !queries.iter().any(|item| item == term) {
             queries.push(term.to_owned());
@@ -681,7 +709,7 @@ fn query_looks_like_training_plan(query: &str) -> bool {
             "毕业论文",
             "学分",
         ],
-    )
+    ) || asks_program_comparison_knowledge(query)
 }
 
 #[derive(Debug, Clone)]
@@ -825,7 +853,8 @@ pub fn infer_knowledge_filters(query: &str) -> KnowledgeSearchFilters {
             "有什么专业",
             "开设哪些专业",
         ],
-    ) || query.contains("学院") && query.contains("专业")
+    ) || asks_program_comparison_knowledge(query)
+        || query.contains("学院") && query.contains("专业")
         || query.contains("选考")
         || query.contains("选科")
     {
@@ -1122,6 +1151,7 @@ fn contains_supported_admission_year(message: &str) -> bool {
 fn is_knowledge_message(message: &str) -> bool {
     let asks_school_intro = contains_any(message, &["介绍", "讲讲", "说说"])
         && contains_any(message, &["学校", "院校", "哈师大", "哈尔滨师范大学"]);
+    let asks_school_fact = asks_school_specific_fact(message);
     let asks_major_fit = contains_any(message, &["适合", "匹配", "契合", "合适"])
         && contains_any(
             message,
@@ -1154,6 +1184,21 @@ fn is_knowledge_message(message: &str) -> bool {
             "学校官网",
             "官网",
             "网址",
+            "校训",
+            "校风",
+            "校规",
+            "章程",
+            "办学定位",
+            "办学特色",
+            "学校特色",
+            "学院特色",
+            "特色学院",
+            "中外合作",
+            "联合培养",
+            "学术不端",
+            "普通话",
+            "校园网",
+            "创意市集",
             "普通类",
             "艺术类",
             "综合分",
@@ -1213,7 +1258,95 @@ fn is_knowledge_message(message: &str) -> bool {
             "FAQ",
         ],
     ) || asks_school_intro
+        || asks_school_fact
         || asks_major_fit
+        || asks_program_comparison_knowledge(message)
+}
+
+fn asks_program_comparison_knowledge(message: &str) -> bool {
+    contains_any(
+        message,
+        &[
+            "区别",
+            "差别",
+            "差异",
+            "不同",
+            "相比",
+            "比较",
+            "对比",
+            "哪个更适合",
+            "哪个更好",
+            "怎么选",
+        ],
+    ) && contains_any(
+        message,
+        &[
+            "专业",
+            "学院",
+            "班",
+            "师范",
+            "非师范",
+            "行知",
+            "实验班",
+            "培养",
+            "课程",
+            "学位",
+            "实践",
+            "就业",
+            "升学",
+        ],
+    )
+}
+
+fn asks_school_specific_fact(message: &str) -> bool {
+    let mentions_school = contains_any(
+        message,
+        &[
+            "哈师大",
+            "哈尔滨师范大学",
+            "贵校",
+            "你校",
+            "学校",
+            "学院",
+            "专业",
+        ],
+    );
+    if !mentions_school {
+        return false;
+    }
+
+    contains_any(
+        message,
+        &[
+            "是什么",
+            "什么意思",
+            "含义",
+            "内涵",
+            "有没有",
+            "是否",
+            "真的吗",
+            "主要",
+            "属于",
+            "隶属",
+            "学制",
+            "几年",
+            "要求",
+            "规定",
+            "政策",
+            "处罚",
+            "如何",
+            "怎么",
+            "哪些",
+            "哪几个",
+            "多少",
+            "哪里",
+            "在哪",
+            "合作",
+            "培养",
+            "认证",
+            "资格",
+        ],
+    )
 }
 
 fn contains_any(text: &str, needles: &[&str]) -> bool {
@@ -1686,6 +1819,23 @@ mod tests {
     }
 
     #[test]
+    fn routes_school_specific_fact_questions_to_knowledge() {
+        for query in [
+            "哈尔滨师范大学的校训是什么？有什么含义？",
+            "学校校训是什么？",
+            "哈师大斯拉夫语学院是特色学院吗？主要学什么？",
+            "国际美术学院和苏里科夫美术学院有没有联合培养？",
+            "汉语言文学专业普通话要求是什么？",
+            "学术不端行为在学校会如何处理？",
+            "学校校园网能不能自动连接？",
+        ] {
+            let decision = route_message(query);
+            assert_eq!(decision.intent, RetrievalIntent::KnowledgeAnswer, "{query}");
+            assert!(decision.must_use_tools, "{query}");
+        }
+    }
+
+    #[test]
     fn routes_natural_probability_and_major_fit_questions() {
         let probability = route_message("河北500分报汉语言文学师范类有希望吗？");
         assert_eq!(probability.intent, RetrievalIntent::ProbabilityAssessment);
@@ -1694,6 +1844,22 @@ mod tests {
         let fit = route_message("生物科学专业适合喜欢实验、以后想当老师的学生吗？");
         assert_eq!(fit.intent, RetrievalIntent::KnowledgeAnswer);
         assert!(fit.must_use_tools);
+    }
+
+    #[test]
+    fn routes_program_comparison_questions_to_knowledge() {
+        for query in [
+            "地理科学（师范类）和行知实验班有什么区别？",
+            "计算机科学与技术师范和非师范怎么选？",
+            "音乐学师范类和普通音乐表演培养上有什么不同？",
+        ] {
+            let decision = route_message(query);
+            assert_eq!(decision.intent, RetrievalIntent::KnowledgeAnswer, "{query}");
+            assert!(decision.must_use_tools, "{query}");
+
+            let filters = infer_knowledge_filters(query);
+            assert_eq!(filters.document_kind.as_deref(), Some("training_plan"), "{query}");
+        }
     }
 
     #[test]

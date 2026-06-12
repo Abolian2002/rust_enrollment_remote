@@ -577,6 +577,8 @@ pub struct AdminTicketItem {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub phone: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
     pub province: String,
     pub content: String,
     pub status: String,

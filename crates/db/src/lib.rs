@@ -621,7 +621,9 @@ impl Database {
         })
     }
 
-    pub async fn admin_knowledge_coverage_snapshot(&self) -> Result<AdminKnowledgeCoverageSnapshot> {
+    pub async fn admin_knowledge_coverage_snapshot(
+        &self,
+    ) -> Result<AdminKnowledgeCoverageSnapshot> {
         let counts = sqlx::query(
             r#"
             SELECT
@@ -748,18 +750,24 @@ impl Database {
     pub async fn admin_big_screen_snapshot(&self) -> Result<AdminBigScreenSnapshot> {
         let updated_at = self.admin_updated_at().await?;
         let total_questions = self.admin_total_user_questions().await?.max(1);
-        let today_questions = self.admin_user_question_count("current_date", "now()").await?;
-        let today_users = self.admin_distinct_conversation_count("current_date", "now()").await?;
+        let today_questions = self
+            .admin_user_question_count("current_date", "now()")
+            .await?;
+        let today_users = self
+            .admin_distinct_conversation_count("current_date", "now()")
+            .await?;
         let week_questions = self
             .admin_user_question_count("current_date - interval '6 days'", "now()")
             .await?;
         let week_users = self
             .admin_distinct_conversation_count("current_date - interval '6 days'", "now()")
             .await?;
-        let faq_count = sqlx::query("SELECT COUNT(*)::bigint AS count FROM faq_knowledge WHERE status = 'PUBLISHED'")
-            .fetch_one(&self.pool)
-            .await?
-            .get::<i64, _>("count");
+        let faq_count = sqlx::query(
+            "SELECT COUNT(*)::bigint AS count FROM faq_knowledge WHERE status = 'PUBLISHED'",
+        )
+        .fetch_one(&self.pool)
+        .await?
+        .get::<i64, _>("count");
         let chunk_count = sqlx::query("SELECT COUNT(*)::bigint AS count FROM knowledge_chunks WHERE data_version = 'official-pdf-knowledge-v2'")
             .fetch_one(&self.pool)
             .await?
@@ -885,10 +893,12 @@ impl Database {
     }
 
     async fn admin_updated_at(&self) -> Result<String> {
-        Ok(sqlx::query("SELECT to_char(now(), 'YYYY-MM-DD HH24:MI') AS updated_at")
-            .fetch_one(&self.pool)
-            .await?
-            .get("updated_at"))
+        Ok(
+            sqlx::query("SELECT to_char(now(), 'YYYY-MM-DD HH24:MI') AS updated_at")
+                .fetch_one(&self.pool)
+                .await?
+                .get("updated_at"),
+        )
     }
 
     async fn admin_total_user_questions(&self) -> Result<i64> {
@@ -1033,20 +1043,18 @@ impl Database {
         let sql = format!(
             "SELECT COUNT(*)::bigint AS count FROM conversation_messages WHERE role = 'user' AND created_at >= {start_sql} AND created_at < {end_sql}"
         );
-        Ok(sqlx::query(&sql)
-            .fetch_one(&self.pool)
-            .await?
-            .get("count"))
+        Ok(sqlx::query(&sql).fetch_one(&self.pool).await?.get("count"))
     }
 
-    async fn admin_distinct_conversation_count(&self, start_sql: &str, end_sql: &str) -> Result<i64> {
+    async fn admin_distinct_conversation_count(
+        &self,
+        start_sql: &str,
+        end_sql: &str,
+    ) -> Result<i64> {
         let sql = format!(
             "SELECT COUNT(DISTINCT conversation_id)::bigint AS count FROM conversation_messages WHERE role = 'user' AND created_at >= {start_sql} AND created_at < {end_sql}"
         );
-        Ok(sqlx::query(&sql)
-            .fetch_one(&self.pool)
-            .await?
-            .get("count"))
+        Ok(sqlx::query(&sql).fetch_one(&self.pool).await?.get("count"))
     }
 
     async fn admin_recent_user_question_points(&self, days: i64) -> Result<Vec<i64>> {
@@ -1507,13 +1515,12 @@ impl Database {
             .unwrap_or("admin");
         let handled_by_db = match handled_by.map(str::trim).filter(|value| !value.is_empty()) {
             Some(candidate) => {
-                let exists = sqlx::query(
-                    "SELECT EXISTS(SELECT 1 FROM admin_users WHERE id = $1) AS exists",
-                )
-                .bind(candidate)
-                .fetch_one(&self.pool)
-                .await?
-                .get::<bool, _>("exists");
+                let exists =
+                    sqlx::query("SELECT EXISTS(SELECT 1 FROM admin_users WHERE id = $1) AS exists")
+                        .bind(candidate)
+                        .fetch_one(&self.pool)
+                        .await?
+                        .get::<bool, _>("exists");
                 exists.then_some(candidate)
             }
             None => None,
@@ -1591,7 +1598,7 @@ impl Database {
             r#"
             SELECT COUNT(*)::bigint AS total
             FROM admin_tickets
-            WHERE ($1 = '%%' OR id ILIKE $1 OR name ILIKE $1 OR phone ILIKE $1 OR province ILIKE $1 OR content ILIKE $1)
+            WHERE ($1 = '%%' OR id ILIKE $1 OR name ILIKE $1 OR phone ILIKE $1 OR email ILIKE $1 OR province ILIKE $1 OR content ILIKE $1)
               AND ($2::text IS NULL OR status = $2)
             "#,
         )
@@ -1607,6 +1614,7 @@ impl Database {
               id,
               name,
               phone,
+              email,
               province,
               content,
               status,
@@ -1616,7 +1624,7 @@ impl Database {
               handled_by,
               resolution
             FROM admin_tickets
-            WHERE ($1 = '%%' OR id ILIKE $1 OR name ILIKE $1 OR phone ILIKE $1 OR province ILIKE $1 OR content ILIKE $1)
+            WHERE ($1 = '%%' OR id ILIKE $1 OR name ILIKE $1 OR phone ILIKE $1 OR email ILIKE $1 OR province ILIKE $1 OR content ILIKE $1)
               AND ($2::text IS NULL OR status = $2)
             ORDER BY
               CASE priority WHEN '高' THEN 0 WHEN '中' THEN 1 ELSE 2 END,
@@ -1638,6 +1646,62 @@ impl Database {
             page,
             page_size,
         })
+    }
+
+    pub async fn create_public_ticket(
+        &self,
+        name: Option<&str>,
+        phone: &str,
+        email: Option<&str>,
+        province: &str,
+        content: &str,
+    ) -> Result<AdminTicketItem> {
+        self.ensure_admin_ops_schema().await?;
+        let id = format!("T-{}", Uuid::new_v4().simple());
+        let name = name
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("匿名用户");
+        let email = email.map(str::trim).filter(|value| !value.is_empty());
+
+        let row = sqlx::query(
+            r#"
+            INSERT INTO admin_tickets (
+              id,
+              name,
+              phone,
+              email,
+              province,
+              content,
+              status,
+              priority
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, '待处理', '中')
+            RETURNING
+              id,
+              name,
+              phone,
+              email,
+              province,
+              content,
+              status,
+              priority,
+              to_char(created_at, 'YYYY-MM-DD HH24:MI') AS created_at,
+              to_char(updated_at, 'YYYY-MM-DD HH24:MI') AS updated_at,
+              handled_by,
+              resolution
+            "#,
+        )
+        .bind(id)
+        .bind(name)
+        .bind(phone.trim())
+        .bind(email)
+        .bind(province.trim())
+        .bind(content.trim())
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(admin_ticket_from_row(row))
     }
 
     pub async fn admin_update_ticket(
@@ -1662,6 +1726,7 @@ impl Database {
               id,
               name,
               phone,
+              email,
               province,
               content,
               status,
@@ -1820,6 +1885,7 @@ impl Database {
               id text PRIMARY KEY,
               name text NOT NULL DEFAULT '匿名用户',
               phone text,
+              email text,
               province text NOT NULL DEFAULT '未知',
               content text NOT NULL,
               status text NOT NULL DEFAULT '待处理',
@@ -1833,6 +1899,9 @@ impl Database {
         )
         .execute(&self.pool)
         .await?;
+        sqlx::query("ALTER TABLE admin_tickets ADD COLUMN IF NOT EXISTS email text")
+            .execute(&self.pool)
+            .await?;
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS admin_settings (
@@ -2882,6 +2951,7 @@ fn admin_ticket_from_row(row: sqlx::postgres::PgRow) -> AdminTicketItem {
         id: row.get("id"),
         name: row.get("name"),
         phone: row.try_get("phone").ok(),
+        email: row.try_get("email").ok(),
         province: row.get("province"),
         content: row.get("content"),
         status: row.get("status"),

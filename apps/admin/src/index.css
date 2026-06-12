@@ -556,6 +556,19 @@ td {
   background: transparent;
   font-weight: 700;
 }
+.stacked-cell {
+  display: grid;
+  gap: 4px;
+  min-width: 128px;
+}
+.stacked-cell span {
+  color: #101828;
+  font-weight: 700;
+}
+.stacked-cell small {
+  color: #667085;
+  font-size: 12px;
+}
 .word-cloud {
   min-height: 150px;
   display: flex;

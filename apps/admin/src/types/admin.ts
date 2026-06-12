@@ -158,6 +158,7 @@ export type AdminTicketItem = {
   id: string;
   name: string;
   phone?: string;
+  email?: string;
   province: string;
   content: string;
   status: '待处理' | '处理中' | '已办结' | '已关闭';

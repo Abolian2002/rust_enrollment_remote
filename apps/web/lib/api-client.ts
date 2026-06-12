@@ -48,6 +48,26 @@ export type ChatResult = {
   citations: ChatCitation[];
 };
 
+export type PublicTicketInput = {
+  name?: string;
+  province: string;
+  phone: string;
+  email?: string;
+  content: string;
+};
+
+export type PublicTicketResult = {
+  id: string;
+  name: string;
+  phone?: string;
+  email?: string;
+  province: string;
+  content: string;
+  status: string;
+  priority: string;
+  createdAt: string;
+};
+
 export type ChatStreamStatus = "resolving" | "retrieving" | "generating";
 
 export type ChatStreamHandlers = {
@@ -448,6 +468,10 @@ export async function listAdmissionPlansByMajor(params: {
 
 export async function sendChatMessage(input: ChatRequestInput) {
   return apiPost<ChatResult>("/api/v1/chat", input);
+}
+
+export async function createPublicTicket(input: PublicTicketInput) {
+  return apiPost<PublicTicketResult>("/api/v1/tickets", input);
 }
 
 export async function streamChatMessage(input: ChatRequestInput, handlers: ChatStreamHandlers = {}) {

@@ -977,7 +977,11 @@ function TicketsPage() {
   }, [active, query]);
 
   const rows = list ?? tickets;
-  const filtered = rows.filter((item) => (active === '全部' || item.status === active) && `${item.name}${item.content}${item.province}`.includes(query));
+  const filtered = rows.filter((item) => {
+    const phone = 'phone' in item ? item.phone ?? '' : '';
+    const email = 'email' in item ? item.email ?? '' : '';
+    return (active === '全部' || item.status === active) && `${item.name}${phone}${email}${item.content}${item.province}`.includes(query);
+  });
 
   function openTicket(item: AdminTicketItem | Ticket) {
     setTicket(item);
@@ -1008,17 +1012,40 @@ function TicketsPage() {
     <>
       <Toolbar>
         <div className="tabs">{tabs.map((tab) => <button className={active === tab ? 'active' : ''} type="button" onClick={() => setActive(tab)} key={tab}>{tab}</button>)}</div>
-        <SearchBox value={query} onChange={setQuery} placeholder="搜索姓名/电话/内容..." />
+        <SearchBox value={query} onChange={setQuery} placeholder="搜索姓名/电话/邮箱/内容..." />
       </Toolbar>
       {loadError ? <div className="warning-box"><AlertCircle size={18} />真实工单暂不可用，已显示本地样例</div> : null}
       <Card title={`留言工单列表 ${filtered.length} 条`}>
         {filtered.length ? (
-          <DataTable headers={['工单编号', '姓名', '省份', '咨询内容', '提交时间', '状态', '优先级', '操作']} rows={filtered.map((item) => [item.id, item.name, item.province, item.content, 'createdAt' in item ? item.createdAt : item.time, <StatusBadge value={item.status} />, <StatusBadge value={item.priority} />, <button className="table-action" type="button" onClick={() => openTicket(item)}>办理</button>])} />
+          <DataTable headers={['工单编号', '姓名', '省份', '联系方式', '咨询内容', '提交时间', '状态', '优先级', '操作']} rows={filtered.map((item) => {
+            const phone = 'phone' in item ? item.phone : undefined;
+            const email = 'email' in item ? item.email : undefined;
+            return [
+              item.id,
+              item.name,
+              item.province,
+              <div className="stacked-cell">
+                <span>{phone || '未留手机'}</span>
+                {email ? <small>{email}</small> : null}
+              </div>,
+              item.content,
+              'createdAt' in item ? item.createdAt : item.time,
+              <StatusBadge value={item.status} />,
+              <StatusBadge value={item.priority} />,
+              <button className="table-action" type="button" onClick={() => openTicket(item)}>办理</button>
+            ];
+          })} />
         ) : (
           <div className="empty-state">当前没有匹配的真实工单。</div>
         )}
       </Card>
       {ticket ? <Modal title={`工单 ${ticket.id}`} onClose={() => setTicket(null)}>
+        <div className="detail-grid">
+          <div><span>姓名</span><b>{ticket.name}</b></div>
+          <div><span>省份</span><b>{ticket.province}</b></div>
+          <div><span>手机</span><b>{'phone' in ticket && ticket.phone ? ticket.phone : '未填写'}</b></div>
+          <div><span>邮箱</span><b>{'email' in ticket && ticket.email ? ticket.email : '未填写'}</b></div>
+        </div>
         <p className="dialog-text">{ticket.content}</p>
         <label className="field"><span>处理备注</span><textarea value={resolution} onChange={(event) => setResolution(event.target.value)} placeholder="填写处理结论、回访情况或下一步安排。" /></label>
         <PrimaryButton onClick={() => void advance(ticket.id)}><CheckCircle2 size={16} />推进状态</PrimaryButton>

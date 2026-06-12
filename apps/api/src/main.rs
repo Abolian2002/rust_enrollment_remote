@@ -191,6 +191,16 @@ struct AdminTicketUpdateRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct PublicTicketCreateRequest {
+    name: Option<String>,
+    province: String,
+    phone: String,
+    email: Option<String>,
+    content: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct AdminSettingsUpdateRequest {
     welcome_message: String,
     fallback_message: String,
@@ -274,6 +284,7 @@ fn build_router(state: Arc<AppState>) -> Router {
         )
         .route("/api/v1/knowledge/faq", get(knowledge_faq))
         .route("/api/v1/knowledge/policies", get(knowledge_policies))
+        .route("/api/v1/tickets", post(create_public_ticket))
         .route("/api/v1/admin/dashboard/summary", get(admin_dashboard))
         .route("/api/v1/admin/analytics/insights", get(admin_insights))
         .route("/api/v1/admin/analytics/special", get(admin_special))
@@ -293,7 +304,10 @@ fn build_router(state: Arc<AppState>) -> Router {
         )
         .route("/api/v1/admin/knowledge/faqs", get(admin_knowledge_faqs))
         .route("/api/v1/admin/knowledge/faqs", post(admin_create_faq))
-        .route("/api/v1/admin/knowledge/faqs/{faq_id}", patch(admin_update_faq))
+        .route(
+            "/api/v1/admin/knowledge/faqs/{faq_id}",
+            patch(admin_update_faq),
+        )
         .route(
             "/api/v1/admin/knowledge/chunks",
             get(admin_knowledge_chunks),
@@ -304,7 +318,10 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/v1/admin/faq/{faq_id}", patch(admin_update_faq))
         .route("/api/v1/admin/feedback", post(admin_create_feedback))
         .route("/api/v1/admin/tickets", get(admin_tickets))
-        .route("/api/v1/admin/tickets/{ticket_id}", patch(admin_update_ticket))
+        .route(
+            "/api/v1/admin/tickets/{ticket_id}",
+            patch(admin_update_ticket),
+        )
         .route("/api/v1/admin/settings", get(admin_settings))
         .route("/api/v1/admin/settings", patch(admin_update_settings))
         .route("/api/v1/admin/audit-logs", get(admin_audit_logs))
@@ -1564,7 +1581,10 @@ async fn admin_knowledge_coverage(
             tracing::error!(error = %error, "failed to load admin knowledge coverage");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(fail("ADMIN_KNOWLEDGE_COVERAGE_ERROR", "无法读取知识库覆盖数据。")),
+                Json(fail(
+                    "ADMIN_KNOWLEDGE_COVERAGE_ERROR",
+                    "无法读取知识库覆盖数据。",
+                )),
             )
                 .into_response()
         }
@@ -1686,11 +1706,29 @@ async fn admin_create_faq(
     if let Err(response) = require_admin_token(&headers) {
         return response;
     }
-    let Some(question) = payload.question.as_deref().map(str::trim).filter(|value| !value.is_empty()) else {
-        return (StatusCode::BAD_REQUEST, Json(fail("BAD_REQUEST", "FAQ 问题不能为空。"))).into_response();
+    let Some(question) = payload
+        .question
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(fail("BAD_REQUEST", "FAQ 问题不能为空。")),
+        )
+            .into_response();
     };
-    let Some(answer) = payload.answer.as_deref().map(str::trim).filter(|value| !value.is_empty()) else {
-        return (StatusCode::BAD_REQUEST, Json(fail("BAD_REQUEST", "FAQ 答案不能为空。"))).into_response();
+    let Some(answer) = payload
+        .answer
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(fail("BAD_REQUEST", "FAQ 答案不能为空。")),
+        )
+            .into_response();
     };
     if question.chars().count() > 300 || answer.chars().count() > 3000 {
         return (
@@ -1833,7 +1871,11 @@ async fn admin_create_feedback(
     if let Err(response) = require_admin_token(&headers) {
         return response;
     }
-    let comment = payload.comment.as_deref().map(str::trim).filter(|value| !value.is_empty());
+    let comment = payload
+        .comment
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
     if comment.map(|value| value.chars().count()).unwrap_or(0) > 2000 {
         return (
             StatusCode::BAD_REQUEST,
@@ -1893,6 +1935,64 @@ async fn admin_tickets(
     }
 }
 
+async fn create_public_ticket(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<PublicTicketCreateRequest>,
+) -> impl IntoResponse {
+    let name = normalize_optional_text(payload.name.as_deref(), 32);
+    let province = payload.province.trim();
+    let phone = payload.phone.trim();
+    let email = normalize_optional_text(payload.email.as_deref(), 120);
+    let content = payload.content.trim();
+
+    if province.is_empty() || province.chars().count() > 32 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(fail("BAD_REQUEST", "请填写有效的省份。")),
+        )
+            .into_response();
+    }
+    if !is_valid_phone(phone) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(fail("BAD_REQUEST", "请填写 11 位手机号码。")),
+        )
+            .into_response();
+    }
+    if let Some(email) = email.as_deref() {
+        if !is_valid_email(email) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(fail("BAD_REQUEST", "请填写有效的邮箱地址。")),
+            )
+                .into_response();
+        }
+    }
+    if content.chars().count() < 2 || content.chars().count() > 1000 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(fail("BAD_REQUEST", "咨询问题需在 2-1000 个字符之间。")),
+        )
+            .into_response();
+    }
+
+    match state
+        .db
+        .create_public_ticket(name.as_deref(), phone, email.as_deref(), province, content)
+        .await
+    {
+        Ok(item) => (StatusCode::OK, Json(ok(item))).into_response(),
+        Err(error) => {
+            tracing::error!(error = %error, "failed to create public ticket");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(fail("TICKET_CREATE_ERROR", "留言提交失败，请稍后再试。")),
+            )
+                .into_response()
+        }
+    }
+}
+
 async fn admin_update_ticket(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -1936,7 +2036,33 @@ async fn admin_update_ticket(
     }
 }
 
-async fn admin_settings(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl IntoResponse {
+fn normalize_optional_text(value: Option<&str>, max_chars: usize) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.chars().take(max_chars).collect())
+}
+
+fn is_valid_phone(value: &str) -> bool {
+    value.len() == 11 && value.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn is_valid_email(value: &str) -> bool {
+    let Some((local, domain)) = value.split_once('@') else {
+        return false;
+    };
+    !local.is_empty()
+        && domain.contains('.')
+        && !domain.starts_with('.')
+        && !domain.ends_with('.')
+        && value.chars().count() <= 120
+        && !value.chars().any(char::is_whitespace)
+}
+
+async fn admin_settings(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
     if let Err(response) = require_admin_token(&headers) {
         return response;
     }
@@ -1968,7 +2094,10 @@ async fn admin_update_settings(
     {
         return (
             StatusCode::BAD_REQUEST,
-            Json(fail("BAD_REQUEST", "配置内容不能为空，且单项不超过 1000 字。")),
+            Json(fail(
+                "BAD_REQUEST",
+                "配置内容不能为空，且单项不超过 1000 字。",
+            )),
         )
             .into_response();
     }

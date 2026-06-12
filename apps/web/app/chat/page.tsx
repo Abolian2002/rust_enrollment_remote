@@ -6,7 +6,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useChatSession } from "@/components/use-chat-session";
 import { useVoicePlayback } from "@/components/digital-human/use-voice-playback";
 import { FormattedMessage } from "@/components/formatted-message";
-import { stopActiveVoiceStream, streamVoiceChatMessage } from "@/lib/api-client";
+import { createPublicTicket, stopActiveVoiceStream, streamVoiceChatMessage } from "@/lib/api-client";
 import { cn } from "@/lib/cn";
 
 const hotCategories = [
@@ -224,6 +224,7 @@ export default function ChatPage() {
   const [localRichMessages, setLocalRichMessages] = useState<LocalRichMessage[]>([]);
   const [isDrawerOpen, setIsDrawerOpen] = useState(false);
   const [isDhModalOpen, setIsDhModalOpen] = useState(false);
+  const [isTicketModalOpen, setIsTicketModalOpen] = useState(false);
 
   const voice = useVoicePlayback();
   const {
@@ -470,6 +471,7 @@ export default function ChatPage() {
                   onClear={clearChat}
                   onSubmit={handleSubmit}
                   onOpenDrawer={() => setIsDrawerOpen(true)}
+                  onOpenTicket={() => setIsTicketModalOpen(true)}
                 />
               </div>
             </section>
@@ -561,8 +563,190 @@ export default function ChatPage() {
           </div>
         )}
 
+        {isTicketModalOpen ? (
+          <TicketModal onClose={() => setIsTicketModalOpen(false)} />
+        ) : null}
+
       </div>
     </main>
+  );
+}
+
+function TicketModal({ onClose }: { onClose: () => void }) {
+  const [name, setName] = useState("");
+  const [province, setProvince] = useState("");
+  const [phone, setPhone] = useState("");
+  const [email, setEmail] = useState("");
+  const [content, setContent] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState("");
+  const [createdId, setCreatedId] = useState("");
+
+  const normalizedPhone = phone.trim();
+  const normalizedEmail = email.trim();
+  const canSubmit =
+    province.trim().length > 0 &&
+    /^\d{11}$/.test(normalizedPhone) &&
+    content.trim().length >= 2 &&
+    (!normalizedEmail || /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedEmail));
+
+  async function handleTicketSubmit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setError("");
+    if (!canSubmit) {
+      setError("请检查省份、11 位手机号和咨询问题；邮箱如填写需为有效格式。");
+      return;
+    }
+    setSubmitting(true);
+    try {
+      const ticket = await createPublicTicket({
+        ...(name.trim() ? { name: name.trim() } : {}),
+        province: province.trim(),
+        phone: normalizedPhone,
+        ...(normalizedEmail ? { email: normalizedEmail } : {}),
+        content: content.trim()
+      });
+      setCreatedId(ticket.id);
+      setName("");
+      setProvince("");
+      setPhone("");
+      setEmail("");
+      setContent("");
+    } catch (error) {
+      setError(error instanceof Error ? error.message : "留言提交失败，请稍后再试。");
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  return (
+    <div className="fixed inset-0 z-[70] flex items-center justify-center px-4 py-6">
+      <div className="absolute inset-0 bg-slate-950/55 backdrop-blur-sm" onClick={onClose} />
+      <section className="relative z-10 w-full max-w-[560px] overflow-hidden rounded-3xl border border-white/60 bg-white/95 shadow-2xl">
+        <div className="flex items-start justify-between gap-4 border-b border-slate-100 px-6 py-5">
+          <div>
+            <h2 className="text-lg font-black text-school-900">留言咨询</h2>
+            <p className="mt-1 text-sm leading-6 text-slate-500">
+              留下联系方式和问题，招生咨询老师会在后台工单中看到并尽快处理。
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={onClose}
+            className="rounded-full p-2 text-slate-400 transition hover:bg-slate-100 hover:text-slate-700"
+            aria-label="关闭留言窗口"
+          >
+            <CloseIcon className="h-5 w-5" />
+          </button>
+        </div>
+
+        {createdId ? (
+          <div className="px-6 py-7">
+            <div className="rounded-2xl border border-emerald-100 bg-emerald-50 px-4 py-4 text-sm leading-7 text-emerald-800">
+              留言已提交，工单号：<span className="font-black">{createdId}</span>。请保持手机或邮箱可联系，老师会结合你的问题继续跟进。
+            </div>
+            <div className="mt-5 flex justify-end gap-3">
+              <button
+                type="button"
+                onClick={() => setCreatedId("")}
+                className="rounded-xl border border-slate-200 px-4 py-2 text-sm font-bold text-slate-600 transition hover:bg-slate-50"
+              >
+                再写一条
+              </button>
+              <button
+                type="button"
+                onClick={onClose}
+                className="rounded-xl bg-school-900 px-4 py-2 text-sm font-bold text-white transition hover:bg-school-800"
+              >
+                完成
+              </button>
+            </div>
+          </div>
+        ) : (
+          <form onSubmit={handleTicketSubmit} className="grid gap-4 px-6 py-6">
+            <div className="grid gap-4 sm:grid-cols-2">
+              <label className="grid gap-2 text-sm font-bold text-slate-700">
+                姓名（可选）
+                <input
+                  value={name}
+                  onChange={(event) => setName(event.target.value)}
+                  maxLength={32}
+                  placeholder="例如：张同学"
+                  className="rounded-xl border border-slate-200 bg-white px-3 py-2.5 text-sm font-medium outline-none transition focus:border-school-500 focus:ring-4 focus:ring-school-100"
+                />
+              </label>
+              <label className="grid gap-2 text-sm font-bold text-slate-700">
+                省份
+                <input
+                  value={province}
+                  onChange={(event) => setProvince(event.target.value)}
+                  maxLength={32}
+                  placeholder="例如：河北"
+                  className="rounded-xl border border-slate-200 bg-white px-3 py-2.5 text-sm font-medium outline-none transition focus:border-school-500 focus:ring-4 focus:ring-school-100"
+                  required
+                />
+              </label>
+            </div>
+            <div className="grid gap-4 sm:grid-cols-2">
+              <label className="grid gap-2 text-sm font-bold text-slate-700">
+                手机号
+                <input
+                  value={phone}
+                  onChange={(event) => setPhone(event.target.value.replace(/\D/g, "").slice(0, 11))}
+                  inputMode="numeric"
+                  pattern="\d{11}"
+                  placeholder="11 位手机号码"
+                  className="rounded-xl border border-slate-200 bg-white px-3 py-2.5 text-sm font-medium outline-none transition focus:border-school-500 focus:ring-4 focus:ring-school-100"
+                  required
+                />
+              </label>
+              <label className="grid gap-2 text-sm font-bold text-slate-700">
+                邮箱（可选）
+                <input
+                  value={email}
+                  onChange={(event) => setEmail(event.target.value)}
+                  type="email"
+                  maxLength={120}
+                  placeholder="用于接收补充回复"
+                  className="rounded-xl border border-slate-200 bg-white px-3 py-2.5 text-sm font-medium outline-none transition focus:border-school-500 focus:ring-4 focus:ring-school-100"
+                />
+              </label>
+            </div>
+            <label className="grid gap-2 text-sm font-bold text-slate-700">
+              咨询问题
+              <textarea
+                value={content}
+                onChange={(event) => setContent(event.target.value.slice(0, 1000))}
+                placeholder="请尽量写清省份、科类、分数、专业或想咨询的政策。"
+                className="min-h-[132px] resize-none rounded-xl border border-slate-200 bg-white px-3 py-2.5 text-sm font-medium leading-6 outline-none transition focus:border-school-500 focus:ring-4 focus:ring-school-100"
+                required
+              />
+            </label>
+            {error ? (
+              <div className="rounded-xl border border-rose-100 bg-rose-50 px-3 py-2 text-sm font-semibold text-rose-700">
+                {error}
+              </div>
+            ) : null}
+            <div className="flex flex-col-reverse gap-3 pt-1 sm:flex-row sm:justify-end">
+              <button
+                type="button"
+                onClick={onClose}
+                className="rounded-xl border border-slate-200 px-4 py-2.5 text-sm font-bold text-slate-600 transition hover:bg-slate-50"
+              >
+                取消
+              </button>
+              <button
+                type="submit"
+                disabled={submitting || !canSubmit}
+                className="rounded-xl bg-school-900 px-5 py-2.5 text-sm font-black text-white shadow-sm transition hover:bg-school-800 disabled:cursor-not-allowed disabled:bg-slate-300"
+              >
+                {submitting ? "提交中..." : "提交留言"}
+              </button>
+            </div>
+          </form>
+        )}
+      </section>
+    </div>
   );
 }
 
@@ -1068,7 +1252,8 @@ function InputDock({
   onInterrupt,
   onClear,
   onSubmit,
-  onOpenDrawer
+  onOpenDrawer,
+  onOpenTicket
 }: {
   disabled: boolean;
   input: string;
@@ -1078,6 +1263,7 @@ function InputDock({
   onClear: () => void;
   onSubmit: (event: FormEvent<HTMLFormElement>) => void | Promise<void>;
   onOpenDrawer: () => void;
+  onOpenTicket: () => void;
 }) {
   return (
     <div className="shrink-0 border-t border-slate-200/50 bg-white/60 px-4 py-4 backdrop-blur-md sm:px-6 lg:px-8 relative z-10">
@@ -1087,7 +1273,7 @@ function InputDock({
           <div className="flex shrink-0 items-center gap-2">
             <ToolButton active icon={ClipboardIcon} label="志愿测评" onClick={() => void onAsk("我想做分步志愿测评，请先问我需要提供哪些信息。")} />
             <ToolButton icon={QuestionIcon} label="常见问题" onClick={() => void onAsk("请列出哈尔滨师范大学招生咨询的常见问题。")} />
-            <ToolButton icon={MessageIcon} label="留言咨询" onClick={() => void onAsk("我想留言咨询招生问题，需要提供哪些信息？")} />
+            <ToolButton icon={MessageIcon} label="留言咨询" onClick={onOpenTicket} />
             <button
               type="button"
               onClick={onOpenDrawer}

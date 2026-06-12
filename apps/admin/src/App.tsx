@@ -63,17 +63,39 @@ import {
   type Ticket,
 } from './data/mock';
 import {
+  fetchAdminAdmissionsAnalytics,
+  fetchAdminBigScreen,
   fetchAdminConversationDetail,
   fetchAdminConversations,
   fetchAdminDashboard,
   fetchAdminFaqs,
+  fetchAdminInsights,
   fetchAdminKnowledgeChunks,
+  fetchAdminKnowledgeCoverage,
+  fetchAdminSpecial,
+  fetchAdminAuditLogs,
+  fetchAdminSettings,
+  fetchAdminTickets,
+  createAdminFaq,
+  createAdminFeedback,
+  updateAdminFaq,
+  updateAdminSettings,
+  updateAdminTicket,
 } from './api/admin';
 import type {
+  AdminAuditLogItem,
+  AdminAdmissionsAnalyticsSnapshot,
+  AdminBigScreenSnapshot,
   AdminConversationDetail,
   AdminConversationListItem,
   AdminDashboardSnapshot,
+  AdminFeedbackType,
+  AdminInsightsSnapshot,
   AdminKnowledgeChunkItem,
+  AdminKnowledgeCoverageSnapshot,
+  AdminSettings,
+  AdminSpecialSnapshot,
+  AdminTicketItem,
 } from './types/admin';
 
 echarts.registerMap('china', chinaMap as never);
@@ -390,25 +412,52 @@ function DashboardPage() {
 function InsightsPage() {
   const [month, setMonth] = useState(insightMonths[3]);
   const [query, setQuery] = useState('');
-  const filtered = top20.filter((row) => row[0].includes(query) || row[1].includes(query));
+  const [insights, setInsights] = useState<AdminInsightsSnapshot | null>(null);
+  const [loadError, setLoadError] = useState('');
+
+  useEffect(() => {
+    let alive = true;
+    fetchAdminInsights()
+      .then((data) => {
+        if (alive) {
+          setInsights(data);
+          setLoadError('');
+        }
+      })
+      .catch((error: Error) => {
+        if (alive) {
+          setLoadError(error.message);
+        }
+      });
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  const topRows = insights?.topQuestions.map((item) => [item.question, item.category, String(item.count), item.share] as [string, string, string, string]) ?? top20;
+  const filtered = topRows.filter((row) => row[0].includes(query) || row[1].includes(query));
+  const insightCategoryStats = insights?.categoryStats ?? categoryStats;
+  const insightProvinceBars = insights?.provinceBars ?? provinceBars;
+  const wordCloud = insights?.wordCloud.map((item) => item.name) ?? ['录取分数', '公费师范', '专业', '分数线', '招生计划', '宿舍', '优师计划', '就业', '学费', '调剂', '位次', '师范', '投档', '升学', '报名', '环境', '师资'];
 
   return (
     <>
-      <PageTitle title="2026级新生招生 用户咨询洞察" />
+      <PageTitle title="招生咨询热点洞察" subtitle={insights ? `真实数据更新时间：${insights.updatedAt}` : undefined} />
       <Card>
         <div className="month-tabs">
           {insightMonths.map((item) => <button className={item.label === month.label ? 'active' : ''} type="button" key={item.label} onClick={() => setMonth(item)}>{item.label}</button>)}
-          <span className="trend-alert">↗ 咨询趋势：高峰</span>
+          <span className="trend-alert">{insights ? '真实咨询日志聚合' : '↗ 咨询趋势：高峰'}</span>
         </div>
         <div className="insight-hero">
-          <MiniMetric icon={Users} label="咨询用户数" value={month.users} />
-          <MiniMetric icon={MessageSquare} label="咨询问答数" value={month.questions} />
-          <MiniMetric icon={Target} label="高意向留资量" value={month.leads} />
-          <p><b>本月特征：</b>{month.summary}</p>
-          <p><b>重点关注：</b>本月咨询量突破11万人次，创下年度单月最高纪录，整体咨询量较上月增长21%。省内咨询占比稳定在65%左右，但省外咨询增速明显加快。</p>
-          <div className="tag-row"><span>二模成绩分析</span><span>各分数段报考建议</span><span>专业选择困惑</span><span>历年录取位次</span></div>
+          <MiniMetric icon={Users} label={insights?.stats[0]?.label ?? '咨询用户数'} value={insights?.stats[0]?.value ?? month.users} />
+          <MiniMetric icon={MessageSquare} label={insights?.stats[1]?.label ?? '咨询问答数'} value={insights?.stats[1]?.value ?? month.questions} />
+          <MiniMetric icon={Target} label={insights?.stats[2]?.label ?? '高意向留资量'} value={insights?.stats[2]?.value ?? month.leads} />
+          <p><b>数据特征：</b>{insights?.summary ?? month.summary}</p>
+          <p><b>重点关注：</b>后台按分数位次、录取规则、专业介绍、专项政策、校园生活等通用类别归集用户问题，用于辅助招生办及时发现咨询高峰和知识库缺口。</p>
+          <div className="tag-row">{wordCloud.slice(0, 4).map((word) => <span key={word}>{word}</span>)}</div>
         </div>
       </Card>
+      {loadError ? <div className="warning-box"><AlertCircle size={18} />真实热点数据暂不可用，已显示本地样例</div> : null}
       <Toolbar>
         <SelectLike>近30天</SelectLike>
         <SelectLike>全部分类</SelectLike>
@@ -416,35 +465,74 @@ function InsightsPage() {
         <PrimaryButton ghost><Download size={16} />导出Excel</PrimaryButton>
       </Toolbar>
       <div className="grid-two">
-        <Card title="咨询内容分类统计"><Chart option={pieOption(categoryStats)} height={280} /></Card>
-        <Card title="生源地域热度分析"><Chart option={horizontalBarOption(provinceBars)} height={280} /></Card>
+        <Card title="咨询内容分类统计"><Chart option={pieOption(insightCategoryStats)} height={280} /></Card>
+        <Card title="生源地域热度分析"><Chart option={horizontalBarOption(insightProvinceBars)} height={280} /></Card>
       </div>
       <Card title="高频问题 TOP20 榜单">
         <DataTable headers={['排名', '问题内容', '分类', '提问次数', '占比']} rows={filtered.map((row, index) => [index + 1, row[0], row[1], row[2], row[3]])} />
       </Card>
       <Card title="用户关注点词云">
-        <div className="word-cloud">{['录取分数', '公费师范', '专业', '分数线', '招生计划', '宿舍', '优师计划', '就业', '学费', '调剂', '位次', '师范', '投档', '升学', '报名', '环境', '师资'].map((word, index) => <span style={{ fontSize: `${14 + (index % 6) * 4}px` }} key={word}>{word}</span>)}</div>
+        <div className="word-cloud">{wordCloud.map((word, index) => <span style={{ fontSize: `${14 + (index % 6) * 4}px` }} key={word}>{word}</span>)}</div>
       </Card>
     </>
   );
 }
 
 function SpecialPage() {
+  const [special, setSpecial] = useState<AdminSpecialSnapshot | null>(null);
+  const [admissions, setAdmissions] = useState<AdminAdmissionsAnalyticsSnapshot | null>(null);
+  const [loadError, setLoadError] = useState('');
+
+  useEffect(() => {
+    let alive = true;
+    Promise.all([fetchAdminSpecial(), fetchAdminAdmissionsAnalytics()])
+      .then(([specialData, admissionsData]) => {
+        if (alive) {
+          setSpecial(specialData);
+          setAdmissions(admissionsData);
+          setLoadError('');
+        }
+      })
+      .catch((error: Error) => {
+        if (alive) {
+          setLoadError(error.message);
+        }
+      });
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  const specialPageStats = special?.stats ?? specialStats;
+  const normalVsNonNormal = special?.normalVsNonNormal.length ? special.normalVsNonNormal : [{ name: '师范类', value: 66 }, { name: '非师范类', value: 34 }];
+  const specialPlanRows = special?.specialPlans ?? specialPlans;
+  const majorAttentionRows = special?.majorAttention.length ? special.majorAttention : majorAttention;
+  const policyRows = special?.policyStats.length ? special.policyStats : ['投档比例', '调剂退档规则', '同分录取规则', '单科成绩要求', '体检限制专业', '加分政策', '少数民族照顾'].map((name, index) => [name, 876 - index * 111] as [string, number]);
+
   return (
     <>
-      <StatGrid stats={specialStats} />
+      {loadError ? <div className="warning-box"><AlertCircle size={18} />真实专项数据暂不可用，已显示本地样例</div> : null}
+      <StatGrid stats={specialPageStats} />
       <div className="grid-two">
-        <Card title="师范类 vs 非师范类咨询对比"><Chart option={pieOption([{ name: '师范类', value: 66 }, { name: '非师范类', value: 34 }])} height={270} /></Card>
-        <Card title="专项计划咨询量占比"><Chart option={barOption(specialPlans.map((item) => item[0] as string), specialPlans.map((item) => item[1] as number), '#3478f6')} height={270} /></Card>
+        <Card title="师范类 vs 非师范类咨询对比"><Chart option={pieOption(normalVsNonNormal)} height={270} /></Card>
+        <Card title="专项与政策咨询量"><Chart option={barOption(specialPlanRows.map((item) => item[0] as string), specialPlanRows.map((item) => item[1] as number), '#3478f6')} height={270} /></Card>
       </div>
       <div className="grid-two">
-        <Card title="各专业考生关注度 TOP10"><Chart option={horizontalBarOption(majorAttention)} height={340} /></Card>
+        <Card title="各专业考生关注度 TOP10"><Chart option={horizontalBarOption(majorAttentionRows)} height={340} /></Card>
         <Card title="录取规则与政策类问题统计">
-          <div className="policy-bars">{['投档比例', '调剂退档规则', '同分录取规则', '单科成绩要求', '体检限制专业', '加分政策', '少数民族照顾'].map((name, index) => <div key={name}><span>{876 - index * 111}</span><b>{name}</b></div>)}</div>
+          <div className="policy-bars">{policyRows.map(([name, count]) => <div key={name}><span>{count}</span><b>{name}</b></div>)}</div>
         </Card>
       </div>
-      <Card title="专项计划详细数据">
-        <DataTable headers={['专项名称', '咨询量', '占比', '环比变化', '热度趋势']} rows={specialPlans.map((row) => [...row, '▁▃▅▆▇'])} />
+      <Card title="专项与政策咨询详细数据">
+        <DataTable headers={['名称', '咨询量', '占比', '数据来源', '热度趋势']} rows={specialPlanRows.map((row) => [...row, '▁▃▅▆▇'])} />
+      </Card>
+      <Card title="2021-2025 录取统计覆盖" action={<span className="soft-pill">来自录取统计表，不等同招生计划</span>}>
+        <StatGrid stats={admissions?.stats ?? []} />
+        <div className="grid-two">
+          <Chart option={barOption((admissions?.yearCounts ?? []).map((item) => item.name), (admissions?.yearCounts ?? []).map((item) => item.value), '#2161ff')} height={260} />
+          <Chart option={horizontalBarOption(admissions?.provinceCoverage.slice(0, 10) ?? [])} height={260} />
+        </div>
+        <DataTable headers={['覆盖较多的专业', '覆盖省份数']} rows={(admissions?.topMajors ?? []).slice(0, 8).map(([name, count]) => [name, count])} />
       </Card>
     </>
   );
@@ -509,6 +597,10 @@ function ConversationsPage() {
   const [selected, setSelected] = useState<AdminConversationListItem | null>(null);
   const [detail, setDetail] = useState<AdminConversationDetail | null>(null);
   const [loadError, setLoadError] = useState('');
+  const [feedbackType, setFeedbackType] = useState<AdminFeedbackType>('manual-fix');
+  const [feedbackComment, setFeedbackComment] = useState('');
+  const [feedbackSaved, setFeedbackSaved] = useState('');
+  const [feedbackSaving, setFeedbackSaving] = useState(false);
   const mockRows = conversations
     .filter((item) => item.join('').includes(query))
     .map(([id, province, updatedAt, messageCount, status, manualIntervention]) => ({
@@ -545,9 +637,36 @@ function ConversationsPage() {
   function openConversation(row: AdminConversationListItem) {
     setSelected(row);
     setDetail(null);
+    setFeedbackComment('');
+    setFeedbackSaved('');
     fetchAdminConversationDetail(row.id)
       .then(setDetail)
       .catch(() => setDetail(null));
+  }
+
+  async function submitFeedback() {
+    if (!selected || !feedbackComment.trim()) {
+      setFeedbackSaved('请先填写反馈备注。');
+      return;
+    }
+    setFeedbackSaving(true);
+    setFeedbackSaved('');
+    try {
+      await createAdminFeedback({
+        conversationId: selected.id,
+        feedbackType,
+        comment: feedbackComment.trim(),
+        handledBy: 'admin',
+        status: feedbackType === 'helpful' ? 'resolved' : 'open',
+      });
+      setFeedbackSaved('人工反馈已写入，可在后续审计中跟踪处理。');
+      setFeedbackComment('');
+      fetchAdminConversations(query).then((data) => setApiRows(data.items)).catch(() => {});
+    } catch (error) {
+      setFeedbackSaved(error instanceof Error ? error.message : '人工反馈提交失败');
+    } finally {
+      setFeedbackSaving(false);
+    }
   }
 
   return (
@@ -589,6 +708,21 @@ function ConversationsPage() {
           ) : (
             <div className="empty-state">正在读取对话详情，或当前为本地样例数据。</div>
           )}
+          <div className="feedback-panel">
+            <h3>人工反馈 / 纠错</h3>
+            <div className="feedback-grid">
+              <label className="field"><span>反馈类型</span>
+                <select value={feedbackType} onChange={(event) => setFeedbackType(event.target.value as AdminFeedbackType)}>
+                  <option value="manual-fix">人工纠错</option>
+                  <option value="incorrect">回答有误</option>
+                  <option value="helpful">回答有帮助</option>
+                </select>
+              </label>
+              <label className="field"><span>处理备注</span><textarea value={feedbackComment} onChange={(event) => setFeedbackComment(event.target.value)} placeholder="记录问题、建议处理方式或确认结论。" /></label>
+            </div>
+            <PrimaryButton onClick={() => void submitFeedback()}><Save size={16} />{feedbackSaving ? '提交中...' : '提交反馈'}</PrimaryButton>
+            {feedbackSaved ? <span className="save-tip">{feedbackSaved}</span> : null}
+          </div>
         </Modal>
       ) : null}
     </>
@@ -600,10 +734,13 @@ function KnowledgePage() {
   const [items, setItems] = useState(knowledgeBase);
   const [apiItems, setApiItems] = useState<KnowledgeItem[] | null>(null);
   const [chunks, setChunks] = useState<AdminKnowledgeChunkItem[]>([]);
+  const [coverage, setCoverage] = useState<AdminKnowledgeCoverageSnapshot | null>(null);
   const [faqTotal, setFaqTotal] = useState<number | null>(null);
   const [chunkTotal, setChunkTotal] = useState<number | null>(null);
   const [loadError, setLoadError] = useState('');
-  const [modal, setModal] = useState<'new' | 'import' | null>(null);
+  const [modal, setModal] = useState<'new' | 'import' | 'edit' | null>(null);
+  const [editingFaq, setEditingFaq] = useState<KnowledgeItem | null>(null);
+  const [savingFaq, setSavingFaq] = useState(false);
   const rows = apiItems ?? items.filter((item) => `${item.question}${item.answer}${item.similar}`.includes(query));
 
   useEffect(() => {
@@ -611,11 +748,13 @@ function KnowledgePage() {
     Promise.all([
       fetchAdminFaqs(query),
       fetchAdminKnowledgeChunks(query),
+      fetchAdminKnowledgeCoverage(),
     ])
-      .then(([faqList, chunkList]) => {
+      .then(([faqList, chunkList, coverageData]) => {
         if (alive) {
           setApiItems(faqList.items);
           setChunks(chunkList.items);
+          setCoverage(coverageData);
           setFaqTotal(faqList.total);
           setChunkTotal(chunkList.total);
           setLoadError('');
@@ -625,6 +764,7 @@ function KnowledgePage() {
         if (alive) {
           setApiItems(null);
           setChunks([]);
+          setCoverage(null);
           setFaqTotal(null);
           setChunkTotal(null);
           setLoadError(error.message);
@@ -648,6 +788,48 @@ function KnowledgePage() {
     }]);
   }
 
+  function openFaqEditor(item: KnowledgeItem) {
+    setEditingFaq(item);
+    setModal('edit');
+  }
+
+  async function saveFaqDraft(input: {
+    question: string;
+    answer: string;
+    category: string;
+    tags: string[];
+    status: 'draft' | 'published';
+    sourceLabel: string;
+  }) {
+    setSavingFaq(true);
+    try {
+      const saved = modal === 'edit' && editingFaq
+        ? await updateAdminFaq(String(editingFaq.id), input)
+        : await createAdminFaq(input);
+      if (apiItems) {
+        setApiItems((current) => {
+          const list = current ?? [];
+          return modal === 'edit'
+            ? list.map((item) => String(item.id) === String(saved.id) ? saved : item)
+            : [saved, ...list];
+        });
+      } else {
+        setItems((current) => {
+          return modal === 'edit'
+            ? current.map((item) => String(item.id) === String(saved.id) ? saved : item)
+            : [saved, ...current];
+        });
+      }
+      setModal(null);
+      setEditingFaq(null);
+      setLoadError('');
+    } catch (error) {
+      setLoadError(error instanceof Error ? error.message : 'FAQ 保存失败');
+    } finally {
+      setSavingFaq(false);
+    }
+  }
+
   return (
     <>
       <Toolbar>
@@ -655,11 +837,30 @@ function KnowledgePage() {
         <SearchBox value={query} onChange={setQuery} placeholder="搜索问答内容..." />
         <PrimaryButton ghost onClick={() => setModal('import')}><Upload size={16} />批量导入</PrimaryButton>
         <PrimaryButton ghost><Download size={16} />导出</PrimaryButton>
-        <PrimaryButton onClick={() => setModal('new')}><Plus size={16} />本地新增预览</PrimaryButton>
+        <PrimaryButton onClick={() => { setEditingFaq(null); setModal('new'); }}><Plus size={16} />新增 FAQ</PrimaryButton>
       </Toolbar>
       {loadError ? <div className="warning-box"><AlertCircle size={18} />真实知识库暂不可用，已显示本地样例</div> : null}
+      {coverage ? (
+        <Card title="知识库真实覆盖概览" action={<span className="soft-pill">更新时间：{coverage.updatedAt}</span>}>
+          <StatGrid stats={coverage.stats} />
+          <div className="grid-two">
+            <Chart option={pieOption(coverage.documentKinds)} height={260} />
+            <Chart option={horizontalBarOption(coverage.collegeChunks.slice(0, 12))} height={260} />
+          </div>
+          <div className="grid-two">
+            <div>
+              <h3 className="subsection-title">FAQ 分类覆盖</h3>
+              <Chart option={pieOption(coverage.faqCategories)} height={240} />
+            </div>
+            <div>
+              <h3 className="subsection-title">政策文档年份分布</h3>
+              <Chart option={barOption(coverage.policyYears.map((item) => item.name), coverage.policyYears.map((item) => item.value), '#34c8c2')} height={240} />
+            </div>
+          </div>
+        </Card>
+      ) : null}
       <Card title={`标准问答库 ${faqTotal ?? rows.length} 条`}>
-        <DataTable headers={['ID', '标准问题', '相似问法', '标准答案', '来源', '更新时间', '状态', '命中']} rows={rows.map((item) => [item.id, item.question, item.similar, item.answer, item.source, item.updatedAt, <StatusBadge value={item.status} />, item.hits])} />
+        <DataTable headers={['ID', '标准问题', '相似问法', '标准答案', '来源', '更新时间', '状态', '命中', '操作']} rows={rows.map((item) => [item.id, item.question, item.similar, item.answer, item.source, item.updatedAt, <StatusBadge value={item.status} />, item.hits, <button className="table-action" type="button" onClick={() => openFaqEditor(item)}>编辑</button>])} />
       </Card>
       <Card title={`PDF 文档片段审计 ${chunkTotal ?? chunks.length} 条`} action={<span className="soft-pill">招生简章 / 培养方案</span>}>
         {chunks.length ? (
@@ -691,20 +892,57 @@ function KnowledgePage() {
           ))}
         </div>
       </Card>
-      {modal ? <KnowledgeModal mode={modal} onClose={() => setModal(null)} onSave={(item) => { setItems((current) => [...current, item]); setModal(null); }} /> : null}
+      {modal ? <KnowledgeModal mode={modal} initialItem={editingFaq} saving={savingFaq} onClose={() => { setModal(null); setEditingFaq(null); }} onSave={(item) => void saveFaqDraft(item)} /> : null}
     </>
   );
 }
 
-function KnowledgeModal({ mode, onClose, onSave }: { mode: 'new' | 'import'; onClose: () => void; onSave: (item: KnowledgeItem) => void }) {
-  const [question, setQuestion] = useState('');
-  const [answer, setAnswer] = useState('');
+function KnowledgeModal({
+  mode,
+  initialItem,
+  saving,
+  onClose,
+  onSave,
+}: {
+  mode: 'new' | 'import' | 'edit';
+  initialItem: KnowledgeItem | null;
+  saving: boolean;
+  onClose: () => void;
+  onSave: (item: {
+    question: string;
+    answer: string;
+    category: string;
+    tags: string[];
+    status: 'draft' | 'published';
+    sourceLabel: string;
+  }) => void;
+}) {
+  const [question, setQuestion] = useState(initialItem?.question ?? '');
+  const [answer, setAnswer] = useState(initialItem?.answer ?? '');
+  const [category, setCategory] = useState(initialItem?.source || '招生咨询');
+  const [tagsText, setTagsText] = useState(initialItem?.similar ?? '');
+  const [status, setStatus] = useState<'draft' | 'published'>(initialItem?.status === '启用' ? 'published' : 'draft');
+  const [sourceLabel, setSourceLabel] = useState(initialItem?.source ?? '管理后台录入');
+  const tags = tagsText.split(/[|,，]/).map((item) => item.trim()).filter(Boolean);
+
   return (
-    <Modal title={mode === 'new' ? '新增标准问答' : '批量导入问答'} onClose={onClose}>
+    <Modal title={mode === 'edit' ? '编辑标准问答' : mode === 'new' ? '新增标准问答' : '批量导入问答'} onClose={onClose}>
       {mode === 'import' ? <div className="upload-drop"><Upload size={30} />拖拽 Excel 文件到此处，或点击选择文件</div> : null}
       <label className="field"><span>标准问题</span><input value={question} onChange={(event) => setQuestion(event.target.value)} placeholder="请输入标准问题" /></label>
       <label className="field"><span>标准答案</span><textarea value={answer} onChange={(event) => setAnswer(event.target.value)} placeholder="请输入标准答案" /></label>
-      <PrimaryButton onClick={() => onSave({ id: Date.now(), question: question || '新增招生咨询问题', similar: '新问法', answer: answer || '请以招生办公室官方公告为准。', source: '后台新增', updatedAt: '2024-06-14', status: '启用', hits: 0 })}><Save size={16} />保存</PrimaryButton>
+      <div className="grid-two compact-grid">
+        <label className="field"><span>分类</span><input value={category} onChange={(event) => setCategory(event.target.value)} /></label>
+        <label className="field"><span>状态</span>
+          <select value={status} onChange={(event) => setStatus(event.target.value as 'draft' | 'published')}>
+            <option value="draft">草稿，不进入正式 FAQ</option>
+            <option value="published">发布，进入 FAQ 检索候选</option>
+          </select>
+        </label>
+      </div>
+      <label className="field"><span>相似问法 / 标签</span><input value={tagsText} onChange={(event) => setTagsText(event.target.value)} placeholder="用逗号或 | 分隔" /></label>
+      <label className="field"><span>来源标签</span><input value={sourceLabel} onChange={(event) => setSourceLabel(event.target.value)} /></label>
+      <p className="soft-note">保存 FAQ 只更新结构化问答表；向量 chunk / embedding 后续通过单独的审核重嵌入流程处理。</p>
+      <PrimaryButton onClick={() => onSave({ question, answer, category, tags, status, sourceLabel })}><Save size={16} />{saving ? '保存中...' : '保存 FAQ'}</PrimaryButton>
     </Modal>
   );
 }
@@ -712,14 +950,58 @@ function KnowledgeModal({ mode, onClose, onSave }: { mode: 'new' | 'import'; onC
 function TicketsPage() {
   const [active, setActive] = useState('全部');
   const [query, setQuery] = useState('');
-  const [list, setList] = useState(tickets);
-  const [ticket, setTicket] = useState<Ticket | null>(null);
-  const filtered = list.filter((item) => (active === '全部' || item.status === active) && `${item.name}${item.content}${item.province}`.includes(query));
+  const [list, setList] = useState<AdminTicketItem[] | null>(null);
+  const [loadError, setLoadError] = useState('');
+  const [ticket, setTicket] = useState<AdminTicketItem | Ticket | null>(null);
+  const [resolution, setResolution] = useState('');
   const tabs = ['全部', '待处理', '处理中', '已办结'];
 
-  function advance(id: string) {
-    setList((current) => current.map((item) => item.id === id ? { ...item, status: item.status === '待处理' ? '处理中' : '已办结' } : item));
-    setTicket(null);
+  useEffect(() => {
+    let alive = true;
+    fetchAdminTickets(query, active)
+      .then((data) => {
+        if (alive) {
+          setList(data.items);
+          setLoadError('');
+        }
+      })
+      .catch((error: Error) => {
+        if (alive) {
+          setList(null);
+          setLoadError(error.message);
+        }
+      });
+    return () => {
+      alive = false;
+    };
+  }, [active, query]);
+
+  const rows = list ?? tickets;
+  const filtered = rows.filter((item) => (active === '全部' || item.status === active) && `${item.name}${item.content}${item.province}`.includes(query));
+
+  function openTicket(item: AdminTicketItem | Ticket) {
+    setTicket(item);
+    setResolution('resolution' in item && item.resolution ? item.resolution : '');
+  }
+
+  async function advance(id: string) {
+    const currentStatus = ticket?.status ?? '待处理';
+    const nextStatus = currentStatus === '待处理' ? '处理中' : '已办结';
+    if (!list) {
+      setTicket(null);
+      return;
+    }
+    try {
+      const updated = await updateAdminTicket(id, {
+        status: nextStatus,
+        resolution: resolution.trim() || undefined,
+        handledBy: 'admin',
+      });
+      setList((current) => current?.map((item) => item.id === id ? updated : item) ?? current);
+      setTicket(null);
+    } catch (error) {
+      setLoadError(error instanceof Error ? error.message : '工单更新失败');
+    }
   }
 
   return (
@@ -728,10 +1010,19 @@ function TicketsPage() {
         <div className="tabs">{tabs.map((tab) => <button className={active === tab ? 'active' : ''} type="button" onClick={() => setActive(tab)} key={tab}>{tab}</button>)}</div>
         <SearchBox value={query} onChange={setQuery} placeholder="搜索姓名/电话/内容..." />
       </Toolbar>
+      {loadError ? <div className="warning-box"><AlertCircle size={18} />真实工单暂不可用，已显示本地样例</div> : null}
       <Card title={`留言工单列表 ${filtered.length} 条`}>
-        <DataTable headers={['工单编号', '姓名', '省份', '咨询内容', '提交时间', '状态', '优先级', '操作']} rows={filtered.map((item) => [item.id, item.name, item.province, item.content, item.time, <StatusBadge value={item.status} />, <StatusBadge value={item.priority} />, <button className="table-action" type="button" onClick={() => setTicket(item)}>办理</button>])} />
+        {filtered.length ? (
+          <DataTable headers={['工单编号', '姓名', '省份', '咨询内容', '提交时间', '状态', '优先级', '操作']} rows={filtered.map((item) => [item.id, item.name, item.province, item.content, 'createdAt' in item ? item.createdAt : item.time, <StatusBadge value={item.status} />, <StatusBadge value={item.priority} />, <button className="table-action" type="button" onClick={() => openTicket(item)}>办理</button>])} />
+        ) : (
+          <div className="empty-state">当前没有匹配的真实工单。</div>
+        )}
       </Card>
-      {ticket ? <Modal title={`工单 ${ticket.id}`} onClose={() => setTicket(null)}><p className="dialog-text">{ticket.content}</p><PrimaryButton onClick={() => advance(ticket.id)}><CheckCircle2 size={16} />推进状态</PrimaryButton></Modal> : null}
+      {ticket ? <Modal title={`工单 ${ticket.id}`} onClose={() => setTicket(null)}>
+        <p className="dialog-text">{ticket.content}</p>
+        <label className="field"><span>处理备注</span><textarea value={resolution} onChange={(event) => setResolution(event.target.value)} placeholder="填写处理结论、回访情况或下一步安排。" /></label>
+        <PrimaryButton onClick={() => void advance(ticket.id)}><CheckCircle2 size={16} />推进状态</PrimaryButton>
+      </Modal> : null}
     </>
   );
 }
@@ -741,22 +1032,75 @@ function SettingsPage() {
   const [welcome, setWelcome] = useState('您好，欢迎来到哈尔滨师范大学！我是您的招生咨询助手「沐阳」，很高兴为您服务。请问有什么可以帮助您的吗？');
   const [fallback, setFallback] = useState('抱歉，我暂时无法回答这个问题。建议您拨打招生咨询电话：0451-88060678，或者提交人工留言，我们会尽快为您解答。');
   const [saved, setSaved] = useState(false);
+  const [settings, setSettings] = useState<AdminSettings | null>(null);
+  const [auditLogs, setAuditLogs] = useState<AdminAuditLogItem[]>([]);
+  const [loadError, setLoadError] = useState('');
+
+  useEffect(() => {
+    let alive = true;
+    Promise.all([fetchAdminSettings(), fetchAdminAuditLogs()])
+      .then(([settingsData, auditData]) => {
+        if (alive) {
+          setSettings(settingsData);
+          setWelcome(settingsData.welcomeMessage);
+          setFallback(settingsData.fallbackMessage);
+          setAuditLogs(auditData.items);
+          setLoadError('');
+        }
+      })
+      .catch((error: Error) => {
+        if (alive) {
+          setLoadError(error.message);
+        }
+      });
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  async function saveSettings() {
+    setSaved(false);
+    try {
+      const updated = await updateAdminSettings({
+        welcomeMessage: welcome,
+        fallbackMessage: fallback,
+        updatedBy: 'admin',
+      });
+      setSettings(updated);
+      setWelcome(updated.welcomeMessage);
+      setFallback(updated.fallbackMessage);
+      setSaved(true);
+      fetchAdminAuditLogs().then((data) => setAuditLogs(data.items)).catch(() => {});
+    } catch (error) {
+      setLoadError(error instanceof Error ? error.message : '配置保存失败');
+    }
+  }
 
   return (
     <>
       <div className="tabs settings-tabs">{['数字人配置', '热门问题', '账号管理', '操作日志'].map((item) => <button className={tab === item ? 'active' : ''} type="button" onClick={() => setTab(item)} key={item}>{item}</button>)}</div>
+      {loadError ? <div className="warning-box"><AlertCircle size={18} />真实配置暂不可用：{loadError}</div> : null}
       {tab === '数字人配置' ? (
         <div className="grid-two">
           <Card title="数字人欢迎语配置">
             <label className="field"><span>开场欢迎语</span><textarea value={welcome} onChange={(event) => setWelcome(event.target.value)} /></label>
             <label className="field"><span>兜底话术配置</span><textarea value={fallback} onChange={(event) => setFallback(event.target.value)} /></label>
-            <PrimaryButton onClick={() => setSaved(true)}><Save size={16} />保存配置</PrimaryButton>
+            <PrimaryButton onClick={() => void saveSettings()}><Save size={16} />保存配置</PrimaryButton>
             {saved ? <span className="save-tip">配置已保存，预览已同步更新</span> : null}
+            {settings?.updatedAt ? <p className="soft-note">最近保存：{settings.updatedAt}</p> : null}
           </Card>
           <Card title="配置预览">
             <div className="preview-card"><img src="/assets/muyang.gif" alt="沐阳" /><b>沐阳</b><p>{welcome}</p><small>兜底：{fallback}</small></div>
           </Card>
         </div>
+      ) : tab === '操作日志' ? (
+        <Card title="操作日志">
+          {auditLogs.length ? (
+            <DataTable headers={['时间', '操作', '对象', '操作者', '详情']} rows={auditLogs.map((item) => [item.createdAt, item.action, item.targetType, item.actor, JSON.stringify(item.detail)])} />
+          ) : (
+            <div className="empty-state">暂无后台操作日志。</div>
+          )}
+        </Card>
       ) : (
         <Card title={tab}><div className="empty-state">该模块已按源站样式预留，可继续扩展真实配置项。</div></Card>
       )}
@@ -766,11 +1110,14 @@ function SettingsPage() {
 
 function BigScreenPage() {
   const [category, setCategory] = useState('总榜');
+  const [screen, setScreen] = useState<AdminBigScreenSnapshot | null>(null);
   const now = new Date().toLocaleString('zh-CN', { year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }).replace(/\//g, '/');
   const bigStatIcons = [Users, MessageSquare, Globe2, LayoutDashboard, MapPinned, Target, FileText];
-  const provincePercents = ['12.5%', '6.6%', '5.3%', '5.3%', '4.7%', '4.7%', '4.1%', '4.1%', '4.1%', '3.5%', '3.5%', '3.5%'];
-  const provinceEvaluate = [3302, 1737, 1390, 1390, 1234, 1234, 1078, 1076, 1076, 923, 921, 921];
-  const behaviorData = [
+  const screenMapData = screen?.mapData.length ? screen.mapData : mapData;
+  const provinceTotal = screenMapData.reduce((sum, item) => sum + item.value, 0) || 1;
+  const provincePercents = screenMapData.map((item) => `${(item.value * 100 / provinceTotal).toFixed(1)}%`);
+  const provinceEvaluate = screenMapData.map((item) => Math.max(Math.round(item.value * 0.28), 0));
+  const behaviorData = screen?.behaviorCards.map((item) => [item.label, item.value, item.delta, item.points] as const) ?? [
     ['今日咨询用户', '7,785', '+20.0%', [12, 18, 22, 28, 31, 29, 36]],
     ['今日咨询问答', '32,777', '+20.5%', [18, 21, 25, 29, 34, 33, 39]],
     ['今日志愿测评量', '1,168', '+45.2%', [10, 14, 16, 22, 28, 25, 31]],
@@ -778,6 +1125,28 @@ function BigScreenPage() {
     ['近7天问答', '182,094', '+12.4%', [19, 21, 20, 23, 25, 26, 30]],
     ['近7天志愿测评量', '6,488', '+52.3%', [12, 17, 15, 21, 25, 24, 33]],
   ] as const;
+  const screenStats = screen?.bigStats ?? bigStats;
+  const screenRealtimeMessages = screen?.realtimeMessages ?? realtimeMessages.map(([province, question, answer, time]) => ({ province: String(province), question: String(question), answer: String(answer), time: String(time) }));
+  const screenTopQuestions = screen?.topQuestions.map((item) => [item.question, `${item.count}次`, item.share] as [string, string, string]) ?? bigTopQuestions;
+  const mapMax = Math.max(...screenMapData.map((item) => item.value), 1);
+
+  useEffect(() => {
+    let alive = true;
+    fetchAdminBigScreen()
+      .then((data) => {
+        if (alive) {
+          setScreen(data);
+        }
+      })
+      .catch(() => {
+        if (alive) {
+          setScreen(null);
+        }
+      });
+    return () => {
+      alive = false;
+    };
+  }, []);
 
   const mapOption = {
     animation: false,
@@ -785,7 +1154,7 @@ function BigScreenPage() {
     tooltip: { trigger: 'item' },
     visualMap: {
       min: 0,
-      max: 24000,
+      max: mapMax,
       right: 18,
       bottom: 120,
       text: ['高', '低'],
@@ -803,7 +1172,7 @@ function BigScreenPage() {
       label: { show: false },
       itemStyle: { areaColor: '#2a78d7', borderColor: '#163f8a', borderWidth: 0.8 },
       emphasis: { itemStyle: { areaColor: '#ff9d24' } },
-      data: mapData,
+      data: screenMapData,
     }],
   };
 
@@ -812,10 +1181,10 @@ function BigScreenPage() {
       <header className="big-header">
         <div><b>哈师大招生智能体管理后台</b><span>{now}</span></div>
         <h1>哈尔滨师范大学 · 招生智能体<small>全国生源招生咨询态势总览</small></h1>
-        <p>数据基于用户IP解析省份统计</p>
+        <p>{screen ? `真实咨询数据更新时间：${screen.updatedAt}` : '数据基于用户IP解析省份统计'}</p>
       </header>
       <div className="big-stat-row">
-        {bigStats.map((stat, index) => {
+        {screenStats.map((stat, index) => {
           const Icon = bigStatIcons[index] ?? Target;
           return (
             <div key={stat.label}>
@@ -845,11 +1214,11 @@ function BigScreenPage() {
               <div className="donut"><strong>12</strong><span>省份</span></div>
               <div className="province-table">
                 <div className="province-table-head"><span>省份</span><span>咨询量</span><span>测评量</span></div>
-                <ul>{mapData.map((item, index) => (
+                <ul>{screenMapData.map((item, index) => (
                   <li key={item.name}>
                     <span><i style={{ background: `hsl(212, 95%, ${68 - (index % 5) * 6}%)` }} />{item.name}{['上海', '北京'].includes(item.name) ? '市' : '省'}</span>
-                    <b>{item.value.toLocaleString()} <small>({provincePercents[index]})</small></b>
-                    <em>{provinceEvaluate[index].toLocaleString()} <small>({provincePercents[index]})</small></em>
+                    <b>{item.value.toLocaleString()} <small>({provincePercents[index] ?? '0.0%'})</small></b>
+                    <em>{(provinceEvaluate[index] ?? 0).toLocaleString()} <small>({provincePercents[index] ?? '0.0%'})</small></em>
                   </li>
                 ))}</ul>
                 <div className="province-scrollbar"><span /><b /></div>
@@ -864,10 +1233,10 @@ function BigScreenPage() {
           <BigPanel title="实时咨询动态" action={<span className="live-dot">实时</span>}>
             <div className="live-list">
               <div className="live-track">
-                {[...realtimeMessages, ...realtimeMessages].map(([province, ask, answer, time], index) => (
+                {[...screenRealtimeMessages, ...screenRealtimeMessages].map(({ province, question, answer, time }, index) => (
                   <div key={`${province}-${time}-${index}`}>
                     <b>{province}</b>
-                    <span>{ask}</span>
+                    <span>{question}</span>
                     <em>答：{answer}</em>
                     <time>{time}</time>
                   </div>
@@ -881,10 +1250,10 @@ function BigScreenPage() {
             <div className="big-tabs">{['总榜 (100%)', '院校介绍 (25%)', '分数与位次 (32%)', '招生计划 (18%)', '录取政策 (12%)', '专项与公费师范 (8%)', '就读与就业 (5%)'].map((item) => <button className={category === item.split(' ')[0] ? 'active' : ''} type="button" onClick={() => setCategory(item.split(' ')[0])} key={item}>{item}</button>)}</div>
             <div className="big-insight">
               <b>智能洞察</b>
-              <p>考生咨询集中在三个方面：<mark>一是录取分数线及位次预测</mark>，说明考生对录取难度高度关注；<mark>二是师范类专业选择、就业前景及公费师范政策</mark>，表明教师职业吸引力持续增强；<mark>三是招生专业目录、选科要求和录取规则</mark>，体现考生志愿填报日趋理性。</p>
+              <p>{screen?.insight ?? <>考生咨询集中在三个方面：<mark>一是录取分数线及位次预测</mark>，说明考生对录取难度高度关注；<mark>二是师范类专业选择、就业前景及公费师范政策</mark>，表明教师职业吸引力持续增强；<mark>三是招生专业目录、选科要求和录取规则</mark>，体现考生志愿填报日趋理性。</>}</p>
               <p>高校应重点关注<mark>分数线透明化、师范生就业数据公示、专项计划宣传</mark>等工作。</p>
             </div>
-            <ol className="big-rank">{bigTopQuestions.map(([question, count, delta], index) => <li key={question}><b>{index + 1}</b><span>{question}</span><em>{count}</em><strong className={delta.startsWith('-') ? 'negative' : ''}>{delta}</strong></li>)}</ol>
+            <ol className="big-rank">{screenTopQuestions.map(([question, count, delta], index) => <li key={question}><b>{index + 1}</b><span>{question}</span><em>{count}</em><strong className={delta.startsWith('-') ? 'negative' : ''}>{delta}</strong></li>)}</ol>
           </BigPanel>
         </aside>
       </section>

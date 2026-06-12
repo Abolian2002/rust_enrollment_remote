@@ -378,6 +378,33 @@ pub struct AdminChartDatum {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
+pub struct AdminTopQuestion {
+    pub question: String,
+    pub category: String,
+    pub count: i64,
+    pub share: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminRealtimeMessage {
+    pub province: String,
+    pub question: String,
+    pub answer: String,
+    pub time: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminBehaviorCard {
+    pub label: String,
+    pub value: String,
+    pub delta: String,
+    pub points: Vec<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
 pub struct AdminDashboardSnapshot {
     pub updated_at: String,
     pub stats: Vec<AdminStat>,
@@ -387,6 +414,63 @@ pub struct AdminDashboardSnapshot {
     pub hot_questions: Vec<(String, String)>,
     pub category_stats: Vec<AdminChartDatum>,
     pub province_bars: Vec<(String, i64)>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminInsightsSnapshot {
+    pub updated_at: String,
+    pub stats: Vec<AdminStat>,
+    pub category_stats: Vec<AdminChartDatum>,
+    pub province_bars: Vec<(String, i64)>,
+    pub top_questions: Vec<AdminTopQuestion>,
+    pub word_cloud: Vec<AdminChartDatum>,
+    pub summary: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminSpecialSnapshot {
+    pub updated_at: String,
+    pub stats: Vec<AdminStat>,
+    pub normal_vs_non_normal: Vec<AdminChartDatum>,
+    pub special_plans: Vec<(String, i64, String, String)>,
+    pub major_attention: Vec<(String, i64)>,
+    pub policy_stats: Vec<(String, i64)>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminAdmissionsAnalyticsSnapshot {
+    pub updated_at: String,
+    pub stats: Vec<AdminStat>,
+    pub year_counts: Vec<AdminChartDatum>,
+    pub province_coverage: Vec<(String, i64)>,
+    pub subject_distribution: Vec<AdminChartDatum>,
+    pub top_majors: Vec<(String, i64)>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminKnowledgeCoverageSnapshot {
+    pub updated_at: String,
+    pub stats: Vec<AdminStat>,
+    pub document_kinds: Vec<AdminChartDatum>,
+    pub college_chunks: Vec<(String, i64)>,
+    pub faq_categories: Vec<AdminChartDatum>,
+    pub policy_years: Vec<AdminChartDatum>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminBigScreenSnapshot {
+    pub updated_at: String,
+    pub big_stats: Vec<AdminStat>,
+    pub map_data: Vec<AdminChartDatum>,
+    pub realtime_messages: Vec<AdminRealtimeMessage>,
+    pub top_questions: Vec<AdminTopQuestion>,
+    pub behavior_cards: Vec<AdminBehaviorCard>,
+    pub insight: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -464,6 +548,83 @@ pub struct AdminKnowledgeChunkItem {
 #[serde(rename_all = "camelCase")]
 pub struct AdminKnowledgeChunkList {
     pub items: Vec<AdminKnowledgeChunkItem>,
+    pub total: i64,
+    pub page: i64,
+    pub page_size: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminFeedbackItem {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conversation_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
+    pub feedback_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub handled_by: Option<String>,
+    pub status: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminTicketItem {
+    pub id: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phone: Option<String>,
+    pub province: String,
+    pub content: String,
+    pub status: String,
+    pub priority: String,
+    pub created_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub handled_by: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolution: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminTicketList {
+    pub items: Vec<AdminTicketItem>,
+    pub total: i64,
+    pub page: i64,
+    pub page_size: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminSettings {
+    pub welcome_message: String,
+    pub fallback_message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminAuditLogItem {
+    pub id: String,
+    pub action: String,
+    pub target_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_id: Option<String>,
+    pub actor: String,
+    pub detail: Value,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminAuditLogList {
+    pub items: Vec<AdminAuditLogItem>,
     pub total: i64,
     pub page: i64,
     pub page_size: i64,

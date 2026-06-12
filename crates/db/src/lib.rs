@@ -1,15 +1,20 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use domain::{
-    AdminChartDatum, AdminConversationDetail, AdminConversationList, AdminConversationListItem,
-    AdminDashboardSnapshot, AdminFaqItem, AdminFaqList, AdminKnowledgeChunkItem,
-    AdminKnowledgeChunkList, AdminStat, AdmissionScoreRecord, ChatCitation, ChatStructuredResult,
-    ConversationHistory, ConversationMessage, FaqEvidence, LatestScore, MajorAdmissionProvince,
-    PolicyEvidence, ProvinceAdmissionMajor, ResolvedMemory, ScoreSummary, VectorChunkEvidence,
+    AdminAdmissionsAnalyticsSnapshot, AdminAuditLogItem, AdminAuditLogList, AdminBehaviorCard,
+    AdminBigScreenSnapshot, AdminChartDatum, AdminConversationDetail, AdminConversationList,
+    AdminConversationListItem, AdminDashboardSnapshot, AdminFaqItem, AdminFaqList,
+    AdminFeedbackItem, AdminInsightsSnapshot, AdminKnowledgeChunkItem, AdminKnowledgeChunkList,
+    AdminKnowledgeCoverageSnapshot, AdminRealtimeMessage, AdminSettings, AdminSpecialSnapshot,
+    AdminStat, AdminTicketItem, AdminTicketList, AdminTopQuestion, AdmissionScoreRecord,
+    ChatCitation, ChatStructuredResult, ConversationHistory, ConversationMessage, FaqEvidence,
+    LatestScore, MajorAdmissionProvince, PolicyEvidence, ProvinceAdmissionMajor, ResolvedMemory,
+    ScoreSummary, VectorChunkEvidence,
 };
 use serde_json::Value;
 use sqlx::{PgPool, Row, postgres::PgPoolOptions};
 use std::time::Duration;
+use uuid::Uuid;
 
 #[derive(Clone)]
 pub struct Database {
@@ -273,6 +278,799 @@ impl Database {
         })
     }
 
+    pub async fn admin_insights_snapshot(&self) -> Result<AdminInsightsSnapshot> {
+        let counts = sqlx::query(
+            r#"
+            SELECT
+              (SELECT COUNT(DISTINCT conversation_id)::bigint FROM conversation_messages WHERE role = 'user' AND created_at >= now() - interval '30 days') AS active_users,
+              (SELECT COUNT(*)::bigint FROM conversation_messages WHERE role = 'user' AND created_at >= now() - interval '30 days') AS question_count,
+              (SELECT COUNT(DISTINCT c.province_code)::bigint FROM conversations c WHERE NULLIF(c.province_code, '') IS NOT NULL) AS province_count,
+              (SELECT COUNT(*)::bigint FROM conversation_messages WHERE role = 'user') AS total_questions,
+              to_char(now(), 'YYYY-MM-DD HH24:MI') AS updated_at
+            "#,
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        let active_users = counts.get::<i64, _>("active_users");
+        let question_count = counts.get::<i64, _>("question_count");
+        let province_count = counts.get::<i64, _>("province_count");
+        let total_questions = counts.get::<i64, _>("total_questions").max(1);
+
+        let category_stats = self.admin_question_category_stats().await?;
+        let province_bars = self.admin_province_bars(12).await?;
+        let top_questions = self.admin_top_questions(20, total_questions).await?;
+
+        let word_rows = sqlx::query(
+            r#"
+            WITH keywords(word) AS (
+              VALUES
+                ('录取分数'), ('位次'), ('概率'), ('招生简章'), ('培养方案'), ('专业'),
+                ('课程'), ('公费师范'), ('优师计划'), ('调剂'), ('同分'), ('体检'),
+                ('宿舍'), ('学费'), ('就业'), ('考研'), ('校区'), ('招生电话')
+            )
+            SELECT word, COUNT(m.id)::bigint AS count
+            FROM keywords
+            LEFT JOIN conversation_messages m
+              ON m.role = 'user' AND m.content ILIKE '%' || word || '%'
+            GROUP BY word
+            HAVING COUNT(m.id) > 0
+            ORDER BY count DESC, word
+            LIMIT 24
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let word_cloud = word_rows
+            .into_iter()
+            .map(|row| AdminChartDatum {
+                name: row.get("word"),
+                value: row.get("count"),
+            })
+            .collect::<Vec<_>>();
+
+        Ok(AdminInsightsSnapshot {
+            updated_at: counts.get("updated_at"),
+            stats: vec![
+                AdminStat {
+                    label: "近30天咨询会话".to_owned(),
+                    value: format_number(active_users),
+                    delta: None,
+                    tone: Some("blue".to_owned()),
+                },
+                AdminStat {
+                    label: "近30天用户提问".to_owned(),
+                    value: format_number(question_count),
+                    delta: None,
+                    tone: Some("green".to_owned()),
+                },
+                AdminStat {
+                    label: "覆盖省份".to_owned(),
+                    value: format_number(province_count),
+                    delta: None,
+                    tone: Some("cyan".to_owned()),
+                },
+            ],
+            category_stats,
+            province_bars,
+            top_questions,
+            word_cloud,
+            summary: "统计来自真实对话日志。当前后台按分数位次、录取规则、专业介绍、专项政策和校园生活等通用维度归类，用于发现学生和家长近期最关心的问题。".to_owned(),
+        })
+    }
+
+    pub async fn admin_special_snapshot(&self) -> Result<AdminSpecialSnapshot> {
+        let total_questions = self.admin_total_user_questions().await?.max(1);
+        let updated_at = self.admin_updated_at().await?;
+        let plan_rows = sqlx::query(
+            r#"
+            WITH plans(name, pattern) AS (
+              VALUES
+                ('公费师范生', '%公费师范%'),
+                ('优师计划', '%优师%'),
+                ('振兴龙江计划', '%振兴龙江%'),
+                ('艺术类招生', '%艺术%'),
+                ('师范类专业', '%师范%')
+            )
+            SELECT name, COUNT(m.id)::bigint AS count
+            FROM plans
+            LEFT JOIN conversation_messages m
+              ON m.role = 'user' AND m.content ILIKE pattern
+            GROUP BY name
+            ORDER BY count DESC, name
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let special_plans = plan_rows
+            .iter()
+            .map(|row| {
+                let count = row.get::<i64, _>("count");
+                (
+                    row.get::<String, _>("name"),
+                    count,
+                    format_share(count, total_questions),
+                    "真实咨询".to_owned(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let major_attention = self.admin_major_attention(10).await?;
+        let policy_rows = sqlx::query(
+            r#"
+            WITH policies(name, pattern) AS (
+              VALUES
+                ('投档比例', '%投档%'),
+                ('调剂退档规则', '%调剂%'),
+                ('同分录取规则', '%同分%'),
+                ('单科成绩要求', '%单科%'),
+                ('体检限制专业', '%体检%'),
+                ('加分政策', '%加分%'),
+                ('语种要求', '%语种%')
+            )
+            SELECT name, COUNT(m.id)::bigint AS count
+            FROM policies
+            LEFT JOIN conversation_messages m
+              ON m.role = 'user' AND m.content ILIKE pattern
+            GROUP BY name
+            ORDER BY count DESC, name
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let policy_stats = policy_rows
+            .into_iter()
+            .map(|row| (row.get::<String, _>("name"), row.get::<i64, _>("count")))
+            .collect::<Vec<_>>();
+
+        let normal_rows = sqlx::query(
+            r#"
+            SELECT
+              CASE WHEN m.is_normal_major THEN '师范类' ELSE '非师范类' END AS name,
+              COUNT(DISTINCT cm.id)::bigint AS count
+            FROM majors m
+            JOIN conversation_messages cm
+              ON cm.role = 'user' AND cm.content ILIKE '%' || m.name || '%'
+            GROUP BY m.is_normal_major
+            ORDER BY count DESC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let normal_vs_non_normal = normal_rows
+            .into_iter()
+            .map(|row| AdminChartDatum {
+                name: row.get("name"),
+                value: row.get("count"),
+            })
+            .collect::<Vec<_>>();
+
+        let count_for = |name: &str| -> i64 {
+            special_plans
+                .iter()
+                .find(|(item_name, _, _, _)| item_name == name)
+                .map(|(_, count, _, _)| *count)
+                .unwrap_or(0)
+        };
+
+        Ok(AdminSpecialSnapshot {
+            updated_at,
+            stats: vec![
+                AdminStat {
+                    label: "公费师范咨询量".to_owned(),
+                    value: format_number(count_for("公费师范生")),
+                    delta: None,
+                    tone: Some("blue".to_owned()),
+                },
+                AdminStat {
+                    label: "优师计划咨询量".to_owned(),
+                    value: format_number(count_for("优师计划")),
+                    delta: None,
+                    tone: Some("green".to_owned()),
+                },
+                AdminStat {
+                    label: "振兴龙江专项咨询量".to_owned(),
+                    value: format_number(count_for("振兴龙江计划")),
+                    delta: None,
+                    tone: Some("amber".to_owned()),
+                },
+            ],
+            normal_vs_non_normal,
+            special_plans,
+            major_attention,
+            policy_stats,
+        })
+    }
+
+    pub async fn admin_admissions_analytics_snapshot(
+        &self,
+    ) -> Result<AdminAdmissionsAnalyticsSnapshot> {
+        let counts = sqlx::query(
+            r#"
+            SELECT
+              COUNT(*)::bigint AS score_count,
+              COUNT(DISTINCT province_id)::bigint AS province_count,
+              COUNT(DISTINCT major_id)::bigint AS major_count,
+              MIN(year) AS min_year,
+              MAX(year) AS max_year,
+              to_char(now(), 'YYYY-MM-DD HH24:MI') AS updated_at
+            FROM admission_scores
+            WHERE batch NOT ILIKE '%专升本%'
+              AND batch NOT ILIKE '%单招%'
+              AND batch NOT ILIKE '%预科%'
+            "#,
+        )
+        .fetch_one(&self.pool)
+        .await?;
+
+        let year_rows = sqlx::query(
+            r#"
+            SELECT year::text AS name, COUNT(*)::bigint AS count
+            FROM admission_scores
+            WHERE batch NOT ILIKE '%专升本%'
+              AND batch NOT ILIKE '%单招%'
+              AND batch NOT ILIKE '%预科%'
+            GROUP BY year
+            ORDER BY year
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let year_counts = year_rows
+            .into_iter()
+            .map(|row| AdminChartDatum {
+                name: row.get("name"),
+                value: row.get("count"),
+            })
+            .collect::<Vec<_>>();
+
+        let province_rows = sqlx::query(
+            r#"
+            SELECT p.name, COUNT(DISTINCT s.major_id)::bigint AS count
+            FROM admission_scores s
+            JOIN provinces p ON p.id = s.province_id
+            WHERE s.batch NOT ILIKE '%专升本%'
+              AND s.batch NOT ILIKE '%单招%'
+              AND s.batch NOT ILIKE '%预科%'
+            GROUP BY p.name
+            ORDER BY count DESC, p.name
+            LIMIT 20
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let province_coverage = province_rows
+            .into_iter()
+            .map(|row| (row.get::<String, _>("name"), row.get::<i64, _>("count")))
+            .collect::<Vec<_>>();
+
+        let subject_rows = sqlx::query(
+            r#"
+            SELECT subject_type AS name, COUNT(*)::bigint AS count
+            FROM admission_scores
+            WHERE batch NOT ILIKE '%专升本%'
+              AND batch NOT ILIKE '%单招%'
+              AND batch NOT ILIKE '%预科%'
+            GROUP BY subject_type
+            ORDER BY count DESC, subject_type
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let subject_distribution = subject_rows
+            .into_iter()
+            .map(|row| AdminChartDatum {
+                name: row.get("name"),
+                value: row.get("count"),
+            })
+            .collect::<Vec<_>>();
+
+        let major_rows = sqlx::query(
+            r#"
+            SELECT m.name, COUNT(DISTINCT s.province_id)::bigint AS count
+            FROM admission_scores s
+            JOIN majors m ON m.id = s.major_id
+            WHERE s.batch NOT ILIKE '%专升本%'
+              AND s.batch NOT ILIKE '%单招%'
+              AND s.batch NOT ILIKE '%预科%'
+            GROUP BY m.name
+            ORDER BY count DESC, m.name
+            LIMIT 15
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let top_majors = major_rows
+            .into_iter()
+            .map(|row| (row.get::<String, _>("name"), row.get::<i64, _>("count")))
+            .collect::<Vec<_>>();
+
+        let min_year = counts.try_get::<Option<i32>, _>("min_year").ok().flatten();
+        let max_year = counts.try_get::<Option<i32>, _>("max_year").ok().flatten();
+        let year_label = match min_year.zip(max_year) {
+            Some((min_year, max_year)) if min_year != max_year => format!("{min_year}-{max_year}"),
+            Some((year, _)) => year.to_string(),
+            None => "暂无".to_owned(),
+        };
+
+        Ok(AdminAdmissionsAnalyticsSnapshot {
+            updated_at: counts.get("updated_at"),
+            stats: vec![
+                AdminStat {
+                    label: "录取统计记录".to_owned(),
+                    value: format_number(counts.get("score_count")),
+                    delta: Some(year_label),
+                    tone: Some("blue".to_owned()),
+                },
+                AdminStat {
+                    label: "覆盖省份".to_owned(),
+                    value: format_number(counts.get("province_count")),
+                    delta: None,
+                    tone: Some("green".to_owned()),
+                },
+                AdminStat {
+                    label: "覆盖专业".to_owned(),
+                    value: format_number(counts.get("major_count")),
+                    delta: None,
+                    tone: Some("cyan".to_owned()),
+                },
+            ],
+            year_counts,
+            province_coverage,
+            subject_distribution,
+            top_majors,
+        })
+    }
+
+    pub async fn admin_knowledge_coverage_snapshot(&self) -> Result<AdminKnowledgeCoverageSnapshot> {
+        let counts = sqlx::query(
+            r#"
+            SELECT
+              (SELECT COUNT(*)::bigint FROM faq_knowledge WHERE status = 'PUBLISHED') AS faq_count,
+              (SELECT COUNT(*)::bigint FROM policy_documents WHERE status::text = 'ACTIVE') AS policy_count,
+              (SELECT COUNT(*)::bigint FROM knowledge_chunks WHERE data_version = 'official-pdf-knowledge-v2') AS chunk_count,
+              (SELECT COUNT(DISTINCT metadata->>'college')::bigint FROM knowledge_chunks WHERE data_version = 'official-pdf-knowledge-v2' AND NULLIF(metadata->>'college', '') IS NOT NULL) AS college_count,
+              to_char(now(), 'YYYY-MM-DD HH24:MI') AS updated_at
+            "#,
+        )
+        .fetch_one(&self.pool)
+        .await?;
+
+        let kind_rows = sqlx::query(
+            r#"
+            SELECT COALESCE(NULLIF(metadata->>'documentKind', ''), source_type::text) AS name, COUNT(*)::bigint AS count
+            FROM knowledge_chunks
+            WHERE data_version = 'official-pdf-knowledge-v2'
+            GROUP BY COALESCE(NULLIF(metadata->>'documentKind', ''), source_type::text)
+            ORDER BY count DESC, name
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let document_kinds = kind_rows
+            .into_iter()
+            .map(|row| AdminChartDatum {
+                name: row.get("name"),
+                value: row.get("count"),
+            })
+            .collect::<Vec<_>>();
+
+        let college_rows = sqlx::query(
+            r#"
+            SELECT metadata->>'college' AS name, COUNT(*)::bigint AS count
+            FROM knowledge_chunks
+            WHERE data_version = 'official-pdf-knowledge-v2'
+              AND NULLIF(metadata->>'college', '') IS NOT NULL
+            GROUP BY metadata->>'college'
+            ORDER BY count DESC, name
+            LIMIT 20
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let college_chunks = college_rows
+            .into_iter()
+            .map(|row| (row.get::<String, _>("name"), row.get::<i64, _>("count")))
+            .collect::<Vec<_>>();
+
+        let faq_rows = sqlx::query(
+            r#"
+            SELECT category AS name, COUNT(*)::bigint AS count
+            FROM faq_knowledge
+            WHERE status = 'PUBLISHED'
+            GROUP BY category
+            ORDER BY count DESC, category
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let faq_categories = faq_rows
+            .into_iter()
+            .map(|row| AdminChartDatum {
+                name: row.get("name"),
+                value: row.get("count"),
+            })
+            .collect::<Vec<_>>();
+
+        let policy_rows = sqlx::query(
+            r#"
+            SELECT COALESCE(year::text, '未标注') AS name, COUNT(*)::bigint AS count
+            FROM policy_documents
+            WHERE status::text = 'ACTIVE'
+            GROUP BY COALESCE(year::text, '未标注')
+            ORDER BY name DESC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let policy_years = policy_rows
+            .into_iter()
+            .map(|row| AdminChartDatum {
+                name: row.get("name"),
+                value: row.get("count"),
+            })
+            .collect::<Vec<_>>();
+
+        Ok(AdminKnowledgeCoverageSnapshot {
+            updated_at: counts.get("updated_at"),
+            stats: vec![
+                AdminStat {
+                    label: "固定 FAQ".to_owned(),
+                    value: format_number(counts.get("faq_count")),
+                    delta: None,
+                    tone: Some("green".to_owned()),
+                },
+                AdminStat {
+                    label: "政策文档".to_owned(),
+                    value: format_number(counts.get("policy_count")),
+                    delta: None,
+                    tone: Some("blue".to_owned()),
+                },
+                AdminStat {
+                    label: "PDF/FAQ 向量片段".to_owned(),
+                    value: format_number(counts.get("chunk_count")),
+                    delta: None,
+                    tone: Some("cyan".to_owned()),
+                },
+                AdminStat {
+                    label: "培养方案覆盖学院".to_owned(),
+                    value: format_number(counts.get("college_count")),
+                    delta: None,
+                    tone: Some("purple".to_owned()),
+                },
+            ],
+            document_kinds,
+            college_chunks,
+            faq_categories,
+            policy_years,
+        })
+    }
+
+    pub async fn admin_big_screen_snapshot(&self) -> Result<AdminBigScreenSnapshot> {
+        let updated_at = self.admin_updated_at().await?;
+        let total_questions = self.admin_total_user_questions().await?.max(1);
+        let today_questions = self.admin_user_question_count("current_date", "now()").await?;
+        let today_users = self.admin_distinct_conversation_count("current_date", "now()").await?;
+        let week_questions = self
+            .admin_user_question_count("current_date - interval '6 days'", "now()")
+            .await?;
+        let week_users = self
+            .admin_distinct_conversation_count("current_date - interval '6 days'", "now()")
+            .await?;
+        let faq_count = sqlx::query("SELECT COUNT(*)::bigint AS count FROM faq_knowledge WHERE status = 'PUBLISHED'")
+            .fetch_one(&self.pool)
+            .await?
+            .get::<i64, _>("count");
+        let chunk_count = sqlx::query("SELECT COUNT(*)::bigint AS count FROM knowledge_chunks WHERE data_version = 'official-pdf-knowledge-v2'")
+            .fetch_one(&self.pool)
+            .await?
+            .get::<i64, _>("count");
+
+        let map_data = self
+            .admin_province_bars(34)
+            .await?
+            .into_iter()
+            .map(|(name, value)| AdminChartDatum { name, value })
+            .collect::<Vec<_>>();
+
+        let realtime_rows = sqlx::query(
+            r#"
+            SELECT
+              COALESCE(p.name, NULLIF(c.province_code, ''), '未知') AS province,
+              left(regexp_replace(trim(m.content), '\s+', ' ', 'g'), 70) AS question,
+              COALESCE((
+                SELECT left(regexp_replace(trim(a.content), '\s+', ' ', 'g'), 80)
+                FROM conversation_messages a
+                WHERE a.conversation_id = m.conversation_id
+                  AND a.role = 'assistant'
+                  AND a.created_at >= m.created_at
+                ORDER BY a.created_at ASC
+                LIMIT 1
+              ), '已回复') AS answer,
+              to_char(m.created_at, 'HH24:MI') AS time
+            FROM conversation_messages m
+            JOIN conversations c ON c.id = m.conversation_id
+            LEFT JOIN provinces p ON p.code = c.province_code OR p.name = c.province_code
+            WHERE m.role = 'user'
+              AND trim(m.content) <> ''
+            ORDER BY m.created_at DESC
+            LIMIT 12
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let realtime_messages = realtime_rows
+            .into_iter()
+            .map(|row| AdminRealtimeMessage {
+                province: row.get("province"),
+                question: row.get("question"),
+                answer: row.get("answer"),
+                time: row.get("time"),
+            })
+            .collect::<Vec<_>>();
+
+        let day_points = self.admin_recent_user_question_points(7).await?;
+        let top_questions = self.admin_top_questions(10, total_questions).await?;
+
+        Ok(AdminBigScreenSnapshot {
+            updated_at,
+            big_stats: vec![
+                AdminStat {
+                    label: "今日咨询用户".to_owned(),
+                    value: format_number(today_users),
+                    delta: None,
+                    tone: Some("blue".to_owned()),
+                },
+                AdminStat {
+                    label: "今日咨询问答".to_owned(),
+                    value: format_number(today_questions),
+                    delta: None,
+                    tone: Some("green".to_owned()),
+                },
+                AdminStat {
+                    label: "近7天用户".to_owned(),
+                    value: format_number(week_users),
+                    delta: None,
+                    tone: Some("cyan".to_owned()),
+                },
+                AdminStat {
+                    label: "近7天问答".to_owned(),
+                    value: format_number(week_questions),
+                    delta: None,
+                    tone: Some("purple".to_owned()),
+                },
+                AdminStat {
+                    label: "FAQ".to_owned(),
+                    value: format_number(faq_count),
+                    delta: None,
+                    tone: Some("amber".to_owned()),
+                },
+                AdminStat {
+                    label: "文档片段".to_owned(),
+                    value: format_number(chunk_count),
+                    delta: None,
+                    tone: Some("green".to_owned()),
+                },
+            ],
+            map_data,
+            realtime_messages,
+            top_questions,
+            behavior_cards: vec![
+                AdminBehaviorCard {
+                    label: "今日咨询用户".to_owned(),
+                    value: format_number(today_users),
+                    delta: "+0.0%".to_owned(),
+                    points: day_points.clone(),
+                },
+                AdminBehaviorCard {
+                    label: "今日咨询问答".to_owned(),
+                    value: format_number(today_questions),
+                    delta: "+0.0%".to_owned(),
+                    points: day_points.clone(),
+                },
+                AdminBehaviorCard {
+                    label: "近7天用户".to_owned(),
+                    value: format_number(week_users),
+                    delta: "+0.0%".to_owned(),
+                    points: day_points.clone(),
+                },
+                AdminBehaviorCard {
+                    label: "近7天问答".to_owned(),
+                    value: format_number(week_questions),
+                    delta: "+0.0%".to_owned(),
+                    points: day_points,
+                },
+            ],
+            insight: "大屏数据来自真实咨询日志、FAQ 和文档知识库。当前咨询主要围绕录取分数、专业选择、录取政策、专项计划和校园生活展开。".to_owned(),
+        })
+    }
+
+    async fn admin_updated_at(&self) -> Result<String> {
+        Ok(sqlx::query("SELECT to_char(now(), 'YYYY-MM-DD HH24:MI') AS updated_at")
+            .fetch_one(&self.pool)
+            .await?
+            .get("updated_at"))
+    }
+
+    async fn admin_total_user_questions(&self) -> Result<i64> {
+        Ok(sqlx::query(
+            "SELECT COUNT(*)::bigint AS count FROM conversation_messages WHERE role = 'user'",
+        )
+        .fetch_one(&self.pool)
+        .await?
+        .get("count"))
+    }
+
+    async fn admin_question_category_stats(&self) -> Result<Vec<AdminChartDatum>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT category, COUNT(*)::bigint AS count
+            FROM (
+              SELECT CASE
+                WHEN content ILIKE '%分数%' OR content ILIKE '%录取线%' OR content ILIKE '%位次%' OR content ILIKE '%概率%' OR content ILIKE '%多少分%' THEN '分数位次'
+                WHEN content ILIKE '%调剂%' OR content ILIKE '%同分%' OR content ILIKE '%录取规则%' OR content ILIKE '%投档%' OR content ILIKE '%体检%' OR content ILIKE '%语种%' THEN '录取规则'
+                WHEN content ILIKE '%专业%' OR content ILIKE '%课程%' OR content ILIKE '%培养方案%' OR content ILIKE '%学院%' THEN '专业介绍'
+                WHEN content ILIKE '%公费师范%' OR content ILIKE '%免费师范%' THEN '公费师范'
+                WHEN content ILIKE '%优师%' OR content ILIKE '%振兴龙江%' OR content ILIKE '%专项%' THEN '专项计划'
+                WHEN content ILIKE '%宿舍%' OR content ILIKE '%食堂%' OR content ILIKE '%校区%' OR content ILIKE '%学费%' OR content ILIKE '%奖学金%' THEN '校园生活'
+                ELSE '其他'
+              END AS category
+              FROM conversation_messages
+              WHERE role = 'user'
+            ) categorized
+            GROUP BY category
+            ORDER BY count DESC, category
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| AdminChartDatum {
+                name: row.get("category"),
+                value: row.get("count"),
+            })
+            .collect())
+    }
+
+    async fn admin_province_bars(&self, limit: i64) -> Result<Vec<(String, i64)>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT
+              COALESCE(p.name, NULLIF(c.province_code, ''), '未知') AS province,
+              COUNT(*)::bigint AS count
+            FROM conversations c
+            LEFT JOIN provinces p ON p.code = c.province_code OR p.name = c.province_code
+            GROUP BY COALESCE(p.name, NULLIF(c.province_code, ''), '未知')
+            ORDER BY count DESC, province
+            LIMIT $1
+            "#,
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| (row.get::<String, _>("province"), row.get::<i64, _>("count")))
+            .collect())
+    }
+
+    async fn admin_top_questions(
+        &self,
+        limit: i64,
+        total_questions: i64,
+    ) -> Result<Vec<AdminTopQuestion>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT
+              question,
+              CASE
+                WHEN question ILIKE '%分数%' OR question ILIKE '%录取线%' OR question ILIKE '%位次%' OR question ILIKE '%概率%' OR question ILIKE '%多少分%' THEN '分数位次'
+                WHEN question ILIKE '%调剂%' OR question ILIKE '%同分%' OR question ILIKE '%录取规则%' OR question ILIKE '%投档%' OR question ILIKE '%体检%' OR question ILIKE '%语种%' THEN '录取规则'
+                WHEN question ILIKE '%专业%' OR question ILIKE '%课程%' OR question ILIKE '%培养方案%' OR question ILIKE '%学院%' THEN '专业介绍'
+                WHEN question ILIKE '%公费师范%' OR question ILIKE '%免费师范%' THEN '公费师范'
+                WHEN question ILIKE '%优师%' OR question ILIKE '%振兴龙江%' OR question ILIKE '%专项%' THEN '专项计划'
+                WHEN question ILIKE '%宿舍%' OR question ILIKE '%食堂%' OR question ILIKE '%校区%' OR question ILIKE '%学费%' OR question ILIKE '%奖学金%' THEN '校园生活'
+                ELSE '其他'
+              END AS category,
+              count
+            FROM (
+              SELECT
+                left(regexp_replace(trim(content), '\s+', ' ', 'g'), 80) AS question,
+                COUNT(*)::bigint AS count,
+                max(created_at) AS latest_at
+              FROM conversation_messages
+              WHERE role = 'user'
+                AND trim(content) <> ''
+              GROUP BY left(regexp_replace(trim(content), '\s+', ' ', 'g'), 80)
+            ) grouped
+            ORDER BY count DESC, latest_at DESC
+            LIMIT $1
+            "#,
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                let count = row.get::<i64, _>("count");
+                AdminTopQuestion {
+                    question: row.get("question"),
+                    category: row.get("category"),
+                    count,
+                    share: format_share(count, total_questions.max(1)),
+                }
+            })
+            .collect())
+    }
+
+    async fn admin_major_attention(&self, limit: i64) -> Result<Vec<(String, i64)>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT m.name, COUNT(DISTINCT cm.id)::bigint AS count
+            FROM majors m
+            JOIN conversation_messages cm
+              ON cm.role = 'user' AND cm.content ILIKE '%' || m.name || '%'
+            GROUP BY m.name
+            ORDER BY count DESC, m.name
+            LIMIT $1
+            "#,
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| (row.get::<String, _>("name"), row.get::<i64, _>("count")))
+            .collect())
+    }
+
+    async fn admin_user_question_count(&self, start_sql: &str, end_sql: &str) -> Result<i64> {
+        let sql = format!(
+            "SELECT COUNT(*)::bigint AS count FROM conversation_messages WHERE role = 'user' AND created_at >= {start_sql} AND created_at < {end_sql}"
+        );
+        Ok(sqlx::query(&sql)
+            .fetch_one(&self.pool)
+            .await?
+            .get("count"))
+    }
+
+    async fn admin_distinct_conversation_count(&self, start_sql: &str, end_sql: &str) -> Result<i64> {
+        let sql = format!(
+            "SELECT COUNT(DISTINCT conversation_id)::bigint AS count FROM conversation_messages WHERE role = 'user' AND created_at >= {start_sql} AND created_at < {end_sql}"
+        );
+        Ok(sqlx::query(&sql)
+            .fetch_one(&self.pool)
+            .await?
+            .get("count"))
+    }
+
+    async fn admin_recent_user_question_points(&self, days: i64) -> Result<Vec<i64>> {
+        let days = days.clamp(1, 30);
+        let rows = sqlx::query(
+            r#"
+            SELECT
+              day,
+              COALESCE(COUNT(m.id), 0)::bigint AS value
+            FROM generate_series(current_date - (($1::int - 1) * interval '1 day'), current_date, interval '1 day') AS day
+            LEFT JOIN conversation_messages m
+              ON m.role = 'user'
+             AND m.created_at >= day
+             AND m.created_at < day + interval '1 day'
+            GROUP BY day
+            ORDER BY day
+            "#,
+        )
+        .bind(days as i32)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|row| row.get("value")).collect())
+    }
+
     pub async fn admin_list_conversations(
         &self,
         query: &str,
@@ -469,6 +1267,152 @@ impl Database {
         })
     }
 
+    pub async fn admin_create_faq(
+        &self,
+        question: &str,
+        answer: &str,
+        category: &str,
+        tags: Vec<String>,
+        status: &str,
+        source_label: &str,
+    ) -> Result<AdminFaqItem> {
+        let id = format!("faq_admin_{}", Uuid::new_v4().simple());
+        let status = normalize_faq_status(status);
+        let tags = serde_json::Value::Array(
+            tags.into_iter()
+                .filter_map(|tag| {
+                    let tag = tag.trim().to_owned();
+                    (!tag.is_empty()).then_some(serde_json::Value::String(tag))
+                })
+                .collect(),
+        );
+        let row = sqlx::query(
+            r#"
+            INSERT INTO faq_knowledge
+              (id, question, answer, category, tags, status, source_label, data_version, created_at, updated_at)
+            VALUES
+              ($1, $2, $3, $4, $5, $6::"FaqStatus", $7, 'admin-faq-v1', now(), now())
+            RETURNING
+              id,
+              question,
+              answer,
+              category,
+              source_label,
+              CASE WHEN status::text = 'PUBLISHED' THEN '启用' ELSE '禁用' END AS status,
+              to_char(updated_at, 'YYYY-MM-DD') AS updated_at,
+              COALESCE(
+                (
+                  SELECT string_agg(value, '|')
+                  FROM jsonb_array_elements_text(COALESCE(tags, '[]'::jsonb)) AS value
+                ),
+                ''
+              ) AS similar,
+              0::bigint AS hits
+            "#,
+        )
+        .bind(&id)
+        .bind(question.trim())
+        .bind(answer.trim())
+        .bind(category.trim())
+        .bind(tags)
+        .bind(status)
+        .bind(source_label.trim())
+        .fetch_one(&self.pool)
+        .await?;
+
+        self.admin_insert_audit_log(
+            "create_faq",
+            "faq_knowledge",
+            Some(&id),
+            "admin",
+            serde_json::json!({ "status": status, "category": category }),
+        )
+        .await
+        .ok();
+
+        Ok(admin_faq_from_row(row))
+    }
+
+    pub async fn admin_update_faq(
+        &self,
+        id: &str,
+        question: Option<&str>,
+        answer: Option<&str>,
+        category: Option<&str>,
+        tags: Option<Vec<String>>,
+        status: Option<&str>,
+        source_label: Option<&str>,
+    ) -> Result<Option<AdminFaqItem>> {
+        let tags_value = tags.map(|tags| {
+            serde_json::Value::Array(
+                tags.into_iter()
+                    .filter_map(|tag| {
+                        let tag = tag.trim().to_owned();
+                        (!tag.is_empty()).then_some(serde_json::Value::String(tag))
+                    })
+                    .collect(),
+            )
+        });
+        let status = status.map(normalize_faq_status);
+        let row = sqlx::query(
+            r#"
+            UPDATE faq_knowledge
+            SET
+              question = COALESCE(NULLIF($2, ''), question),
+              answer = COALESCE(NULLIF($3, ''), answer),
+              category = COALESCE(NULLIF($4, ''), category),
+              tags = COALESCE($5, tags),
+              status = COALESCE($6::"FaqStatus", status),
+              source_label = COALESCE(NULLIF($7, ''), source_label),
+              updated_at = now()
+            WHERE id = $1
+            RETURNING
+              id,
+              question,
+              answer,
+              category,
+              source_label,
+              CASE WHEN status::text = 'PUBLISHED' THEN '启用' ELSE '禁用' END AS status,
+              to_char(updated_at, 'YYYY-MM-DD') AS updated_at,
+              COALESCE(
+                (
+                  SELECT string_agg(value, '|')
+                  FROM jsonb_array_elements_text(COALESCE(tags, '[]'::jsonb)) AS value
+                ),
+                ''
+              ) AS similar,
+              (
+                SELECT COUNT(kc.id)::bigint
+                FROM knowledge_chunks kc
+                WHERE kc.faq_knowledge_id = faq_knowledge.id
+              ) AS hits
+            "#,
+        )
+        .bind(id)
+        .bind(question.map(str::trim))
+        .bind(answer.map(str::trim))
+        .bind(category.map(str::trim))
+        .bind(tags_value)
+        .bind(status)
+        .bind(source_label.map(str::trim))
+        .fetch_optional(&self.pool)
+        .await?;
+
+        if row.is_some() {
+            self.admin_insert_audit_log(
+                "update_faq",
+                "faq_knowledge",
+                Some(id),
+                "admin",
+                serde_json::json!({ "status": status }),
+            )
+            .await
+            .ok();
+        }
+
+        Ok(row.map(admin_faq_from_row))
+    }
+
     pub async fn admin_list_knowledge_chunks(
         &self,
         query: &str,
@@ -543,6 +1487,406 @@ impl Database {
             page,
             page_size,
         })
+    }
+
+    pub async fn admin_create_feedback(
+        &self,
+        conversation_id: Option<&str>,
+        message_id: Option<&str>,
+        feedback_type: &str,
+        comment: Option<&str>,
+        handled_by: Option<&str>,
+        status: &str,
+    ) -> Result<AdminFeedbackItem> {
+        let feedback_type = normalize_feedback_type(feedback_type);
+        let status = normalize_feedback_status(status);
+        let id = format!("fb_{}", Uuid::new_v4().simple());
+        let actor = handled_by
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("admin");
+        let handled_by_db = match handled_by.map(str::trim).filter(|value| !value.is_empty()) {
+            Some(candidate) => {
+                let exists = sqlx::query(
+                    "SELECT EXISTS(SELECT 1 FROM admin_users WHERE id = $1) AS exists",
+                )
+                .bind(candidate)
+                .fetch_one(&self.pool)
+                .await?
+                .get::<bool, _>("exists");
+                exists.then_some(candidate)
+            }
+            None => None,
+        };
+        let row = sqlx::query(
+            r#"
+            INSERT INTO feedback_records
+              (id, conversation_id, message_id, feedback_type, comment, handled_by, status)
+            VALUES
+              ($1, $2, $3, $4::"FeedbackType", $5, $6, $7::"FeedbackStatus")
+            RETURNING
+              id,
+              conversation_id,
+              message_id,
+              feedback_type::text AS feedback_type,
+              comment,
+              handled_by,
+              status::text AS status,
+              to_char(created_at, 'YYYY-MM-DD HH24:MI') AS created_at
+            "#,
+        )
+        .bind(&id)
+        .bind(conversation_id)
+        .bind(message_id)
+        .bind(feedback_type)
+        .bind(comment)
+        .bind(handled_by_db)
+        .bind(status)
+        .fetch_one(&self.pool)
+        .await?;
+
+        self.admin_insert_audit_log(
+            "create_feedback",
+            "feedback_records",
+            Some(&id),
+            actor,
+            serde_json::json!({
+                "conversationId": conversation_id,
+                "feedbackType": feedback_type,
+                "status": status
+            }),
+        )
+        .await
+        .ok();
+
+        Ok(AdminFeedbackItem {
+            id: row.get("id"),
+            conversation_id: row.try_get("conversation_id").ok(),
+            message_id: row.try_get("message_id").ok(),
+            feedback_type: feedback_type_to_frontend(row.get::<String, _>("feedback_type")),
+            comment: row.try_get("comment").ok(),
+            handled_by: row.try_get("handled_by").ok(),
+            status: feedback_status_to_frontend(row.get::<String, _>("status")),
+            created_at: row.get("created_at"),
+        })
+    }
+
+    pub async fn admin_list_tickets(
+        &self,
+        query: &str,
+        status: Option<&str>,
+        page: i64,
+        page_size: i64,
+    ) -> Result<AdminTicketList> {
+        self.ensure_admin_ops_schema().await?;
+        let page = page.max(1);
+        let page_size = page_size.clamp(1, 100);
+        let offset = (page - 1) * page_size;
+        let pattern = format!("%{}%", query.trim());
+        let status = status
+            .map(normalize_ticket_status)
+            .filter(|value| value != "all");
+
+        let total = sqlx::query(
+            r#"
+            SELECT COUNT(*)::bigint AS total
+            FROM admin_tickets
+            WHERE ($1 = '%%' OR id ILIKE $1 OR name ILIKE $1 OR phone ILIKE $1 OR province ILIKE $1 OR content ILIKE $1)
+              AND ($2::text IS NULL OR status = $2)
+            "#,
+        )
+        .bind(&pattern)
+        .bind(status.as_deref())
+        .fetch_one(&self.pool)
+        .await?
+        .get("total");
+
+        let rows = sqlx::query(
+            r#"
+            SELECT
+              id,
+              name,
+              phone,
+              province,
+              content,
+              status,
+              priority,
+              to_char(created_at, 'YYYY-MM-DD HH24:MI') AS created_at,
+              to_char(updated_at, 'YYYY-MM-DD HH24:MI') AS updated_at,
+              handled_by,
+              resolution
+            FROM admin_tickets
+            WHERE ($1 = '%%' OR id ILIKE $1 OR name ILIKE $1 OR phone ILIKE $1 OR province ILIKE $1 OR content ILIKE $1)
+              AND ($2::text IS NULL OR status = $2)
+            ORDER BY
+              CASE priority WHEN '高' THEN 0 WHEN '中' THEN 1 ELSE 2 END,
+              CASE status WHEN '待处理' THEN 0 WHEN '处理中' THEN 1 WHEN '已办结' THEN 2 ELSE 3 END,
+              created_at DESC
+            LIMIT $3 OFFSET $4
+            "#,
+        )
+        .bind(&pattern)
+        .bind(status.as_deref())
+        .bind(page_size)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(AdminTicketList {
+            items: rows.into_iter().map(admin_ticket_from_row).collect(),
+            total,
+            page,
+            page_size,
+        })
+    }
+
+    pub async fn admin_update_ticket(
+        &self,
+        ticket_id: &str,
+        status: Option<&str>,
+        resolution: Option<&str>,
+        handled_by: Option<&str>,
+    ) -> Result<Option<AdminTicketItem>> {
+        self.ensure_admin_ops_schema().await?;
+        let status = status.map(normalize_ticket_status);
+        let row = sqlx::query(
+            r#"
+            UPDATE admin_tickets
+            SET
+              status = COALESCE($2, status),
+              resolution = COALESCE($3, resolution),
+              handled_by = COALESCE($4, handled_by),
+              updated_at = now()
+            WHERE id = $1
+            RETURNING
+              id,
+              name,
+              phone,
+              province,
+              content,
+              status,
+              priority,
+              to_char(created_at, 'YYYY-MM-DD HH24:MI') AS created_at,
+              to_char(updated_at, 'YYYY-MM-DD HH24:MI') AS updated_at,
+              handled_by,
+              resolution
+            "#,
+        )
+        .bind(ticket_id)
+        .bind(status.as_deref())
+        .bind(resolution)
+        .bind(handled_by)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        if let Some(status) = status.as_deref() {
+            self.admin_insert_audit_log(
+                "update_ticket",
+                "admin_tickets",
+                Some(ticket_id),
+                handled_by.unwrap_or("admin"),
+                serde_json::json!({ "status": status }),
+            )
+            .await
+            .ok();
+        }
+
+        Ok(row.map(admin_ticket_from_row))
+    }
+
+    pub async fn admin_get_settings(&self) -> Result<AdminSettings> {
+        self.ensure_admin_ops_schema().await?;
+        let rows = sqlx::query(
+            r#"
+            SELECT key, value, to_char(updated_at, 'YYYY-MM-DD HH24:MI') AS updated_at
+            FROM admin_settings
+            WHERE key IN ('welcome_message', 'fallback_message')
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut settings = default_admin_settings();
+        for row in rows {
+            let key = row.get::<String, _>("key");
+            let value = row.get::<String, _>("value");
+            let updated_at = row.try_get::<String, _>("updated_at").ok();
+            match key.as_str() {
+                "welcome_message" => settings.welcome_message = value,
+                "fallback_message" => settings.fallback_message = value,
+                _ => {}
+            }
+            settings.updated_at = updated_at.or(settings.updated_at);
+        }
+        Ok(settings)
+    }
+
+    pub async fn admin_update_settings(
+        &self,
+        welcome_message: &str,
+        fallback_message: &str,
+        updated_by: Option<&str>,
+    ) -> Result<AdminSettings> {
+        self.ensure_admin_ops_schema().await?;
+        let actor = updated_by.unwrap_or("admin");
+        for (key, value) in [
+            ("welcome_message", welcome_message.trim()),
+            ("fallback_message", fallback_message.trim()),
+        ] {
+            sqlx::query(
+                r#"
+                INSERT INTO admin_settings (key, value, updated_by, updated_at)
+                VALUES ($1, $2, $3, now())
+                ON CONFLICT (key)
+                DO UPDATE SET value = EXCLUDED.value, updated_by = EXCLUDED.updated_by, updated_at = now()
+                "#,
+            )
+            .bind(key)
+            .bind(value)
+            .bind(actor)
+            .execute(&self.pool)
+            .await?;
+        }
+
+        self.admin_insert_audit_log(
+            "update_settings",
+            "admin_settings",
+            None,
+            actor,
+            serde_json::json!({ "keys": ["welcome_message", "fallback_message"] }),
+        )
+        .await
+        .ok();
+
+        self.admin_get_settings().await
+    }
+
+    pub async fn admin_list_audit_logs(
+        &self,
+        page: i64,
+        page_size: i64,
+    ) -> Result<AdminAuditLogList> {
+        self.ensure_admin_ops_schema().await?;
+        let page = page.max(1);
+        let page_size = page_size.clamp(1, 100);
+        let offset = (page - 1) * page_size;
+        let total = sqlx::query("SELECT COUNT(*)::bigint AS total FROM admin_audit_logs")
+            .fetch_one(&self.pool)
+            .await?
+            .get("total");
+        let rows = sqlx::query(
+            r#"
+            SELECT
+              id,
+              action,
+              target_type,
+              target_id,
+              actor,
+              detail,
+              to_char(created_at, 'YYYY-MM-DD HH24:MI') AS created_at
+            FROM admin_audit_logs
+            ORDER BY created_at DESC
+            LIMIT $1 OFFSET $2
+            "#,
+        )
+        .bind(page_size)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(AdminAuditLogList {
+            items: rows
+                .into_iter()
+                .map(|row| AdminAuditLogItem {
+                    id: row.get("id"),
+                    action: row.get("action"),
+                    target_type: row.get("target_type"),
+                    target_id: row.try_get("target_id").ok(),
+                    actor: row.get("actor"),
+                    detail: row.get("detail"),
+                    created_at: row.get("created_at"),
+                })
+                .collect(),
+            total,
+            page,
+            page_size,
+        })
+    }
+
+    async fn ensure_admin_ops_schema(&self) -> Result<()> {
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS admin_tickets (
+              id text PRIMARY KEY,
+              name text NOT NULL DEFAULT '匿名用户',
+              phone text,
+              province text NOT NULL DEFAULT '未知',
+              content text NOT NULL,
+              status text NOT NULL DEFAULT '待处理',
+              priority text NOT NULL DEFAULT '中',
+              handled_by text,
+              resolution text,
+              created_at timestamp without time zone NOT NULL DEFAULT now(),
+              updated_at timestamp without time zone NOT NULL DEFAULT now()
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS admin_settings (
+              key text PRIMARY KEY,
+              value text NOT NULL,
+              updated_by text,
+              updated_at timestamp without time zone NOT NULL DEFAULT now()
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS admin_audit_logs (
+              id text PRIMARY KEY,
+              action text NOT NULL,
+              target_type text NOT NULL,
+              target_id text,
+              actor text NOT NULL DEFAULT 'admin',
+              detail jsonb NOT NULL DEFAULT '{}'::jsonb,
+              created_at timestamp without time zone NOT NULL DEFAULT now()
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn admin_insert_audit_log(
+        &self,
+        action: &str,
+        target_type: &str,
+        target_id: Option<&str>,
+        actor: &str,
+        detail: Value,
+    ) -> Result<()> {
+        self.ensure_admin_ops_schema().await?;
+        sqlx::query(
+            r#"
+            INSERT INTO admin_audit_logs (id, action, target_type, target_id, actor, detail)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            "#,
+        )
+        .bind(format!("audit_{}", Uuid::new_v4().simple()))
+        .bind(action)
+        .bind(target_type)
+        .bind(target_id)
+        .bind(actor)
+        .bind(detail)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     pub async fn resolve_province(&self, value: &str) -> Result<Option<ProvinceRecord>> {
@@ -1461,6 +2805,100 @@ fn format_number(value: i64) -> String {
         result.insert(0, '-');
     }
     result
+}
+
+fn format_share(count: i64, total: i64) -> String {
+    if total <= 0 {
+        return "0.0%".to_owned();
+    }
+    format!("{:.1}%", count as f64 * 100.0 / total as f64)
+}
+
+fn normalize_feedback_type(value: &str) -> &'static str {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "helpful" | "有帮助" => "HELPFUL",
+        "manual-fix" | "manual_fix" | "manualfix" | "人工纠错" => "MANUAL_FIX",
+        _ => "INCORRECT",
+    }
+}
+
+fn normalize_faq_status(value: &str) -> &'static str {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "published" | "publish" | "启用" | "已发布" => "PUBLISHED",
+        _ => "DRAFT",
+    }
+}
+
+fn admin_faq_from_row(row: sqlx::postgres::PgRow) -> AdminFaqItem {
+    AdminFaqItem {
+        id: row.get("id"),
+        question: row.get("question"),
+        similar: row.get("similar"),
+        answer: row.get("answer"),
+        source: row.get::<String, _>("source_label"),
+        updated_at: row.get("updated_at"),
+        status: row.get("status"),
+        hits: row.get("hits"),
+    }
+}
+
+fn normalize_feedback_status(value: &str) -> &'static str {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "resolved" | "已解决" | "已办结" => "RESOLVED",
+        _ => "OPEN",
+    }
+}
+
+fn feedback_type_to_frontend(value: String) -> String {
+    match value.as_str() {
+        "HELPFUL" => "helpful",
+        "MANUAL_FIX" => "manual-fix",
+        _ => "incorrect",
+    }
+    .to_owned()
+}
+
+fn feedback_status_to_frontend(value: String) -> String {
+    match value.as_str() {
+        "RESOLVED" => "resolved",
+        _ => "open",
+    }
+    .to_owned()
+}
+
+fn normalize_ticket_status(value: &str) -> String {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "working" | "处理中" => "处理中",
+        "resolved" | "done" | "已办结" => "已办结",
+        "closed" | "已关闭" => "已关闭",
+        "all" | "全部" => "all",
+        _ => "待处理",
+    }
+    .to_owned()
+}
+
+fn admin_ticket_from_row(row: sqlx::postgres::PgRow) -> AdminTicketItem {
+    AdminTicketItem {
+        id: row.get("id"),
+        name: row.get("name"),
+        phone: row.try_get("phone").ok(),
+        province: row.get("province"),
+        content: row.get("content"),
+        status: row.get("status"),
+        priority: row.get("priority"),
+        created_at: row.get("created_at"),
+        updated_at: row.try_get("updated_at").ok(),
+        handled_by: row.try_get("handled_by").ok(),
+        resolution: row.try_get("resolution").ok(),
+    }
+}
+
+fn default_admin_settings() -> AdminSettings {
+    AdminSettings {
+        welcome_message: "您好，欢迎来到哈尔滨师范大学！我是您的招生咨询助手「沐阳」，很高兴为您服务。请问有什么可以帮助您的吗？".to_owned(),
+        fallback_message: "抱歉，我暂时无法回答这个问题。建议您拨打招生咨询电话：0451-88060678，或者提交人工留言，我们会尽快为您解答。".to_owned(),
+        updated_at: None,
+    }
 }
 
 fn read_env_u64(key: &str, default: u64) -> u64 {

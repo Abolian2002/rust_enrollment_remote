@@ -253,5 +253,30 @@
         }
       }
     ]
+  },
+  {
+    "name": "g8-school-fact-not-polluted-by-major-context",
+    "requiresLiveProvider": true,
+    "turns": [
+      {
+        "message": "地理科学（师范类）和行知实验班有什么区别？",
+        "expect": {
+          "type": "knowledge_answer",
+          "minToolCalls": 1,
+          "minVectorChunks": 1,
+          "replyIncludes": ["地理科学", "行知"],
+          "replyExcludes": ["言行班", "知行班"]
+        }
+      },
+      {
+        "message": "学校校训是什么？",
+        "expect": {
+          "type": "knowledge_answer",
+          "minToolCalls": 1,
+          "replyIncludes": ["敦品励学", "弘毅致远"],
+          "replyExcludes": ["学高为师", "身正为范", "地理科学", "行知实验班"]
+        }
+      }
+    ]
   }
 ]

@@ -793,6 +793,7 @@ impl AdmissionsAgent {
 
     fn should_force_training_plan_query_major_focus(query: &str) -> bool {
         !is_admission_policy_query(query)
+            && !asks_program_comparison_context(query)
             && asks_training_plan_context(query)
             && extract_major_phrase(query).is_some()
     }
@@ -887,7 +888,7 @@ impl AdmissionsAgent {
             LlmMessage {
                     role: MessageRole::System,
                     content:
-                        "你是哈尔滨师范大学招生智能顾问，回答面向学生和家长，要自然、亲切、准确，不要说“知识库命中”“有资料”“字段”等后台词。\n\n优先级规则：\n1. 系统边界最高，其次是用户本轮问题。必须先回答用户本轮真正想问的内容，不要因为模板或历史上下文转移主题。\n2. 结构化结果、证据和引用是事实来源；草稿回答只是提示，不可覆盖用户意图。\n3. 对话上下文、confirmed memory、active referents 和压缩摘要只用于理解“它、这个专业、刚才那个、继续”等多轮指代，不是事实证据；如果它们与本轮结构化结果或证据冲突，必须以本轮结构化结果和证据为准。\n\n事实边界分层：\n1. 高风险事实必须严格依据给定结构化结果、证据和引用回答，包括录取线、位次、录取概率、招生计划、招生政策、招生电话、官网链接、专业目录、培养方案、课程、学分、毕业要求、体检、语种、调剂和同分规则。没有证据时不要编造，要说明还需要按招生简章、培养方案、FAQ、官网或录取统计核对。\n2. 低风险泛聊可以发挥模型常识，包括城市印象、大学生活建议、备考建议、如何和家长沟通、入学前准备等；涉及学校具体安排时要用“通常/一般/建议以学校通知为准”等边界表达。\n3. 如果已经给出结构化证据，要优先用证据，不要把培养方案覆盖专业说成当年一定招生，不要把相近专业数据说成目标专业数据。培养方案问题只允许使用目标专业的培养方案证据；如果证据来自其他专业，要明确不能据此回答目标专业。\n4. 招生联系方式只能使用证据中出现的号码和网址；不要补写学院电话或自行推测工作时间。\n5. 艺术类录取规则只能按证据表述。没有证据时，不得自行生成“文化课×40%+专业课×60%”等折算公式。\n6. 概率和普通高考录取线解释不得混用专升本、单招、预科等非普通高考批次；如果证据批次不可比，要说明边界。\n7. 普通闲聊、身份介绍、能力介绍也要根据用户原话直接回应，不要套用无关模板；用户问“你擅长什么”时，回答能力范围即可，不要要求用户补省份分数。\n8. 用户用“和、或、以及、哪些”等方式同时问多个事实点时，要逐项回应；证据只覆盖其中一部分时，先回答有证据的部分，再明确说明其余部分在当前证据中没有直接条款支持，不能自行补充。\n9. 只有当用户正在问录取概率、分数线、志愿建议或明确需要个性化判断时，才追问省份、科类、分数、位次、意向专业；用户只是问学校介绍、校园生活或能力介绍时，不要用画像追问收尾。"
+                        "你是哈尔滨师范大学招生智能顾问，回答面向学生和家长，要自然、亲切、准确，不要说“知识库命中”“有资料”“字段”等后台词。\n\n优先级规则：\n1. 系统边界最高，其次是用户本轮问题。必须先回答用户本轮真正想问的内容，不要因为模板或历史上下文转移主题。\n2. 结构化结果、证据和引用是事实来源；草稿回答只是提示，不可覆盖用户意图。\n3. 对话上下文、confirmed memory、active referents 和压缩摘要只用于理解“它、这个专业、刚才那个、继续”等多轮指代，不是事实证据；如果它们与本轮结构化结果或证据冲突，必须以本轮结构化结果和证据为准。\n\n事实边界分层：\n1. 高风险事实必须严格依据给定结构化结果、证据和引用回答，包括录取线、位次、录取概率、招生计划、招生政策、招生电话、官网链接、专业目录、培养方案、课程、学分、毕业要求、体检、语种、调剂、同分规则、校训、学校章程、办学定位和学校官方历史沿革。没有证据时不要编造，要说明还需要按招生简章、培养方案、FAQ、官网或录取统计核对。\n2. 低风险泛聊可以发挥模型常识，包括城市印象、大学生活建议、备考建议、如何和家长沟通、入学前准备等；涉及学校具体安排时要用“通常/一般/建议以学校通知为准”等边界表达。\n3. 如果已经给出结构化证据，要优先用证据，不要把培养方案覆盖专业说成当年一定招生，不要把相近专业数据说成目标专业数据。培养方案问题只允许使用目标专业的培养方案证据；如果证据来自其他专业，要明确不能据此回答目标专业。\n4. 招生联系方式只能使用证据中出现的号码和网址；不要补写学院电话或自行推测工作时间。\n5. 艺术类录取规则只能按证据表述。没有证据时，不得自行生成“文化课×40%+专业课×60%”等折算公式。\n6. 概率和普通高考录取线解释不得混用专升本、单招、预科等非普通高考批次；如果证据批次不可比，要说明边界。\n7. 普通闲聊、身份介绍、能力介绍也要根据用户原话直接回应，不要套用无关模板；用户问“你擅长什么”时，回答能力范围即可，不要要求用户补省份分数。\n8. 用户用“和、或、以及、哪些”等方式同时问多个事实点时，要逐项回应；证据只覆盖其中一部分时，先回答有证据的部分，再明确说明其余部分在当前证据中没有直接条款支持，不能自行补充。\n9. 只有当用户正在问录取概率、分数线、志愿建议或明确需要个性化判断时，才追问省份、科类、分数、位次、意向专业；用户只是问学校介绍、校园生活或能力介绍时，不要用画像追问收尾。"
                             .to_owned(),
             },
             LlmMessage {
@@ -1343,6 +1344,7 @@ fn asks_training_plan_context(message: &str) -> bool {
     .iter()
     .any(|item| message.contains(item))
         || asks_major_fit_context(message)
+        || asks_program_comparison_context(message)
 }
 
 fn asks_major_fit_context(message: &str) -> bool {
@@ -1351,6 +1353,41 @@ fn asks_major_fit_context(message: &str) -> bool {
             message,
             &["专业", "培养", "老师", "教师", "实验", "课程", "就业"],
         )
+}
+
+fn asks_program_comparison_context(message: &str) -> bool {
+    contains_any_text(
+        message,
+        &[
+            "区别",
+            "差别",
+            "差异",
+            "不同",
+            "相比",
+            "比较",
+            "对比",
+            "哪个更适合",
+            "哪个更好",
+            "怎么选",
+        ],
+    ) && contains_any_text(
+        message,
+        &[
+            "专业",
+            "学院",
+            "班",
+            "师范",
+            "非师范",
+            "行知",
+            "实验班",
+            "培养",
+            "课程",
+            "学位",
+            "实践",
+            "就业",
+            "升学",
+        ],
+    )
 }
 
 fn asks_score_with_likely_training_plan_followup(message: &str) -> bool {
@@ -2244,7 +2281,7 @@ fn looks_like_knowledge_follow_up(message: &str) -> bool {
 }
 
 fn contextual_knowledge_query(message: &str, memory: &ResolvedMemory) -> String {
-    if is_broad_school_or_campus_query(message) {
+    if is_broad_school_or_campus_query(message) || is_school_level_fact_query(message) {
         return message.to_owned();
     }
     let Some(major) = memory.major_name.as_deref() else {
@@ -2285,7 +2322,7 @@ fn contextual_knowledge_query_with_history(
     history: &[ConversationMessage],
 ) -> String {
     let query = contextual_knowledge_query(message, memory);
-    if is_broad_school_or_campus_query(message) {
+    if is_broad_school_or_campus_query(message) || is_school_level_fact_query(message) {
         return query;
     }
     if query != message || !(looks_like_knowledge_follow_up(message) || is_short_follow_up(message))
@@ -2647,7 +2684,21 @@ fn score_query_uses_unspecified_subject_records(
 
 fn sanitize_high_risk_facts(reply: String, structured_result: &ChatStructuredResult) -> String {
     let reply = sanitize_unverified_art_formula(reply, structured_result);
-    sanitize_unverified_admissions_phones(reply, structured_result)
+    let reply = sanitize_unverified_admissions_phones(reply, structured_result);
+    sanitize_evidence_backed_term_typos(reply, structured_result)
+}
+
+fn sanitize_evidence_backed_term_typos(
+    reply: String,
+    structured_result: &ChatStructuredResult,
+) -> String {
+    let evidence_text = structured_result_text(structured_result);
+    if !(reply.contains("行知") || evidence_text.contains("行知")) {
+        return reply;
+    }
+
+    reply.replace("言行班", "行知班")
+        .replace("知行班", "行知班")
 }
 
 fn sanitize_unverified_art_formula(
@@ -2975,7 +3026,7 @@ fn should_update_major_from_knowledge_query(query: &str) -> bool {
         return false;
     }
 
-    if is_broad_school_or_campus_query(query) {
+    if is_broad_school_or_campus_query(query) || is_school_level_fact_query(query) {
         return false;
     }
 
@@ -3046,6 +3097,32 @@ fn is_broad_school_or_campus_query(message: &str) -> bool {
         ],
     );
     asks_intro && asks_school && !asks_specific_program
+}
+
+fn is_school_level_fact_query(message: &str) -> bool {
+    let mentions_school = contains_any_text(
+        message,
+        &["学校", "院校", "哈师大", "哈尔滨师范大学", "贵校", "你校"],
+    );
+    if !mentions_school {
+        return contains_any_text(message, &["校训", "校风", "学校章程"]);
+    }
+
+    contains_any_text(
+        message,
+        &[
+            "校训",
+            "校风",
+            "校规",
+            "学校章程",
+            "办学定位",
+            "办学特色",
+            "学校特色",
+            "学术不端",
+            "校园网",
+            "创意市集",
+        ],
+    )
 }
 
 fn message_explicitly_names_major_for_memory(message: &str) -> bool {
@@ -3913,6 +3990,12 @@ mod tests {
         assert!(asks_training_plan_context(
             "如果喜欢做实验，也想以后当生物老师，这个专业适合吗？"
         ));
+        assert!(asks_training_plan_context(
+            "地理科学（师范类）和行知实验班有什么区别？"
+        ));
+        assert!(asks_program_comparison_context(
+            "计算机科学与技术师范和非师范怎么选？"
+        ));
         assert!(asks_province_admission_major_list(
             "哈师大在山东招生哪些专业"
         ));
@@ -4016,7 +4099,28 @@ mod tests {
             contextual_knowledge_query("简单介绍一下学校", &memory),
             "简单介绍一下学校"
         );
+        assert_eq!(
+            contextual_knowledge_query("学校校训是什么？", &memory),
+            "学校校训是什么？"
+        );
+        assert_eq!(
+            contextual_knowledge_query_with_history(
+                "学校校训是什么？",
+                &memory,
+                &history
+            ),
+            "学校校训是什么？"
+        );
+        assert_eq!(
+            contextual_knowledge_query_with_history(
+                "地理科学（师范类）和行知实验班有什么区别？",
+                &memory,
+                &history
+            ),
+            "地理科学（师范类）和行知实验班有什么区别？"
+        );
         assert!(is_broad_school_or_campus_query("简单介绍一下学校"));
+        assert!(is_school_level_fact_query("学校校训是什么？"));
         assert!(!is_broad_school_or_campus_query("简单介绍一下西语学院"));
         memory.major_name = Some("生物科学（师范类）".to_owned());
         assert_eq!(
@@ -4264,6 +4368,22 @@ mod tests {
         );
         assert!(!reply.contains("40%"));
         assert!(!reply.contains("60%"));
+    }
+
+    #[test]
+    fn high_risk_fact_sanitizer_normalizes_evidence_backed_program_typos() {
+        let structured = ChatStructuredResult::KnowledgeAnswer {
+            query: "地理科学（师范类）和行知班有什么区别？".to_owned(),
+            faq: Vec::new(),
+            policies: Vec::new(),
+            vector_chunks: Vec::new(),
+        };
+        let reply = sanitize_high_risk_facts(
+            "行知班更强调科研训练，而言行班也有更高毕业要求。".to_owned(),
+            &structured,
+        );
+        assert!(reply.contains("行知班也有更高毕业要求"));
+        assert!(!reply.contains("言行班"));
     }
 
     #[test]

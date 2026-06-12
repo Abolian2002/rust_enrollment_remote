@@ -238,10 +238,18 @@ export default function ChatPage() {
     submitMessage
   } = useChatSession({
     onStreamStart: async () => {
+      if (voice.usesServerVoice) {
+        stopActiveVoiceStream();
+        void voice.prepare().then((ready) => {
+          if (!ready) {
+            void voice.markUnavailable();
+          }
+        }).catch(() => {
+          void voice.markUnavailable();
+        });
+        return;
+      }
       try {
-        if (voice.usesServerVoice) {
-          stopActiveVoiceStream();
-        }
         await voice.prepare();
       } catch {
         await voice.markUnavailable();
@@ -285,7 +293,6 @@ export default function ChatPage() {
       if (voice.usesServerVoice) {
         stopActiveVoiceStream();
         void voice.interrupt();
-        await voice.prepare();
       } else {
         await voice.interrupt();
       }

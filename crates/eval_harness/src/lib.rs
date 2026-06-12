@@ -283,7 +283,7 @@ mod tests {
     #[test]
     fn loads_v6_fixture() {
         let cases = load_fixture("fixtures/chat-context-regression-v6-cases.json").unwrap();
-        assert_eq!(cases.len(), 7);
-        assert_eq!(cases.iter().map(|case| case.turns.len()).sum::<usize>(), 25);
+        assert_eq!(cases.len(), 8);
+        assert_eq!(cases.iter().map(|case| case.turns.len()).sum::<usize>(), 27);
     }
 }

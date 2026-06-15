@@ -11,8 +11,9 @@
 - 后台管理端公网入口：`https://admin.abolian.online/`，本次验证返回 Cloudflare Access `HTTP/2 302` 登录跳转，说明 Access 保护生效。
 - 内网项目服务器 `10.10.200.13` 上 Rust API、Next.js 前端、3 个 LLM worker、embedding、4 个 CosyVoice worker 都在运行。
 - 项目数据库是 K8s namespace `hnu-enrollment` 下的 PostgreSQL 16 + pgvector，pod 为 `hnu-enrollment-postgres-0`，宿主机通过 `kubectl port-forward` 暴露到 `127.0.0.1:55432`。
-- 当前本地和服务器仓库都有 3 个未提交的后台管理前端文件改动：`apps/admin/src/App.tsx`、`apps/admin/src/index.css`、`apps/admin/src/types/admin.ts`。这些改动是后台管理真实数据/布局相关，不是语音、agent 或聊天链路。
-- `127.0.0.1:10090` 曾在内网项目服务器上监听；本次确认它来自本地 WSL 的 SSH 反向隧道 `-R 10090:127.0.0.1:10090`，不是招生项目业务链路，已停止。
+- 本地和服务器仓库的前端修改文件（`App.tsx`、`index.css`、`types/admin.ts`）以及 API 性能优化（内存 TTL 缓存 + try_join 并行化）已全部提交并合入 `main` 分支。
+- 本地和服务器的提交历史与哈希已完全对齐（最新 commit 为 `7381af5`）。本地 `main` 追踪 `origin`（主库），服务器 `main` 追踪部署库 `rust_enrollment_remote.git`。
+- `127.0.0.1:10090` 曾在内网项目服务器上监听；本地 WSL 的 SSH 反向隧道已被停止。
 
 ## 2. 仓库与路径
 
@@ -21,23 +22,14 @@
 - 路径：`/home/scm2002/Code/rust_enrollment`
 - 分支：`main`
 - remotes：
-  - `origin https://github.com/Abolian2002/rust_enrollment.git`
-  - `enrollment_remote https://github.com/Abolian2002/rust_enrollment_remote.git`
-- 本次确认的最近提交：
-  - `206716b add public ticket submission flow`
-  - `785a72f integrate admin data and faq knowledge`
-  - `0449638 document admin access public endpoint`
-  - `1954501 document admin access tunnel setup`
-  - `c1f8b4e prepare admin cloudflare access deployment`
-- 本地未提交文件：
-  - `apps/admin/src/App.tsx`
-  - `apps/admin/src/index.css`
-  - `apps/admin/src/types/admin.ts`
-- 未提交改动性质：
-  - 去掉后台管理系统假数据兜底。
-  - 增加真实数据读取失败提示、空状态、刷新按钮。
-  - 调整知识库管理页布局，避免图表遮挡文字。
-  - FAQ 分类覆盖图单独成行居中展示。
+  - `origin https://github.com/Abolian2002/rust_enrollment.git` (本地主开发库，后续本地修改推送到此处)
+  - `enrollment_remote https://github.com/Abolian2002/rust_enrollment_remote.git` (本地部署分支的远程指针)
+- 当前最新提交：
+  - `7381af5 perf(admin): sync Cargo.lock with tokio db dependency`
+  - `6209aac perf(admin): add 5-min TTL cache + parallel queries for admin endpoints`
+  - `2c9c5e0 feat(admin): 更新后台登录页背景为夏天校园图，重命名xiatian.jpeg，添加运维交接文档`
+  - `3c3e22a add public ticket submission flow`
+- 本地工作区状态：Clean，无未提交文件。
 
 ### 内网项目服务器仓库
 
@@ -45,9 +37,9 @@
 - 密码：`qwer123456`
 - hostname：`train-2`
 - 项目路径：`/home/t2_enroll_ai/rust_enrollment`
-- 远端仓库：`origin https://github.com/Abolian2002/rust_enrollment_remote.git`
-- 服务器仓库 HEAD 与本地一样，最近提交同为 `206716b`。
-- 服务器仓库也有同样 3 个未提交后台管理前端文件。
+- 远端仓库：`origin https://github.com/Abolian2002/rust_enrollment_remote.git` (服务器项目推拉至此处)
+- 服务器仓库 HEAD 指针已与本地完美对齐，最新 commit 同样为 `7381af5`。
+- 服务器工作区状态：Clean，无未提交文件。
 
 ## 3. 服务拓扑
 
@@ -567,8 +559,7 @@ ss -ltnp | grep ':10090'
 
 当前应优先做：
 
-- 把后台管理 3 个未提交文件 review 后提交。
-- 如果要同步服务器，先备份服务器未提交文件，再 rsync 或 git pull。
+- 持续监控后台管理端的接口加载表现，特别是缓存刷新行为及 API 日志。
 - 后续如继续优化后台管理系统，优先保持真实数据、无假数据兜底、可刷新、空状态清晰。
 - 如继续优化语音并发，先压测并观察 first audio、segment gap、CosyVoice worker queue，不要凭感觉调大并发。
 

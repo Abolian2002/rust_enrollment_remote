@@ -1,4 +1,20 @@
-import type { KnowledgeItem, Stat } from '../data/mock';
+export type Stat = {
+  label: string;
+  value: string;
+  delta?: string;
+  tone?: 'blue' | 'green' | 'cyan' | 'amber' | 'red' | 'purple';
+};
+
+export type KnowledgeItem = {
+  id: string | number;
+  question: string;
+  similar: string;
+  answer: string;
+  source: string;
+  updatedAt: string;
+  status: '启用' | '禁用';
+  hits: number;
+};
 
 export type AdminChartDatum = {
   name: string;

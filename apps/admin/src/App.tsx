@@ -1,4 +1,4 @@
-import { useEffect, useState, type FormEvent, type ReactNode } from 'react';
+import { useCallback, useEffect, useState, type FormEvent, type ReactNode } from 'react';
 import { BrowserRouter, Link, Navigate, Route, Routes, useLocation, useNavigate } from 'react-router-dom';
 import ReactECharts from 'echarts-for-react';
 import * as echarts from 'echarts';
@@ -34,35 +34,6 @@ import {
   type LucideIcon,
 } from 'lucide-react';
 import {
-  bigStats,
-  bigTopQuestions,
-  categoryStats,
-  conversations,
-  dashboardStats,
-  evaluationRecords,
-  hotQuestions,
-  hourlyValues,
-  insightMonths,
-  knowledgeBase,
-  majorAttention,
-  mapData,
-  overviewStats,
-  provinceBars,
-  provinceEvaluations,
-  realtimeMessages,
-  specialPlans,
-  specialStats,
-  tickets,
-  top20,
-  trendDays,
-  trendValues,
-  unknownQuestions,
-  type EvaluationRecord,
-  type KnowledgeItem,
-  type Stat,
-  type Ticket,
-} from './data/mock';
-import {
   fetchAdminAdmissionsAnalytics,
   fetchAdminBigScreen,
   fetchAdminConversationDetail,
@@ -96,6 +67,8 @@ import type {
   AdminSettings,
   AdminSpecialSnapshot,
   AdminTicketItem,
+  KnowledgeItem,
+  Stat,
 } from './types/admin';
 
 echarts.registerMap('china', chinaMap as never);
@@ -121,6 +94,8 @@ const toneIconClass: Record<NonNullable<Stat['tone']>, string> = {
   red: 'tone-red',
   purple: 'tone-purple',
 };
+
+const monthFilters = ['近7天', '近30天', '全年'];
 
 function App() {
   return (
@@ -332,6 +307,29 @@ function StatusBadge({ value }: { value: string }) {
   return <span className={`status ${normalized}`}>{value}</span>;
 }
 
+function RefreshAction({ loading, onClick }: { loading?: boolean; onClick: () => void }) {
+  return (
+    <button type="button" className="refresh-action" onClick={onClick} disabled={loading}>
+      <RefreshCw size={16} className={loading ? 'spinning' : ''} />
+      {loading ? '刷新中' : '刷新'}
+    </button>
+  );
+}
+
+function LoadError({ message, onRetry }: { message: string; onRetry?: () => void }) {
+  return (
+    <div className="warning-box">
+      <AlertCircle size={18} />
+      <span>真实数据读取失败：{message}</span>
+      {onRetry ? <button type="button" className="inline-retry" onClick={onRetry}>重试</button> : null}
+    </div>
+  );
+}
+
+function EmptyState({ children = '暂无真实数据。', compact = false }: { children?: ReactNode; compact?: boolean }) {
+  return <div className={`empty-state ${compact ? 'compact' : ''}`}>{children}</div>;
+}
+
 function Modal({ title, children, onClose }: { title: string; children: ReactNode; onClose: () => void }) {
   return (
     <div className="modal-layer" role="dialog" aria-modal="true">
@@ -349,57 +347,73 @@ function Modal({ title, children, onClose }: { title: string; children: ReactNod
 function DashboardPage() {
   const [dashboard, setDashboard] = useState<AdminDashboardSnapshot | null>(null);
   const [loadError, setLoadError] = useState('');
+  const [loading, setLoading] = useState(true);
 
-  useEffect(() => {
-    let alive = true;
+  const loadDashboard = useCallback(() => {
+    setLoading(true);
     fetchAdminDashboard()
       .then((data) => {
-        if (alive) {
-          setDashboard(data);
-          setLoadError('');
-        }
+        setDashboard(data);
+        setLoadError('');
       })
       .catch((error: Error) => {
-        if (alive) {
-          setLoadError(error.message);
-        }
+        setDashboard(null);
+        setLoadError(error.message);
+      })
+      .finally(() => {
+        setLoading(false);
       });
-    return () => {
-      alive = false;
-    };
   }, []);
 
-  const stats = dashboard?.stats ?? dashboardStats;
-  const dashboardTrendDays = dashboard?.trendDays ?? trendDays;
-  const dashboardTrendValues = dashboard?.trendValues ?? trendValues;
-  const dashboardHourlyValues = dashboard?.hourlyValues ?? hourlyValues;
-  const dashboardHotQuestions = dashboard?.hotQuestions ?? hotQuestions;
+  useEffect(() => {
+    loadDashboard();
+  }, [loadDashboard]);
+
+  if (loading && !dashboard) {
+    return <EmptyState>正在读取真实驾驶舱数据...</EmptyState>;
+  }
+
+  if (loadError && !dashboard) {
+    return <LoadError message={loadError} onRetry={loadDashboard} />;
+  }
+
+  if (!dashboard) {
+    return <EmptyState>暂无真实驾驶舱数据。</EmptyState>;
+  }
+
+  const trendLabels = dashboard.trendDays.length === dashboard.trendValues.length
+    ? dashboard.trendDays
+    : dashboard.trendValues.map((_, index) => `第${index + 1}天`);
 
   return (
     <>
       <div className="page-meta">
         <SelectLike>近7天</SelectLike>
-        <span><Clock3 size={16} /> 数据更新时间：{dashboard?.updatedAt ?? 'mock 数据'}</span>
-        {loadError ? <span className="soft-pill amber">真实数据暂不可用，已显示本地样例</span> : null}
+        <span><Clock3 size={16} /> 数据更新时间：{dashboard.updatedAt}</span>
+        <RefreshAction loading={loading} onClick={loadDashboard} />
       </div>
-      <StatGrid stats={stats} />
+      {loadError ? <LoadError message={loadError} onRetry={loadDashboard} /> : null}
+      {dashboard.stats.length ? <StatGrid stats={dashboard.stats} /> : <EmptyState compact>暂无统计指标。</EmptyState>}
       <div className="grid-two">
-        <Card title="咨询量趋势" action={<span className="soft-pill">↗ 上涨趋势</span>}>
-          <Chart option={lineOption(dashboardTrendDays, dashboardTrendValues, '#2161ff')} height={290} />
+        <Card title="咨询量趋势" action={<span className="soft-pill">真实咨询日志聚合</span>}>
+          {dashboard.trendValues.length ? <Chart option={lineOption(trendLabels, dashboard.trendValues, '#2161ff')} height={290} /> : <EmptyState compact>暂无趋势数据。</EmptyState>}
         </Card>
         <Card title="24小时咨询时段分布">
-          <Chart option={barOption(Array.from({ length: 24 }, (_, index) => `${index.toString().padStart(2, '0')}`), dashboardHourlyValues, '#34c8c2')} height={290} />
+          {dashboard.hourlyValues.length ? <Chart option={barOption(Array.from({ length: dashboard.hourlyValues.length }, (_, index) => `${index.toString().padStart(2, '0')}`), dashboard.hourlyValues, '#34c8c2')} height={290} /> : <EmptyState compact>暂无时段分布数据。</EmptyState>}
         </Card>
       </div>
       <div className="grid-two">
         <Card title="近期热点问题 TOP5" action={<a className="linkish" href="/insights">查看全部</a>}>
-          <ol className="rank-list">
-            {dashboardHotQuestions.slice(0, 5).map(([question, count], index) => <li key={question}><b>{index + 1}</b><span>{question}</span><em>{count}</em></li>)}
-          </ol>
+          {dashboard.hotQuestions.length ? (
+            <ol className="rank-list">
+              {dashboard.hotQuestions.slice(0, 5).map(([question, count], index) => <li key={question}><b>{index + 1}</b><span>{question}</span><em>{count}</em></li>)}
+            </ol>
+          ) : (
+            <EmptyState compact>暂无热点问题数据。</EmptyState>
+          )}
         </Card>
         <Card title="预警信息与快捷入口">
-          <div className="warning-box"><AlertCircle size={18} />检测到5条敏感问题，请及时审核处理</div>
-          <div className="warning-box"><Clock3 size={18} />23条工单待处理，其中8条超过24小时未响应</div>
+          <EmptyState compact>预警规则接口尚未接入，暂不展示估算数据。</EmptyState>
           <div className="quick-grid">
             {['高频问题分析', '工单待办', '知识库更新', '待审核对话'].map((item) => <button type="button" key={item}>{item}</button>)}
           </div>
@@ -410,69 +424,73 @@ function DashboardPage() {
 }
 
 function InsightsPage() {
-  const [month, setMonth] = useState(insightMonths[3]);
+  const [month, setMonth] = useState(monthFilters[1]);
   const [query, setQuery] = useState('');
   const [insights, setInsights] = useState<AdminInsightsSnapshot | null>(null);
   const [loadError, setLoadError] = useState('');
+  const [loading, setLoading] = useState(true);
 
-  useEffect(() => {
-    let alive = true;
+  const loadInsights = useCallback(() => {
+    setLoading(true);
     fetchAdminInsights()
       .then((data) => {
-        if (alive) {
-          setInsights(data);
-          setLoadError('');
-        }
+        setInsights(data);
+        setLoadError('');
       })
       .catch((error: Error) => {
-        if (alive) {
-          setLoadError(error.message);
-        }
+        setInsights(null);
+        setLoadError(error.message);
+      })
+      .finally(() => {
+        setLoading(false);
       });
-    return () => {
-      alive = false;
-    };
   }, []);
 
-  const topRows = insights?.topQuestions.map((item) => [item.question, item.category, String(item.count), item.share] as [string, string, string, string]) ?? top20;
+  useEffect(() => {
+    loadInsights();
+  }, [loadInsights]);
+
+  const topRows = insights?.topQuestions.map((item) => [item.question, item.category, String(item.count), item.share] as [string, string, string, string]) ?? [];
   const filtered = topRows.filter((row) => row[0].includes(query) || row[1].includes(query));
-  const insightCategoryStats = insights?.categoryStats ?? categoryStats;
-  const insightProvinceBars = insights?.provinceBars ?? provinceBars;
-  const wordCloud = insights?.wordCloud.map((item) => item.name) ?? ['录取分数', '公费师范', '专业', '分数线', '招生计划', '宿舍', '优师计划', '就业', '学费', '调剂', '位次', '师范', '投档', '升学', '报名', '环境', '师资'];
+  const wordCloud = insights?.wordCloud.map((item) => item.name) ?? [];
 
   return (
     <>
       <PageTitle title="招生咨询热点洞察" subtitle={insights ? `真实数据更新时间：${insights.updatedAt}` : undefined} />
       <Card>
         <div className="month-tabs">
-          {insightMonths.map((item) => <button className={item.label === month.label ? 'active' : ''} type="button" key={item.label} onClick={() => setMonth(item)}>{item.label}</button>)}
-          <span className="trend-alert">{insights ? '真实咨询日志聚合' : '↗ 咨询趋势：高峰'}</span>
+          {monthFilters.map((item) => <button className={item === month ? 'active' : ''} type="button" key={item} onClick={() => setMonth(item)}>{item}</button>)}
+          <span className="trend-alert">{insights ? '真实咨询日志聚合' : '等待真实数据'}</span>
+          <RefreshAction loading={loading} onClick={loadInsights} />
         </div>
-        <div className="insight-hero">
-          <MiniMetric icon={Users} label={insights?.stats[0]?.label ?? '咨询用户数'} value={insights?.stats[0]?.value ?? month.users} />
-          <MiniMetric icon={MessageSquare} label={insights?.stats[1]?.label ?? '咨询问答数'} value={insights?.stats[1]?.value ?? month.questions} />
-          <MiniMetric icon={Target} label={insights?.stats[2]?.label ?? '高意向留资量'} value={insights?.stats[2]?.value ?? month.leads} />
-          <p><b>数据特征：</b>{insights?.summary ?? month.summary}</p>
-          <p><b>重点关注：</b>后台按分数位次、录取规则、专业介绍、专项政策、校园生活等通用类别归集用户问题，用于辅助招生办及时发现咨询高峰和知识库缺口。</p>
-          <div className="tag-row">{wordCloud.slice(0, 4).map((word) => <span key={word}>{word}</span>)}</div>
-        </div>
+        {loadError ? <LoadError message={loadError} onRetry={loadInsights} /> : null}
+        {loading && !insights ? <EmptyState compact>正在读取真实热点数据...</EmptyState> : null}
+        {insights ? (
+          <div className="insight-hero">
+            <MiniMetric icon={Users} label={insights.stats[0]?.label ?? '咨询用户数'} value={insights.stats[0]?.value ?? '0'} />
+            <MiniMetric icon={MessageSquare} label={insights.stats[1]?.label ?? '咨询问答数'} value={insights.stats[1]?.value ?? '0'} />
+            <MiniMetric icon={Target} label={insights.stats[2]?.label ?? '高意向留资量'} value={insights.stats[2]?.value ?? '0'} />
+            <p><b>数据特征：</b>{insights.summary || '暂无摘要。'}</p>
+            <p><b>重点关注：</b>后台按分数位次、录取规则、专业介绍、专项政策、校园生活等通用类别归集用户问题，用于辅助招生办及时发现咨询高峰和知识库缺口。</p>
+            <div className="tag-row">{wordCloud.slice(0, 4).map((word) => <span key={word}>{word}</span>)}</div>
+          </div>
+        ) : null}
       </Card>
-      {loadError ? <div className="warning-box"><AlertCircle size={18} />真实热点数据暂不可用，已显示本地样例</div> : null}
       <Toolbar>
-        <SelectLike>近30天</SelectLike>
+        <SelectLike>{month}</SelectLike>
         <SelectLike>全部分类</SelectLike>
         <SearchBox value={query} onChange={setQuery} placeholder="搜索问题关键词..." />
         <PrimaryButton ghost><Download size={16} />导出Excel</PrimaryButton>
       </Toolbar>
       <div className="grid-two">
-        <Card title="咨询内容分类统计"><Chart option={pieOption(insightCategoryStats)} height={280} /></Card>
-        <Card title="生源地域热度分析"><Chart option={horizontalBarOption(insightProvinceBars)} height={280} /></Card>
+        <Card title="咨询内容分类统计">{insights?.categoryStats.length ? <Chart option={pieOption(insights.categoryStats)} height={280} /> : <EmptyState compact>暂无分类统计。</EmptyState>}</Card>
+        <Card title="生源地域热度分析">{insights?.provinceBars.length ? <Chart option={horizontalBarOption(insights.provinceBars)} height={280} /> : <EmptyState compact>暂无地域热度数据。</EmptyState>}</Card>
       </div>
       <Card title="高频问题 TOP20 榜单">
-        <DataTable headers={['排名', '问题内容', '分类', '提问次数', '占比']} rows={filtered.map((row, index) => [index + 1, row[0], row[1], row[2], row[3]])} />
+        {filtered.length ? <DataTable headers={['排名', '问题内容', '分类', '提问次数', '占比']} rows={filtered.map((row, index) => [index + 1, row[0], row[1], row[2], row[3]])} /> : <EmptyState compact>暂无匹配的真实高频问题。</EmptyState>}
       </Card>
       <Card title="用户关注点词云">
-        <div className="word-cloud">{wordCloud.map((word, index) => <span style={{ fontSize: `${14 + (index % 6) * 4}px` }} key={word}>{word}</span>)}</div>
+        {wordCloud.length ? <div className="word-cloud">{wordCloud.map((word, index) => <span style={{ fontSize: `${14 + (index % 6) * 4}px` }} key={word}>{word}</span>)}</div> : <EmptyState compact>暂无词云数据。</EmptyState>}
       </Card>
     </>
   );
@@ -482,57 +500,59 @@ function SpecialPage() {
   const [special, setSpecial] = useState<AdminSpecialSnapshot | null>(null);
   const [admissions, setAdmissions] = useState<AdminAdmissionsAnalyticsSnapshot | null>(null);
   const [loadError, setLoadError] = useState('');
+  const [loading, setLoading] = useState(true);
 
-  useEffect(() => {
-    let alive = true;
+  const loadSpecial = useCallback(() => {
+    setLoading(true);
     Promise.all([fetchAdminSpecial(), fetchAdminAdmissionsAnalytics()])
       .then(([specialData, admissionsData]) => {
-        if (alive) {
-          setSpecial(specialData);
-          setAdmissions(admissionsData);
-          setLoadError('');
-        }
+        setSpecial(specialData);
+        setAdmissions(admissionsData);
+        setLoadError('');
       })
       .catch((error: Error) => {
-        if (alive) {
-          setLoadError(error.message);
-        }
+        setSpecial(null);
+        setAdmissions(null);
+        setLoadError(error.message);
+      })
+      .finally(() => {
+        setLoading(false);
       });
-    return () => {
-      alive = false;
-    };
   }, []);
 
-  const specialPageStats = special?.stats ?? specialStats;
-  const normalVsNonNormal = special?.normalVsNonNormal.length ? special.normalVsNonNormal : [{ name: '师范类', value: 66 }, { name: '非师范类', value: 34 }];
-  const specialPlanRows = special?.specialPlans ?? specialPlans;
-  const majorAttentionRows = special?.majorAttention.length ? special.majorAttention : majorAttention;
-  const policyRows = special?.policyStats.length ? special.policyStats : ['投档比例', '调剂退档规则', '同分录取规则', '单科成绩要求', '体检限制专业', '加分政策', '少数民族照顾'].map((name, index) => [name, 876 - index * 111] as [string, number]);
+  useEffect(() => {
+    loadSpecial();
+  }, [loadSpecial]);
 
   return (
     <>
-      {loadError ? <div className="warning-box"><AlertCircle size={18} />真实专项数据暂不可用，已显示本地样例</div> : null}
-      <StatGrid stats={specialPageStats} />
+      <div className="page-meta">
+        <span>{special ? `专项数据更新时间：${special.updatedAt}` : '专项招生看板'}</span>
+        <RefreshAction loading={loading} onClick={loadSpecial} />
+      </div>
+      {loadError ? <LoadError message={loadError} onRetry={loadSpecial} /> : null}
+      {loading && !special ? <EmptyState>正在读取真实专项数据...</EmptyState> : null}
+      {special?.stats.length ? <StatGrid stats={special.stats} /> : !loading ? <EmptyState compact>暂无专项统计指标。</EmptyState> : null}
       <div className="grid-two">
-        <Card title="师范类 vs 非师范类咨询对比"><Chart option={pieOption(normalVsNonNormal)} height={270} /></Card>
-        <Card title="专项与政策咨询量"><Chart option={barOption(specialPlanRows.map((item) => item[0] as string), specialPlanRows.map((item) => item[1] as number), '#3478f6')} height={270} /></Card>
+        <Card title="师范类 vs 非师范类咨询对比">{special?.normalVsNonNormal.length ? <Chart option={pieOption(special.normalVsNonNormal)} height={270} /> : <EmptyState compact>暂无师范类对比数据。</EmptyState>}</Card>
+        <Card title="专项与政策咨询量">{special?.specialPlans.length ? <Chart option={barOption(special.specialPlans.map((item) => item[0] as string), special.specialPlans.map((item) => item[1] as number), '#3478f6')} height={270} /> : <EmptyState compact>暂无专项政策咨询数据。</EmptyState>}</Card>
       </div>
       <div className="grid-two">
-        <Card title="各专业考生关注度 TOP10"><Chart option={horizontalBarOption(majorAttentionRows)} height={340} /></Card>
+        <Card title="各专业考生关注度 TOP10">{special?.majorAttention.length ? <Chart option={horizontalBarOption(special.majorAttention)} height={340} /> : <EmptyState compact>暂无专业关注度数据。</EmptyState>}</Card>
         <Card title="录取规则与政策类问题统计">
-          <div className="policy-bars">{policyRows.map(([name, count]) => <div key={name}><span>{count}</span><b>{name}</b></div>)}</div>
+          {special?.policyStats.length ? <div className="policy-bars">{special.policyStats.map(([name, count]) => <div key={name}><span>{count}</span><b>{name}</b></div>)}</div> : <EmptyState compact>暂无录取规则统计。</EmptyState>}
         </Card>
       </div>
       <Card title="专项与政策咨询详细数据">
-        <DataTable headers={['名称', '咨询量', '占比', '数据来源', '热度趋势']} rows={specialPlanRows.map((row) => [...row, '▁▃▅▆▇'])} />
+        {special?.specialPlans.length ? <DataTable headers={['名称', '咨询量', '占比', '数据来源', '热度趋势']} rows={special.specialPlans.map((row) => [...row, '▁▃▅▆▇'])} /> : <EmptyState compact>暂无专项与政策咨询明细。</EmptyState>}
       </Card>
       <Card title="2021-2025 录取统计覆盖" action={<span className="soft-pill">来自录取统计表，不等同招生计划</span>}>
-        <StatGrid stats={admissions?.stats ?? []} />
+        {admissions?.stats.length ? <StatGrid stats={admissions.stats} /> : <EmptyState compact>暂无录取统计覆盖指标。</EmptyState>}
         <div className="grid-two">
-          <Chart option={barOption((admissions?.yearCounts ?? []).map((item) => item.name), (admissions?.yearCounts ?? []).map((item) => item.value), '#2161ff')} height={260} />
-          <Chart option={horizontalBarOption(admissions?.provinceCoverage.slice(0, 10) ?? [])} height={260} />
+          {admissions?.yearCounts.length ? <Chart option={barOption(admissions.yearCounts.map((item) => item.name), admissions.yearCounts.map((item) => item.value), '#2161ff')} height={260} /> : <EmptyState compact>暂无年份覆盖数据。</EmptyState>}
+          {admissions?.provinceCoverage.length ? <Chart option={horizontalBarOption(admissions.provinceCoverage.slice(0, 10))} height={260} /> : <EmptyState compact>暂无省份覆盖数据。</EmptyState>}
         </div>
-        <DataTable headers={['覆盖较多的专业', '覆盖省份数']} rows={(admissions?.topMajors ?? []).slice(0, 8).map(([name, count]) => [name, count])} />
+        {admissions?.topMajors.length ? <DataTable headers={['覆盖较多的专业', '覆盖省份数']} rows={admissions.topMajors.slice(0, 8).map(([name, count]) => [name, count])} /> : <EmptyState compact>暂无专业覆盖数据。</EmptyState>}
       </Card>
     </>
   );
@@ -543,25 +563,21 @@ function EvaluationOverviewPage() {
     <>
       <PageTitle title="测评数据总览" subtitle="志愿填报工具使用分析 · 考生刚需程度洞察" />
       <div className="segment"><button>今日</button><button className="active">近7天</button><button>近30天</button><button>全年</button></div>
-      <StatGrid stats={overviewStats} />
       <div className="grid-two">
         <Card title="按地域维度 · 各省份测评统计">
-          <DataTable headers={['省份', '发起量', '有效提交', '转化率']} rows={provinceEvaluations} />
+          <EmptyState compact>测评统计接口尚未接入，暂不展示临时数据。</EmptyState>
         </Card>
         <Card title="每日测评使用量趋势">
-          <Chart option={barOption(['7/10', '7/11', '7/12', '7/13', '7/14', '7/15', '7/16', '7/17'], [8500, 9200, 11500, 12800, 15200, 18500, 22100, 25800], '#3d8bfd')} height={270} />
-          <div className="chart-note"><span>峰值：25,800</span><span>高峰日：7月17日</span></div>
+          <EmptyState compact>暂无真实测评趋势数据。</EmptyState>
         </Card>
       </div>
       <div className="grid-three">
-        <Card title="考生类型 · 科类分布"><ProgressList items={[['物理类', 47.4], ['历史类', 31.8], ['综合改革', 13.4], ['理工', 6.3], ['文史', 1.1]]} /></Card>
-        <Card title="考生类型 · 报考类型分布"><ProgressList items={[['普通本科批', 58], ['公费师范', 20.1], ['专项计划', 13.4], ['优师计划', 8.5]]} /></Card>
-        <Card title="分数段 · 位次区间分布"><ProgressList items={[['1万名以内', 9.9], ['1万-3万名', 29.9], ['3万-5万名', 36.3], ['5万名以外', 23.9]]} /></Card>
+        <Card title="考生类型 · 科类分布"><EmptyState compact>暂无真实科类分布。</EmptyState></Card>
+        <Card title="考生类型 · 报考类型分布"><EmptyState compact>暂无真实报考类型分布。</EmptyState></Card>
+        <Card title="分数段 · 位次区间分布"><EmptyState compact>暂无真实分数段分布。</EmptyState></Card>
       </div>
       <Card title="深度业务洞察">
-        <div className="insight-cards">
-          {['师范专业热度分析', '位次匹配分析', '测评留存分析'].map((title) => <article key={title}><h3>{title}</h3><p>完成测评后，用户会再次咨询专业、学费、就业等信息，测评到深度咨询再到报考转化的链路已初步形成。</p></article>)}
-        </div>
+        <EmptyState compact>待测评数据接口接入后生成真实业务洞察。</EmptyState>
       </Card>
     </>
   );
@@ -569,8 +585,6 @@ function EvaluationOverviewPage() {
 
 function EvaluationPage() {
   const [query, setQuery] = useState('');
-  const [record, setRecord] = useState<EvaluationRecord | null>(null);
-  const rows = evaluationRecords.filter((item) => `${item.id}${item.province}${item.phone}`.includes(query));
   return (
     <>
       <PageTitle title="测评明细" subtitle="每条记录存档、可溯源" />
@@ -580,13 +594,8 @@ function EvaluationPage() {
         <PrimaryButton ghost><Download size={16} />导出Excel</PrimaryButton>
       </Toolbar>
       <Card>
-        <DataTable
-          headers={['编号', '测评类型', '访问省份', 'IP属地', '科类', '报考类型', '分数', '位次', '联系方式', '状态', '操作']}
-          rows={rows.map((item) => [item.id, item.type, item.province, item.ip, item.subject, item.applyType, item.score, item.rank, item.phone, <StatusBadge value={item.status} />, item.status === '已完成' ? <button className="table-action" type="button" onClick={() => setRecord(item)}>查看</button> : '-'])}
-        />
-        <Pagination total={rows.length} />
+        <EmptyState>测评明细接口尚未接入，暂不展示临时记录。</EmptyState>
       </Card>
-      {record ? <Modal title={`测评结果 ${record.id}`} onClose={() => setRecord(null)}><DetailGrid items={record} /></Modal> : null}
     </>
   );
 }
@@ -601,38 +610,28 @@ function ConversationsPage() {
   const [feedbackComment, setFeedbackComment] = useState('');
   const [feedbackSaved, setFeedbackSaved] = useState('');
   const [feedbackSaving, setFeedbackSaving] = useState(false);
-  const mockRows = conversations
-    .filter((item) => item.join('').includes(query))
-    .map(([id, province, updatedAt, messageCount, status, manualIntervention]) => ({
-      id: id as string,
-      province: province as string,
-      updatedAt: updatedAt as string,
-      messageCount: messageCount as number,
-      status: status as string,
-      manualIntervention: manualIntervention === '是',
-      lastMessage: '本地样例对话',
-    }));
-  const rows = apiRows ?? mockRows;
+  const [loading, setLoading] = useState(true);
+  const rows = apiRows ?? [];
 
-  useEffect(() => {
-    let alive = true;
+  const loadConversations = useCallback(() => {
+    setLoading(true);
     fetchAdminConversations(query)
       .then((data) => {
-        if (alive) {
-          setApiRows(data.items);
-          setLoadError('');
-        }
+        setApiRows(data.items);
+        setLoadError('');
       })
       .catch((error: Error) => {
-        if (alive) {
-          setApiRows(null);
-          setLoadError(error.message);
-        }
+        setApiRows([]);
+        setLoadError(error.message);
+      })
+      .finally(() => {
+        setLoading(false);
       });
-    return () => {
-      alive = false;
-    };
   }, [query]);
+
+  useEffect(() => {
+    loadConversations();
+  }, [loadConversations]);
 
   function openConversation(row: AdminConversationListItem) {
     setSelected(row);
@@ -674,23 +673,28 @@ function ConversationsPage() {
       <Toolbar>
         <SelectLike>近7天</SelectLike><SelectLike>全部省份</SelectLike><SelectLike>全部状态</SelectLike>
         <SearchBox value={query} onChange={setQuery} placeholder="搜索对话内容..." />
+        <RefreshAction loading={loading} onClick={loadConversations} />
         <PrimaryButton ghost><Download size={16} />导出</PrimaryButton>
       </Toolbar>
-      {loadError ? <div className="warning-box"><AlertCircle size={18} />真实对话数据暂不可用，已显示本地样例</div> : null}
+      {loadError ? <LoadError message={loadError} onRetry={loadConversations} /> : null}
       <Card title={`对话记录列表 ${rows.length} 条`}>
-        <DataTable
-          headers={['会话ID', '用户省份', '对话时间', '问题数', '状态', '人工介入', '最近问题', '操作']}
-          rows={rows.map((row) => [
-            row.id,
-            row.province,
-            row.updatedAt,
-            row.messageCount,
-            <StatusBadge value={row.status} />,
-            row.manualIntervention ? '是' : '否',
-            row.lastMessage,
-            <button className="table-action" type="button" onClick={() => openConversation(row)}>查看</button>,
-          ])}
-        />
+        {loading && !rows.length ? <EmptyState compact>正在读取真实对话记录...</EmptyState> : null}
+        {!loading && rows.length === 0 ? <EmptyState compact>暂无匹配的真实对话记录。</EmptyState> : null}
+        {rows.length ? (
+          <DataTable
+            headers={['会话ID', '用户省份', '对话时间', '问题数', '状态', '人工介入', '最近问题', '操作']}
+            rows={rows.map((row) => [
+              row.id,
+              row.province,
+              row.updatedAt,
+              row.messageCount,
+              <StatusBadge value={row.status} />,
+              row.manualIntervention ? '是' : '否',
+              row.lastMessage,
+              <button className="table-action" type="button" onClick={() => openConversation(row)}>查看</button>,
+            ])}
+          />
+        ) : null}
       </Card>
       {selected ? (
         <Modal title={`会话审计 ${selected.id}`} onClose={() => { setSelected(null); setDetail(null); }}>
@@ -706,7 +710,7 @@ function ConversationsPage() {
               ))}
             </div>
           ) : (
-            <div className="empty-state">正在读取对话详情，或当前为本地样例数据。</div>
+            <EmptyState>正在读取真实对话详情。</EmptyState>
           )}
           <div className="feedback-panel">
             <h3>人工反馈 / 纠错</h3>
@@ -731,62 +735,49 @@ function ConversationsPage() {
 
 function KnowledgePage() {
   const [query, setQuery] = useState('');
-  const [items, setItems] = useState(knowledgeBase);
   const [apiItems, setApiItems] = useState<KnowledgeItem[] | null>(null);
   const [chunks, setChunks] = useState<AdminKnowledgeChunkItem[]>([]);
   const [coverage, setCoverage] = useState<AdminKnowledgeCoverageSnapshot | null>(null);
   const [faqTotal, setFaqTotal] = useState<number | null>(null);
   const [chunkTotal, setChunkTotal] = useState<number | null>(null);
   const [loadError, setLoadError] = useState('');
+  const [loading, setLoading] = useState(true);
   const [modal, setModal] = useState<'new' | 'import' | 'edit' | null>(null);
   const [editingFaq, setEditingFaq] = useState<KnowledgeItem | null>(null);
   const [savingFaq, setSavingFaq] = useState(false);
-  const rows = apiItems ?? items.filter((item) => `${item.question}${item.answer}${item.similar}`.includes(query));
+  const rows = apiItems ?? [];
 
-  useEffect(() => {
-    let alive = true;
+  const loadKnowledge = useCallback(() => {
+    setLoading(true);
     Promise.all([
       fetchAdminFaqs(query),
       fetchAdminKnowledgeChunks(query),
       fetchAdminKnowledgeCoverage(),
     ])
       .then(([faqList, chunkList, coverageData]) => {
-        if (alive) {
-          setApiItems(faqList.items);
-          setChunks(chunkList.items);
-          setCoverage(coverageData);
-          setFaqTotal(faqList.total);
-          setChunkTotal(chunkList.total);
-          setLoadError('');
-        }
+        setApiItems(faqList.items);
+        setChunks(chunkList.items);
+        setCoverage(coverageData);
+        setFaqTotal(faqList.total);
+        setChunkTotal(chunkList.total);
+        setLoadError('');
       })
       .catch((error: Error) => {
-        if (alive) {
-          setApiItems(null);
-          setChunks([]);
-          setCoverage(null);
-          setFaqTotal(null);
-          setChunkTotal(null);
-          setLoadError(error.message);
-        }
+        setApiItems([]);
+        setChunks([]);
+        setCoverage(null);
+        setFaqTotal(null);
+        setChunkTotal(null);
+        setLoadError(error.message);
+      })
+      .finally(() => {
+        setLoading(false);
       });
-    return () => {
-      alive = false;
-    };
   }, [query]);
 
-  function addUnknown(question: string) {
-    setItems((current) => [...current, {
-      id: current.length + 1,
-      question,
-      similar: '系统自动归集',
-      answer: '待招生办补充标准答案。',
-      source: '未知问题池',
-      updatedAt: '2024-06-14',
-      status: '启用',
-      hits: 0,
-    }]);
-  }
+  useEffect(() => {
+    loadKnowledge();
+  }, [loadKnowledge]);
 
   function openFaqEditor(item: KnowledgeItem) {
     setEditingFaq(item);
@@ -806,20 +797,12 @@ function KnowledgePage() {
       const saved = modal === 'edit' && editingFaq
         ? await updateAdminFaq(String(editingFaq.id), input)
         : await createAdminFaq(input);
-      if (apiItems) {
-        setApiItems((current) => {
-          const list = current ?? [];
-          return modal === 'edit'
-            ? list.map((item) => String(item.id) === String(saved.id) ? saved : item)
-            : [saved, ...list];
-        });
-      } else {
-        setItems((current) => {
-          return modal === 'edit'
-            ? current.map((item) => String(item.id) === String(saved.id) ? saved : item)
-            : [saved, ...current];
-        });
-      }
+      setApiItems((current) => {
+        const list = current ?? [];
+        return modal === 'edit'
+          ? list.map((item) => String(item.id) === String(saved.id) ? saved : item)
+          : [saved, ...list];
+      });
       setModal(null);
       setEditingFaq(null);
       setLoadError('');
@@ -835,32 +818,39 @@ function KnowledgePage() {
       <Toolbar>
         <SelectLike>全部</SelectLike>
         <SearchBox value={query} onChange={setQuery} placeholder="搜索问答内容..." />
+        <RefreshAction loading={loading} onClick={loadKnowledge} />
         <PrimaryButton ghost onClick={() => setModal('import')}><Upload size={16} />批量导入</PrimaryButton>
         <PrimaryButton ghost><Download size={16} />导出</PrimaryButton>
         <PrimaryButton onClick={() => { setEditingFaq(null); setModal('new'); }}><Plus size={16} />新增 FAQ</PrimaryButton>
       </Toolbar>
-      {loadError ? <div className="warning-box"><AlertCircle size={18} />真实知识库暂不可用，已显示本地样例</div> : null}
+      {loadError ? <LoadError message={loadError} onRetry={loadKnowledge} /> : null}
       {coverage ? (
+        <>
         <Card title="知识库真实覆盖概览" action={<span className="soft-pill">更新时间：{coverage.updatedAt}</span>}>
           <StatGrid stats={coverage.stats} />
-          <div className="grid-two">
-            <Chart option={pieOption(coverage.documentKinds)} height={260} />
-            <Chart option={horizontalBarOption(coverage.collegeChunks.slice(0, 12))} height={260} />
-          </div>
-          <div className="grid-two">
-            <div>
-              <h3 className="subsection-title">FAQ 分类覆盖</h3>
-              <Chart option={pieOption(coverage.faqCategories)} height={240} />
-            </div>
-            <div>
-              <h3 className="subsection-title">政策文档年份分布</h3>
-              <Chart option={barOption(coverage.policyYears.map((item) => item.name), coverage.policyYears.map((item) => item.value), '#34c8c2')} height={240} />
-            </div>
+        </Card>
+        <div className="grid-two knowledge-chart-row">
+          <Card title="文档类型分布">
+            {coverage.documentKinds.length ? <Chart option={centeredDonutOption(coverage.documentKinds)} height={300} /> : <EmptyState compact>暂无文档类型数据。</EmptyState>}
+          </Card>
+          <Card title="政策文档年份分布">
+            {coverage.policyYears.length ? <Chart option={barOption(coverage.policyYears.map((item) => item.name), coverage.policyYears.map((item) => item.value), '#34c8c2')} height={300} /> : <EmptyState compact>暂无政策年份数据。</EmptyState>}
+          </Card>
+        </div>
+        <Card title="培养方案学院覆盖" action={<span className="soft-pill">按文档片段数量统计</span>}>
+          {coverage.collegeChunks.length ? <Chart option={wideHorizontalBarOption(coverage.collegeChunks.slice(0, 12))} height={360} /> : <EmptyState compact>暂无学院覆盖数据。</EmptyState>}
+        </Card>
+        <Card title="FAQ 分类覆盖" action={<span className="soft-pill">按固定问答分类统计</span>}>
+          <div className="knowledge-centered-chart">
+            {coverage.faqCategories.length ? <Chart option={centeredDonutOption(coverage.faqCategories)} height={420} /> : <EmptyState compact>暂无 FAQ 分类数据。</EmptyState>}
           </div>
         </Card>
+        </>
       ) : null}
       <Card title={`标准问答库 ${faqTotal ?? rows.length} 条`}>
-        <DataTable headers={['ID', '标准问题', '相似问法', '标准答案', '来源', '更新时间', '状态', '命中', '操作']} rows={rows.map((item) => [item.id, item.question, item.similar, item.answer, item.source, item.updatedAt, <StatusBadge value={item.status} />, item.hits, <button className="table-action" type="button" onClick={() => openFaqEditor(item)}>编辑</button>])} />
+        {loading && !rows.length ? <EmptyState compact>正在读取真实 FAQ...</EmptyState> : null}
+        {!loading && rows.length === 0 ? <EmptyState compact>暂无匹配的真实 FAQ。</EmptyState> : null}
+        {rows.length ? <DataTable headers={['ID', '标准问题', '相似问法', '标准答案', '来源', '更新时间', '状态', '命中', '操作']} rows={rows.map((item) => [item.id, item.question, item.similar, item.answer, item.source, item.updatedAt, <StatusBadge value={item.status} />, item.hits, <button className="table-action" type="button" onClick={() => openFaqEditor(item)}>编辑</button>])} /> : null}
       </Card>
       <Card title={`PDF 文档片段审计 ${chunkTotal ?? chunks.length} 条`} action={<span className="soft-pill">招生简章 / 培养方案</span>}>
         {chunks.length ? (
@@ -878,19 +868,11 @@ function KnowledgePage() {
             ))}
           </div>
         ) : (
-          <div className="empty-state compact">没有匹配到文档片段。</div>
+          <EmptyState compact>没有匹配到真实文档片段。</EmptyState>
         )}
       </Card>
-      <Card title="未知问题归集池" action={<span className="soft-pill amber">本地样例</span>}>
-        <p className="soft-note">第一阶段先接真实 FAQ 和文档片段只读数据；未覆盖问题、审核状态、命中统计会在后续接入事件日志后改为真实分析。</p>
-        <div className="unknown-list">
-          {unknownQuestions.map(([question, count, status]) => (
-            <div key={question as string}>
-              <div><b>{question}</b><span>出现 {count} 次</span><StatusBadge value={status as string} /></div>
-              <PrimaryButton ghost onClick={() => addUnknown(question as string)}><Plus size={16} />加入知识库</PrimaryButton>
-            </div>
-          ))}
-        </div>
+      <Card title="未知问题归集池" action={<span className="soft-pill amber">待接入真实事件日志</span>}>
+        <EmptyState compact>未知问题归集需要接入低置信度回答、无证据回答、人工反馈等真实事件日志；当前不展示临时数据。</EmptyState>
       </Card>
       {modal ? <KnowledgeModal mode={modal} initialItem={editingFaq} saving={savingFaq} onClose={() => { setModal(null); setEditingFaq(null); }} onSave={(item) => void saveFaqDraft(item)} /> : null}
     </>
@@ -952,40 +934,41 @@ function TicketsPage() {
   const [query, setQuery] = useState('');
   const [list, setList] = useState<AdminTicketItem[] | null>(null);
   const [loadError, setLoadError] = useState('');
-  const [ticket, setTicket] = useState<AdminTicketItem | Ticket | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [ticket, setTicket] = useState<AdminTicketItem | null>(null);
   const [resolution, setResolution] = useState('');
   const tabs = ['全部', '待处理', '处理中', '已办结'];
 
-  useEffect(() => {
-    let alive = true;
+  const loadTickets = useCallback(() => {
+    setLoading(true);
     fetchAdminTickets(query, active)
       .then((data) => {
-        if (alive) {
-          setList(data.items);
-          setLoadError('');
-        }
+        setList(data.items);
+        setLoadError('');
       })
       .catch((error: Error) => {
-        if (alive) {
-          setList(null);
-          setLoadError(error.message);
-        }
+        setList([]);
+        setLoadError(error.message);
+      })
+      .finally(() => {
+        setLoading(false);
       });
-    return () => {
-      alive = false;
-    };
   }, [active, query]);
 
-  const rows = list ?? tickets;
+  useEffect(() => {
+    loadTickets();
+  }, [loadTickets]);
+
+  const rows = list ?? [];
   const filtered = rows.filter((item) => {
-    const phone = 'phone' in item ? item.phone ?? '' : '';
-    const email = 'email' in item ? item.email ?? '' : '';
+    const phone = item.phone ?? '';
+    const email = item.email ?? '';
     return (active === '全部' || item.status === active) && `${item.name}${phone}${email}${item.content}${item.province}`.includes(query);
   });
 
-  function openTicket(item: AdminTicketItem | Ticket) {
+  function openTicket(item: AdminTicketItem) {
     setTicket(item);
-    setResolution('resolution' in item && item.resolution ? item.resolution : '');
+    setResolution(item.resolution ? item.resolution : '');
   }
 
   async function advance(id: string) {
@@ -1013,13 +996,16 @@ function TicketsPage() {
       <Toolbar>
         <div className="tabs">{tabs.map((tab) => <button className={active === tab ? 'active' : ''} type="button" onClick={() => setActive(tab)} key={tab}>{tab}</button>)}</div>
         <SearchBox value={query} onChange={setQuery} placeholder="搜索姓名/电话/邮箱/内容..." />
+        <RefreshAction loading={loading} onClick={loadTickets} />
       </Toolbar>
-      {loadError ? <div className="warning-box"><AlertCircle size={18} />真实工单暂不可用，已显示本地样例</div> : null}
+      {loadError ? <LoadError message={loadError} onRetry={loadTickets} /> : null}
       <Card title={`留言工单列表 ${filtered.length} 条`}>
+        {loading && !filtered.length ? <EmptyState compact>正在读取真实留言工单...</EmptyState> : null}
+        {!loading && !filtered.length ? <EmptyState>当前没有匹配的真实工单。</EmptyState> : null}
         {filtered.length ? (
           <DataTable headers={['工单编号', '姓名', '省份', '联系方式', '咨询内容', '提交时间', '状态', '优先级', '操作']} rows={filtered.map((item) => {
-            const phone = 'phone' in item ? item.phone : undefined;
-            const email = 'email' in item ? item.email : undefined;
+            const phone = item.phone;
+            const email = item.email;
             return [
               item.id,
               item.name,
@@ -1029,22 +1015,20 @@ function TicketsPage() {
                 {email ? <small>{email}</small> : null}
               </div>,
               item.content,
-              'createdAt' in item ? item.createdAt : item.time,
+              item.createdAt,
               <StatusBadge value={item.status} />,
               <StatusBadge value={item.priority} />,
               <button className="table-action" type="button" onClick={() => openTicket(item)}>办理</button>
             ];
           })} />
-        ) : (
-          <div className="empty-state">当前没有匹配的真实工单。</div>
-        )}
+        ) : null}
       </Card>
       {ticket ? <Modal title={`工单 ${ticket.id}`} onClose={() => setTicket(null)}>
         <div className="detail-grid">
           <div><span>姓名</span><b>{ticket.name}</b></div>
           <div><span>省份</span><b>{ticket.province}</b></div>
-          <div><span>手机</span><b>{'phone' in ticket && ticket.phone ? ticket.phone : '未填写'}</b></div>
-          <div><span>邮箱</span><b>{'email' in ticket && ticket.email ? ticket.email : '未填写'}</b></div>
+          <div><span>手机</span><b>{ticket.phone ? ticket.phone : '未填写'}</b></div>
+          <div><span>邮箱</span><b>{ticket.email ? ticket.email : '未填写'}</b></div>
         </div>
         <p className="dialog-text">{ticket.content}</p>
         <label className="field"><span>处理备注</span><textarea value={resolution} onChange={(event) => setResolution(event.target.value)} placeholder="填写处理结论、回访情况或下一步安排。" /></label>
@@ -1056,34 +1040,37 @@ function TicketsPage() {
 
 function SettingsPage() {
   const [tab, setTab] = useState('数字人配置');
-  const [welcome, setWelcome] = useState('您好，欢迎来到哈尔滨师范大学！我是您的招生咨询助手「沐阳」，很高兴为您服务。请问有什么可以帮助您的吗？');
-  const [fallback, setFallback] = useState('抱歉，我暂时无法回答这个问题。建议您拨打招生咨询电话：0451-88060678，或者提交人工留言，我们会尽快为您解答。');
+  const [welcome, setWelcome] = useState('');
+  const [fallback, setFallback] = useState('');
   const [saved, setSaved] = useState(false);
   const [settings, setSettings] = useState<AdminSettings | null>(null);
   const [auditLogs, setAuditLogs] = useState<AdminAuditLogItem[]>([]);
   const [loadError, setLoadError] = useState('');
+  const [loading, setLoading] = useState(true);
 
-  useEffect(() => {
-    let alive = true;
+  const loadSettings = useCallback(() => {
+    setLoading(true);
     Promise.all([fetchAdminSettings(), fetchAdminAuditLogs()])
       .then(([settingsData, auditData]) => {
-        if (alive) {
-          setSettings(settingsData);
-          setWelcome(settingsData.welcomeMessage);
-          setFallback(settingsData.fallbackMessage);
-          setAuditLogs(auditData.items);
-          setLoadError('');
-        }
+        setSettings(settingsData);
+        setWelcome(settingsData.welcomeMessage);
+        setFallback(settingsData.fallbackMessage);
+        setAuditLogs(auditData.items);
+        setLoadError('');
       })
       .catch((error: Error) => {
-        if (alive) {
-          setLoadError(error.message);
-        }
+        setSettings(null);
+        setAuditLogs([]);
+        setLoadError(error.message);
+      })
+      .finally(() => {
+        setLoading(false);
       });
-    return () => {
-      alive = false;
-    };
   }, []);
+
+  useEffect(() => {
+    loadSettings();
+  }, [loadSettings]);
 
   async function saveSettings() {
     setSaved(false);
@@ -1105,11 +1092,15 @@ function SettingsPage() {
 
   return (
     <>
-      <div className="tabs settings-tabs">{['数字人配置', '热门问题', '账号管理', '操作日志'].map((item) => <button className={tab === item ? 'active' : ''} type="button" onClick={() => setTab(item)} key={item}>{item}</button>)}</div>
-      {loadError ? <div className="warning-box"><AlertCircle size={18} />真实配置暂不可用：{loadError}</div> : null}
+      <div className="tabs settings-tabs">
+        {['数字人配置', '热门问题', '账号管理', '操作日志'].map((item) => <button className={tab === item ? 'active' : ''} type="button" onClick={() => setTab(item)} key={item}>{item}</button>)}
+        <RefreshAction loading={loading} onClick={loadSettings} />
+      </div>
+      {loadError ? <LoadError message={loadError} onRetry={loadSettings} /> : null}
       {tab === '数字人配置' ? (
         <div className="grid-two">
           <Card title="数字人欢迎语配置">
+            {loading && !settings ? <EmptyState compact>正在读取真实配置...</EmptyState> : null}
             <label className="field"><span>开场欢迎语</span><textarea value={welcome} onChange={(event) => setWelcome(event.target.value)} /></label>
             <label className="field"><span>兜底话术配置</span><textarea value={fallback} onChange={(event) => setFallback(event.target.value)} /></label>
             <PrimaryButton onClick={() => void saveSettings()}><Save size={16} />保存配置</PrimaryButton>
@@ -1138,42 +1129,39 @@ function SettingsPage() {
 function BigScreenPage() {
   const [category, setCategory] = useState('总榜');
   const [screen, setScreen] = useState<AdminBigScreenSnapshot | null>(null);
+  const [loadError, setLoadError] = useState('');
+  const [loading, setLoading] = useState(true);
   const now = new Date().toLocaleString('zh-CN', { year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }).replace(/\//g, '/');
   const bigStatIcons = [Users, MessageSquare, Globe2, LayoutDashboard, MapPinned, Target, FileText];
-  const screenMapData = screen?.mapData.length ? screen.mapData : mapData;
+  const screenMapData = screen?.mapData ?? [];
   const provinceTotal = screenMapData.reduce((sum, item) => sum + item.value, 0) || 1;
   const provincePercents = screenMapData.map((item) => `${(item.value * 100 / provinceTotal).toFixed(1)}%`);
   const provinceEvaluate = screenMapData.map((item) => Math.max(Math.round(item.value * 0.28), 0));
-  const behaviorData = screen?.behaviorCards.map((item) => [item.label, item.value, item.delta, item.points] as const) ?? [
-    ['今日咨询用户', '7,785', '+20.0%', [12, 18, 22, 28, 31, 29, 36]],
-    ['今日咨询问答', '32,777', '+20.5%', [18, 21, 25, 29, 34, 33, 39]],
-    ['今日志愿测评量', '1,168', '+45.2%', [10, 14, 16, 22, 28, 25, 31]],
-    ['近7天用户', '43,252', '+17.3%', [24, 27, 25, 23, 29, 31, 34]],
-    ['近7天问答', '182,094', '+12.4%', [19, 21, 20, 23, 25, 26, 30]],
-    ['近7天志愿测评量', '6,488', '+52.3%', [12, 17, 15, 21, 25, 24, 33]],
-  ] as const;
-  const screenStats = screen?.bigStats ?? bigStats;
-  const screenRealtimeMessages = screen?.realtimeMessages ?? realtimeMessages.map(([province, question, answer, time]) => ({ province: String(province), question: String(question), answer: String(answer), time: String(time) }));
-  const screenTopQuestions = screen?.topQuestions.map((item) => [item.question, `${item.count}次`, item.share] as [string, string, string]) ?? bigTopQuestions;
+  const behaviorData = screen?.behaviorCards.map((item) => [item.label, item.value, item.delta, item.points] as const) ?? [];
+  const screenStats = screen?.bigStats ?? [];
+  const screenRealtimeMessages = screen?.realtimeMessages ?? [];
+  const screenTopQuestions = screen?.topQuestions.map((item) => [item.question, `${item.count}次`, item.share] as [string, string, string]) ?? [];
   const mapMax = Math.max(...screenMapData.map((item) => item.value), 1);
 
-  useEffect(() => {
-    let alive = true;
+  const loadBigScreen = useCallback(() => {
+    setLoading(true);
     fetchAdminBigScreen()
       .then((data) => {
-        if (alive) {
-          setScreen(data);
-        }
+        setScreen(data);
+        setLoadError('');
       })
-      .catch(() => {
-        if (alive) {
-          setScreen(null);
-        }
+      .catch((error: Error) => {
+        setScreen(null);
+        setLoadError(error.message);
+      })
+      .finally(() => {
+        setLoading(false);
       });
-    return () => {
-      alive = false;
-    };
   }, []);
+
+  useEffect(() => {
+    loadBigScreen();
+  }, [loadBigScreen]);
 
   const mapOption = {
     animation: false,
@@ -1208,10 +1196,11 @@ function BigScreenPage() {
       <header className="big-header">
         <div><b>哈师大招生智能体管理后台</b><span>{now}</span></div>
         <h1>哈尔滨师范大学 · 招生智能体<small>全国生源招生咨询态势总览</small></h1>
-        <p>{screen ? `真实咨询数据更新时间：${screen.updatedAt}` : '数据基于用户IP解析省份统计'}</p>
+        <p>{screen ? `真实咨询数据更新时间：${screen.updatedAt}` : loading ? '正在读取真实咨询数据' : '暂无真实咨询数据'}</p>
       </header>
+      {loadError ? <LoadError message={loadError} onRetry={loadBigScreen} /> : null}
       <div className="big-stat-row">
-        {screenStats.map((stat, index) => {
+        {screenStats.length ? screenStats.map((stat, index) => {
           const Icon = bigStatIcons[index] ?? Target;
           return (
             <div key={stat.label}>
@@ -1220,34 +1209,33 @@ function BigScreenPage() {
               <strong>{stat.value}</strong>
             </div>
           );
-        })}
+        }) : <EmptyState compact>暂无真实大屏指标。</EmptyState>}
       </div>
       <section className="big-grid">
         <aside className="big-left">
           <BigPanel title="用户行为数据统计" action={<SelectLike>近30天</SelectLike>}>
             <div className="behavior-grid">
-              {behaviorData.map(([label, value, delta, points], index) => (
+              {behaviorData.length ? behaviorData.map(([label, value, delta, points], index) => (
                 <div key={label}>
                   <span>{label}</span>
                   <strong>{value}<em>↑{delta.replace('+', '')}</em></strong>
                   <SparkLine points={points} tone={index % 3 === 2 ? 'orange' : index % 3 === 1 ? 'blue' : 'green'} />
                 </div>
-              ))}
+              )) : <EmptyState compact>暂无真实用户行为数据。</EmptyState>}
             </div>
-            <div className="wide-metrics"><div><span>人均提问次数</span><strong>3.9</strong></div><div><span>留资转化率</span><strong>10.0%</strong></div></div>
           </BigPanel>
           <BigPanel title="各省咨询数据详情" action={<button type="button" className="export-action"><Download size={15} />导出</button>}>
             <div className="province-detail">
-              <div className="donut"><strong>12</strong><span>省份</span></div>
+              <div className="donut"><strong>{screenMapData.length}</strong><span>省份</span></div>
               <div className="province-table">
                 <div className="province-table-head"><span>省份</span><span>咨询量</span><span>测评量</span></div>
-                <ul>{screenMapData.map((item, index) => (
+                {screenMapData.length ? <ul>{screenMapData.map((item, index) => (
                   <li key={item.name}>
                     <span><i style={{ background: `hsl(212, 95%, ${68 - (index % 5) * 6}%)` }} />{item.name}{['上海', '北京'].includes(item.name) ? '市' : '省'}</span>
                     <b>{item.value.toLocaleString()} <small>({provincePercents[index] ?? '0.0%'})</small></b>
                     <em>{(provinceEvaluate[index] ?? 0).toLocaleString()} <small>({provincePercents[index] ?? '0.0%'})</small></em>
                   </li>
-                ))}</ul>
+                ))}</ul> : <EmptyState compact>暂无真实省份分布数据。</EmptyState>}
                 <div className="province-scrollbar"><span /><b /></div>
               </div>
             </div>
@@ -1255,10 +1243,10 @@ function BigScreenPage() {
         </aside>
         <section className="map-area">
           <BigPanel title="全国各省咨询热力分布" action={<span>IP解析精准度≥99.9%</span>}>
-            <Chart option={mapOption} height={390} />
+            {screenMapData.length ? <Chart option={mapOption} height={390} /> : <EmptyState compact>暂无真实热力图数据。</EmptyState>}
           </BigPanel>
           <BigPanel title="实时咨询动态" action={<span className="live-dot">实时</span>}>
-            <div className="live-list">
+            {screenRealtimeMessages.length ? <div className="live-list">
               <div className="live-track">
                 {[...screenRealtimeMessages, ...screenRealtimeMessages].map(({ province, question, answer, time }, index) => (
                   <div key={`${province}-${time}-${index}`}>
@@ -1269,18 +1257,17 @@ function BigScreenPage() {
                   </div>
                 ))}
               </div>
-            </div>
+            </div> : <EmptyState compact>暂无真实实时咨询动态。</EmptyState>}
           </BigPanel>
         </section>
         <aside className="big-right">
-          <BigPanel title="全国热点问题TOP榜" action={<RefreshCw size={16} />}>
+          <BigPanel title="全国热点问题TOP榜" action={<RefreshAction loading={loading} onClick={loadBigScreen} />}>
             <div className="big-tabs">{['总榜 (100%)', '院校介绍 (25%)', '分数与位次 (32%)', '招生计划 (18%)', '录取政策 (12%)', '专项与公费师范 (8%)', '就读与就业 (5%)'].map((item) => <button className={category === item.split(' ')[0] ? 'active' : ''} type="button" onClick={() => setCategory(item.split(' ')[0])} key={item}>{item}</button>)}</div>
             <div className="big-insight">
               <b>智能洞察</b>
-              <p>{screen?.insight ?? <>考生咨询集中在三个方面：<mark>一是录取分数线及位次预测</mark>，说明考生对录取难度高度关注；<mark>二是师范类专业选择、就业前景及公费师范政策</mark>，表明教师职业吸引力持续增强；<mark>三是招生专业目录、选科要求和录取规则</mark>，体现考生志愿填报日趋理性。</>}</p>
-              <p>高校应重点关注<mark>分数线透明化、师范生就业数据公示、专项计划宣传</mark>等工作。</p>
+              {screen?.insight ? <p>{screen.insight}</p> : <EmptyState compact>暂无真实智能洞察。</EmptyState>}
             </div>
-            <ol className="big-rank">{screenTopQuestions.map(([question, count, delta], index) => <li key={question}><b>{index + 1}</b><span>{question}</span><em>{count}</em><strong className={delta.startsWith('-') ? 'negative' : ''}>{delta}</strong></li>)}</ol>
+            {screenTopQuestions.length ? <ol className="big-rank">{screenTopQuestions.map(([question, count, delta], index) => <li key={question}><b>{index + 1}</b><span>{question}</span><em>{count}</em><strong className={delta.startsWith('-') ? 'negative' : ''}>{delta}</strong></li>)}</ol> : <EmptyState compact>暂无真实热点榜单。</EmptyState>}
           </BigPanel>
         </aside>
       </section>
@@ -1311,10 +1298,6 @@ function MiniMetric({ icon: Icon, label, value }: { icon: LucideIcon; label: str
   return <div className="mini-metric"><Icon size={22} /><span>{label}</span><strong>{value}</strong></div>;
 }
 
-function ProgressList({ items }: { items: Array<[string, number]> }) {
-  return <div className="progress-list">{items.map(([name, value]) => <div key={name}><div><span>{name}</span><b>{value}%</b></div><i><em style={{ width: `${value}%` }} /></i></div>)}</div>;
-}
-
 function DataTable({ headers, rows }: { headers: ReactNode[]; rows: ReactNode[][] }) {
   return (
     <div className="table-wrap">
@@ -1324,14 +1307,6 @@ function DataTable({ headers, rows }: { headers: ReactNode[]; rows: ReactNode[][
       </table>
     </div>
   );
-}
-
-function Pagination({ total }: { total: number }) {
-  return <div className="pagination"><span>共 {total} 条</span><button>上一页</button><b>第 1 页</b><button>下一页</button></div>;
-}
-
-function DetailGrid({ items }: { items: Record<string, unknown> }) {
-  return <div className="detail-grid">{Object.entries(items).map(([key, value]) => <div key={key}><span>{key}</span><b>{String(value)}</b></div>)}</div>;
 }
 
 function BigPanel({ title, action, children }: { title: string; action?: ReactNode; children: ReactNode }) {
@@ -1372,6 +1347,59 @@ function horizontalBarOption(values: Array<[string, number]>) {
     xAxis: { type: 'value', splitLine: { lineStyle: { color: '#eef1f6' } } },
     yAxis: { type: 'category', data: values.map((item) => item[0]), axisTick: { show: false } },
     series: [{ type: 'bar', data: values.map((item) => item[1]), itemStyle: { color: '#35c7c4', borderRadius: [0, 5, 5, 0] }, barWidth: 18 }],
+  };
+}
+
+function wideHorizontalBarOption(values: Array<[string, number]>) {
+  return {
+    animation: false,
+    grid: { left: 170, right: 32, top: 18, bottom: 32 },
+    tooltip: { trigger: 'axis' },
+    xAxis: { type: 'value', splitLine: { lineStyle: { color: '#eef1f6' } } },
+    yAxis: {
+      type: 'category',
+      data: values.map((item) => item[0]),
+      axisTick: { show: false },
+      axisLabel: { color: '#475467', width: 150, overflow: 'truncate' },
+    },
+    series: [{ type: 'bar', data: values.map((item) => item[1]), itemStyle: { color: '#35c7c4', borderRadius: [0, 5, 5, 0] }, barWidth: 20 }],
+  };
+}
+
+function centeredDonutOption(values: Array<{ name: string; value: number }>) {
+  return {
+    animation: false,
+    tooltip: { trigger: 'item' },
+    legend: {
+      type: 'scroll',
+      bottom: 0,
+      left: 'center',
+      orient: 'horizontal',
+      itemWidth: 14,
+      itemHeight: 10,
+      textStyle: { color: '#475467', fontSize: 12 },
+      pageIconColor: '#2161ff',
+      pageTextStyle: { color: '#667085' },
+    },
+    color: ['#2161ff', '#35c7c4', '#ffb020', '#ff6b6b', '#8b5cf6', '#94a3b8', '#10b981', '#f97316', '#0ea5e9', '#ec4899', '#64748b', '#a855f7'],
+    series: [{
+      type: 'pie',
+      radius: ['42%', '66%'],
+      center: ['50%', '43%'],
+      data: values,
+      avoidLabelOverlap: true,
+      label: { show: false },
+      labelLine: { show: false },
+      emphasis: {
+        label: {
+          show: true,
+          formatter: '{b}\n{d}%',
+          color: '#101828',
+          fontSize: 13,
+          fontWeight: 700,
+        },
+      },
+    }],
   };
 }
 

@@ -214,3 +214,32 @@ export type AdminAuditLogList = {
   page: number;
   pageSize: number;
 };
+
+export type AdminEvaluationSummarySnapshot = {
+  updatedAt: string;
+  stats: Stat[];
+  provinceBars: Array<[string, number]>;
+  dailyTrend: Array<[string, number]>;
+  subjectDistribution: AdminChartDatum[];
+  scoreDistribution: AdminChartDatum[];
+  topMajors: Array<[string, number]>;
+};
+
+export type AdminEvaluationListItem = {
+  id: string;
+  conversationId: string;
+  province: string;
+  subjectType: string;
+  score: number;
+  rank: number;
+  majorName: string;
+  probability: number;
+  level: string;
+  summary: string;
+  createdAt: string;
+};
+
+export type AdminEvaluationList = {
+  items: AdminEvaluationListItem[];
+  total: number;
+};

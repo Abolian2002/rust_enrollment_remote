@@ -16,6 +16,8 @@ import type {
   AdminSpecialSnapshot,
   AdminTicketItem,
   AdminTicketList,
+  AdminEvaluationSummarySnapshot,
+  AdminEvaluationList,
 } from '../types/admin';
 
 export function fetchAdminDashboard() {
@@ -132,5 +134,17 @@ export function fetchAdminAuditLogs() {
   return apiGet<AdminAuditLogList>('/api/v1/admin/audit-logs', {
     page: 1,
     pageSize: 50,
+  });
+}
+
+export function fetchAdminEvaluationSummary() {
+  return apiGet<AdminEvaluationSummarySnapshot>('/api/v1/admin/analytics/evaluation/summary');
+}
+
+export function fetchAdminEvaluationList(q: string, page: number = 1, pageSize: number = 20) {
+  return apiGet<AdminEvaluationList>('/api/v1/admin/analytics/evaluation/list', {
+    q,
+    page,
+    pageSize,
   });
 }

@@ -680,3 +680,42 @@ pub fn fail(code: impl Into<String>, message: impl Into<String>) -> ApiEnvelope<
         }),
     }
 }
+
+// ---- 测评数据总览 (聚合快照) ----
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminEvaluationSummarySnapshot {
+    pub updated_at: String,
+    pub stats: Vec<AdminStat>,
+    pub province_bars: Vec<(String, i64)>,
+    pub daily_trend: Vec<(String, i64)>,
+    pub subject_distribution: Vec<AdminChartDatum>,
+    pub score_distribution: Vec<AdminChartDatum>,
+    pub top_majors: Vec<(String, i64)>,
+}
+
+// ---- 测评明细 (分页列表) ----
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminEvaluationListItem {
+    pub id: String,
+    pub conversation_id: String,
+    pub province: String,
+    pub subject_type: String,
+    pub score: i64,
+    pub rank: i64,
+    pub major_name: String,
+    pub probability: i64,
+    pub level: String,
+    pub summary: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminEvaluationList {
+    pub items: Vec<AdminEvaluationListItem>,
+    pub total: i64,
+}

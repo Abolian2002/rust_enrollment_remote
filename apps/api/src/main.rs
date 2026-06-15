@@ -16,8 +16,8 @@ use axum::{
 use db::Database;
 use domain::{
     AdminAdmissionsAnalyticsSnapshot, AdminBigScreenSnapshot, AdminDashboardSnapshot,
-    AdminInsightsSnapshot, AdminKnowledgeCoverageSnapshot, AdminSpecialSnapshot, ChatReply,
-    ChatRequest, fail, ok, ok_with_meta,
+    AdminEvaluationSummarySnapshot, AdminInsightsSnapshot, AdminKnowledgeCoverageSnapshot,
+    AdminSpecialSnapshot, ChatReply, ChatRequest, fail, ok, ok_with_meta,
 };
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -61,6 +61,7 @@ struct AdminSnapshotCache {
     admissions: RwLock<Option<CachedEntry<AdminAdmissionsAnalyticsSnapshot>>>,
     knowledge: RwLock<Option<CachedEntry<AdminKnowledgeCoverageSnapshot>>>,
     big_screen: RwLock<Option<CachedEntry<AdminBigScreenSnapshot>>>,
+    evaluation_summary: RwLock<Option<CachedEntry<AdminEvaluationSummarySnapshot>>>,
 }
 
 impl AdminSnapshotCache {
@@ -73,6 +74,7 @@ impl AdminSnapshotCache {
             admissions: RwLock::new(None),
             knowledge: RwLock::new(None),
             big_screen: RwLock::new(None),
+            evaluation_summary: RwLock::new(None),
         }
     }
 }
@@ -403,6 +405,8 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/v1/admin/settings", get(admin_settings))
         .route("/api/v1/admin/settings", patch(admin_update_settings))
         .route("/api/v1/admin/audit-logs", get(admin_audit_logs))
+        .route("/api/v1/admin/analytics/evaluation/summary", get(admin_evaluation_summary))
+        .route("/api/v1/admin/analytics/evaluation/list", get(admin_evaluation_list))
         .route("/api/v1/tts/token", post(tts_token))
         .route("/api/v1/tts/speech", post(tts_speech))
         .route("/api/v1/tts/stream", post(tts_stream))
@@ -3244,6 +3248,64 @@ fn is_valid_conversation_id(value: &str) -> bool {
         && value
             .chars()
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
+}
+
+async fn admin_evaluation_summary(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(response) = require_admin_token(&headers) {
+        return response;
+    }
+    let cache = &state.admin_cache;
+    let db = state.db.clone();
+    match cached_or_refresh(&cache.evaluation_summary, cache.ttl, || async move {
+        db.admin_evaluation_summary_snapshot().await
+    })
+    .await
+    {
+        Ok(snapshot) => (StatusCode::OK, Json(ok(snapshot))).into_response(),
+        Err(error) => {
+            tracing::error!(error = %error, "failed to load admin evaluation summary");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(fail("ADMIN_EVALUATION_SUMMARY_ERROR", "无法读取测评总览数据。")),
+            )
+                .into_response()
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct AdminEvaluationListParams {
+    q: Option<String>,
+    page: Option<i64>,
+    page_size: Option<i64>,
+}
+
+async fn admin_evaluation_list(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(params): Query<AdminEvaluationListParams>,
+) -> impl IntoResponse {
+    if let Err(response) = require_admin_token(&headers) {
+        return response;
+    }
+    let q = params.q.unwrap_or_default();
+    let page = params.page.unwrap_or(1);
+    let page_size = params.page_size.unwrap_or(20);
+
+    match state.db.admin_evaluation_list(&q, page, page_size).await {
+        Ok(res) => (StatusCode::OK, Json(ok(res))).into_response(),
+        Err(error) => {
+            tracing::error!(error = %error, "failed to list admin evaluations");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(fail("ADMIN_EVALUATION_LIST_ERROR", "无法读取测评明细列表。")),
+            )
+                .into_response()
+        }
+    }
 }
 
 #[cfg(test)]

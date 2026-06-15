@@ -3,8 +3,9 @@ use chrono::{DateTime, Utc};
 use domain::{
     AdminAdmissionsAnalyticsSnapshot, AdminAuditLogItem, AdminAuditLogList, AdminBehaviorCard,
     AdminBigScreenSnapshot, AdminChartDatum, AdminConversationDetail, AdminConversationList,
-    AdminConversationListItem, AdminDashboardSnapshot, AdminFaqItem, AdminFaqList,
-    AdminFeedbackItem, AdminInsightsSnapshot, AdminKnowledgeChunkItem, AdminKnowledgeChunkList,
+    AdminConversationListItem, AdminDashboardSnapshot, AdminEvaluationList, AdminEvaluationListItem,
+    AdminEvaluationSummarySnapshot, AdminFaqItem, AdminFaqList, AdminFeedbackItem,
+    AdminInsightsSnapshot, AdminKnowledgeChunkItem, AdminKnowledgeChunkList,
     AdminKnowledgeCoverageSnapshot, AdminRealtimeMessage, AdminSettings, AdminSpecialSnapshot,
     AdminStat, AdminTicketItem, AdminTicketList, AdminTopQuestion, AdmissionScoreRecord,
     ChatCitation, ChatStructuredResult, ConversationHistory, ConversationMessage, FaqEvidence,
@@ -2875,6 +2876,296 @@ impl Database {
         .await?;
 
         Ok(())
+    }
+
+    pub async fn admin_evaluation_summary_snapshot(&self) -> Result<AdminEvaluationSummarySnapshot> {
+        let (
+            (total_count, province_count, avg_prob),
+            provinces,
+            daily_trend,
+            subjects,
+            scores,
+            top_majors,
+        ) = tokio::try_join!(
+            self.fetch_evaluation_stats(),
+            self.fetch_evaluation_provinces(),
+            self.fetch_evaluation_daily_trend(),
+            self.fetch_evaluation_subjects(),
+            self.fetch_evaluation_scores(),
+            self.fetch_evaluation_top_majors(),
+        )?;
+
+        let updated_at = sqlx::query("SELECT to_char(now(), 'YYYY-MM-DD HH24:MI') AS updated_at")
+            .fetch_one(&self.pool)
+            .await?
+            .get::<String, _>("updated_at");
+
+        let stats = vec![
+            AdminStat {
+                label: "总测评量".to_owned(),
+                value: format_number(total_count),
+                delta: None,
+                tone: Some("blue".to_owned()),
+            },
+            AdminStat {
+                label: "覆盖省份".to_owned(),
+                value: format_number(province_count),
+                delta: None,
+                tone: Some("green".to_owned()),
+            },
+            AdminStat {
+                label: "平均录取概率".to_owned(),
+                value: format!("{:.1}%", avg_prob),
+                delta: None,
+                tone: Some("amber".to_owned()),
+            },
+            AdminStat {
+                label: "最热门专业".to_owned(),
+                value: top_majors.first().map(|(m, _)| m.clone()).unwrap_or_else(|| "暂无".to_owned()),
+                delta: None,
+                tone: Some("purple".to_owned()),
+            },
+        ];
+
+        Ok(AdminEvaluationSummarySnapshot {
+            updated_at,
+            stats,
+            province_bars: provinces,
+            daily_trend,
+            subject_distribution: subjects,
+            score_distribution: scores,
+            top_majors,
+        })
+    }
+
+    pub async fn admin_evaluation_list(
+        &self,
+        query: &str,
+        page: i64,
+        page_size: i64,
+    ) -> Result<AdminEvaluationList> {
+        let page = page.max(1);
+        let page_size = page_size.clamp(1, 100);
+        let offset = (page - 1) * page_size;
+        let pattern = format!("%{}%", query.trim());
+
+        let total = sqlx::query(
+            r#"
+            SELECT COUNT(*)::bigint AS total
+            FROM conversation_messages
+            WHERE structured_payload->>'type' = 'probability_assessment'
+              AND (
+                $1 = '%%'
+                OR conversation_id ILIKE $1
+                OR COALESCE(structured_payload->'assessment'->'province'->>'name', structured_payload->'assessment'->>'province', '') ILIKE $1
+                OR COALESCE(structured_payload->'assessment'->'major'->>'name', structured_payload->'assessment'->>'major', '') ILIKE $1
+                OR COALESCE(structured_payload->'assessment'->>'level', '') ILIKE $1
+                OR COALESCE(structured_payload->'assessment'->>'summary', '') ILIKE $1
+              )
+            "#,
+        )
+        .bind(&pattern)
+        .fetch_one(&self.pool)
+        .await?
+        .get::<i64, _>("total");
+
+        let rows = sqlx::query(
+            r#"
+            SELECT
+              id,
+              conversation_id,
+              COALESCE(structured_payload->'assessment'->'province'->>'name', structured_payload->'assessment'->>'province', '未知') AS province,
+              COALESCE(structured_payload->'assessment'->>'subjectType', '未知') AS subject_type,
+              COALESCE((structured_payload->'assessment'->>'score')::bigint, 0) AS score,
+              COALESCE((structured_payload->'assessment'->>'rank')::bigint, 0) AS rank,
+              COALESCE(structured_payload->'assessment'->'major'->>'name', structured_payload->'assessment'->>'major', '未知') AS major_name,
+              COALESCE((structured_payload->'assessment'->>'probability')::bigint, 0) AS probability,
+              COALESCE(structured_payload->'assessment'->>'level', '未知') AS level,
+              COALESCE(structured_payload->'assessment'->>'summary', '') AS summary,
+              to_char(created_at, 'YYYY-MM-DD HH24:MI:SS') AS created_at
+            FROM conversation_messages
+            WHERE structured_payload->>'type' = 'probability_assessment'
+              AND (
+                $1 = '%%'
+                OR conversation_id ILIKE $1
+                OR COALESCE(structured_payload->'assessment'->'province'->>'name', structured_payload->'assessment'->>'province', '') ILIKE $1
+                OR COALESCE(structured_payload->'assessment'->'major'->>'name', structured_payload->'assessment'->>'major', '') ILIKE $1
+                OR COALESCE(structured_payload->'assessment'->>'level', '') ILIKE $1
+                OR COALESCE(structured_payload->'assessment'->>'summary', '') ILIKE $1
+              )
+            ORDER BY created_at DESC
+            LIMIT $2 OFFSET $3
+            "#,
+        )
+        .bind(&pattern)
+        .bind(page_size)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let items = rows
+            .into_iter()
+            .map(|row| AdminEvaluationListItem {
+                id: row.get("id"),
+                conversation_id: row.get("conversation_id"),
+                province: row.get("province"),
+                subject_type: row.get("subject_type"),
+                score: row.get("score"),
+                rank: row.get("rank"),
+                major_name: row.get("major_name"),
+                probability: row.get("probability"),
+                level: row.get("level"),
+                summary: row.get("summary"),
+                created_at: row.get("created_at"),
+            })
+            .collect();
+
+        Ok(AdminEvaluationList { items, total })
+    }
+
+    // ---- Helper methods for evaluation statistics and distributions ----
+
+    async fn fetch_evaluation_stats(&self) -> Result<(i64, i64, f64)> {
+        let row = sqlx::query(
+            r#"
+            SELECT 
+              COUNT(*)::bigint AS total_count,
+              COUNT(DISTINCT COALESCE(structured_payload->'assessment'->'province'->>'name', structured_payload->'assessment'->>'province', '未知'))::bigint AS province_count,
+              COALESCE(AVG((structured_payload->'assessment'->>'probability')::double precision), 0.0)::double precision AS avg_prob
+            FROM conversation_messages 
+            WHERE structured_payload->>'type' = 'probability_assessment'
+            "#,
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok((
+            row.get::<i64, _>("total_count"),
+            row.get::<i64, _>("province_count"),
+            row.get::<f64, _>("avg_prob"),
+        ))
+    }
+
+    async fn fetch_evaluation_provinces(&self) -> Result<Vec<(String, i64)>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT 
+              REPLACE(COALESCE(structured_payload->'assessment'->'province'->>'name', structured_payload->'assessment'->>'province', '未知'), '省', '') AS province,
+              COUNT(*)::bigint AS count
+            FROM conversation_messages
+            WHERE structured_payload->>'type' = 'probability_assessment'
+            GROUP BY province
+            ORDER BY count DESC, province
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| (row.get::<String, _>("province"), row.get::<i64, _>("count")))
+            .collect())
+    }
+
+    async fn fetch_evaluation_daily_trend(&self) -> Result<Vec<(String, i64)>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT
+              to_char(d.day, 'YYYY-MM-DD') AS label,
+              COALESCE(COUNT(m.id), 0)::bigint AS value
+            FROM (
+              SELECT generate_series(
+                COALESCE(MAX(created_at)::date - interval '29 days', current_date - interval '29 days'),
+                COALESCE(MAX(created_at)::date, current_date),
+                interval '1 day'
+              )::date AS day
+              FROM conversation_messages
+              WHERE structured_payload->>'type' = 'probability_assessment'
+            ) d
+            LEFT JOIN conversation_messages m
+              ON m.structured_payload->>'type' = 'probability_assessment'
+             AND m.created_at::date = d.day
+            GROUP BY d.day
+            ORDER BY d.day ASC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| (row.get::<String, _>("label"), row.get::<i64, _>("value")))
+            .collect())
+    }
+
+    async fn fetch_evaluation_subjects(&self) -> Result<Vec<AdminChartDatum>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT 
+              COALESCE(structured_payload->'assessment'->>'subjectType', '未知') AS name,
+              COUNT(*)::bigint AS value
+            FROM conversation_messages
+            WHERE structured_payload->>'type' = 'probability_assessment'
+            GROUP BY name
+            ORDER BY value DESC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| AdminChartDatum {
+                name: row.get("name"),
+                value: row.get("value"),
+            })
+            .collect())
+    }
+
+    async fn fetch_evaluation_scores(&self) -> Result<Vec<AdminChartDatum>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT 
+              CASE 
+                WHEN (structured_payload->'assessment'->>'score') IS NULL THEN '未填写'
+                WHEN (structured_payload->'assessment'->>'score')::integer < 400 THEN '400分以下'
+                WHEN (structured_payload->'assessment'->>'score')::integer >= 400 AND (structured_payload->'assessment'->>'score')::integer < 500 THEN '400-500分'
+                WHEN (structured_payload->'assessment'->>'score')::integer >= 500 AND (structured_payload->'assessment'->>'score')::integer < 600 THEN '500-600分'
+                ELSE '600分以上'
+              END AS name,
+              COUNT(*)::bigint AS value
+            FROM conversation_messages
+            WHERE structured_payload->>'type' = 'probability_assessment'
+            GROUP BY name
+            ORDER BY value DESC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| AdminChartDatum {
+                name: row.get("name"),
+                value: row.get("value"),
+            })
+            .collect())
+    }
+
+    async fn fetch_evaluation_top_majors(&self) -> Result<Vec<(String, i64)>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT 
+              COALESCE(structured_payload->'assessment'->'major'->>'name', structured_payload->'assessment'->>'major', '未知') AS name,
+              COUNT(*)::bigint AS count
+            FROM conversation_messages
+            WHERE structured_payload->>'type' = 'probability_assessment'
+            GROUP BY name
+            ORDER BY count DESC, name
+            LIMIT 10
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| (row.get::<String, _>("name"), row.get::<i64, _>("count")))
+            .collect())
     }
 }
 

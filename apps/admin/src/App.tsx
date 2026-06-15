@@ -14,7 +14,6 @@ import {
   Download,
   Eye,
   FileText,
-  Filter,
   Globe2,
   LayoutDashboard,
   Mail,
@@ -73,7 +72,6 @@ import type {
   Stat,
   AdminEvaluationSummarySnapshot,
   AdminEvaluationList,
-  AdminEvaluationListItem,
 } from './types/admin';
 
 echarts.registerMap('china', chinaMap as never);

@@ -371,6 +371,7 @@ function DashboardPage() {
   const [dashboard, setDashboard] = useState<AdminDashboardSnapshot | null>(null);
   const [loadError, setLoadError] = useState('');
   const [loading, setLoading] = useState(true);
+  const [timeRange, setTimeRange] = useState('近7天');
 
   const loadDashboard = useCallback(() => {
     setLoading(true);
@@ -408,7 +409,6 @@ function DashboardPage() {
     ? dashboard.trendDays
     : dashboard.trendValues.map((_, index) => `第${index + 1}天`);
 
-  const [timeRange, setTimeRange] = useState('近7天');
 
   return (
     <>

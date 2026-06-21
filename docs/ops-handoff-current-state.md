@@ -71,22 +71,37 @@
 
 ## 4. 服务器与访问方式
 
-### 内网项目服务器
+### 内网自研模型项目服务器（Server 2）
 
 - 地址：`10.10.200.13`
 - 用户：`t2_enroll_ai`
 - 密码：`qwer123456`
+- 主机名：`train-2`
 - 项目目录：`/home/t2_enroll_ai/rust_enrollment`
 - 主要用途：
-  - Rust API
-  - Next.js 学生端前端
-  - PostgreSQL port-forward
-  - LLM / embedding / CosyVoice 模型服务
+  - Rust API 后端
+  - Next.js 学生/家长端前端
+  - PostgreSQL 数据库端口转发
+  - 我方自研微调大模型（7862 端口）及 CosyVoice/Embedding 服务
 
 局域网内直连：
 
 ```bash
 sshpass -p 'qwer123456' ssh t2_enroll_ai@10.10.200.13
+```
+
+### 内网竞品模型服务器（Server 1）
+
+- 地址：`10.10.200.11`
+- 用户：`t1_enroll_ai`
+- 密码：`qwer123456`
+- 主要用途：
+  - 托管对方竞品模型服务（30080 端口）
+
+局域网内直连：
+
+```bash
+sshpass -p 'qwer123456' ssh t1_enroll_ai@10.10.200.11
 ```
 
 如果不在局域网，但能访问 Tailscale 跳板机，需要先经跳板机再到项目服务器。当前跳板机的 Tailscale SSH 可能会要求浏览器二次认证。
@@ -689,3 +704,12 @@ ss -ltnp | grep ':10090'
   - **修复方案**：杀死全部陈旧的后台 API 进程和 Next.js 进程，以最新环境配置重新在后台拉起 `cargo run --bin api` 以及 `npm run dev`。服务重载后，本地数字人语音合成与播放功能彻底恢复正常。
 - **测试通过**：
   - 本地运行 `npm run test` 与 `cargo test` 全部测试百分之百通过。
+
+### 19.3 数字人语音播报（TTS）两大核心故障定位与修复（2026-06-21）
+- **故障 1：语音卡死无声音（Session Superseded 竞态）**：
+  - **故障现象**：数字人头像提示“语音正在连接/播报中”，服务端语音合成完成并发送，但前端浏览器没有输出 `pushPCM: received` 日志，无声音发出。
+  - **根本原因**：前端点击发送时，在同一手势调用栈中先执行 `void voice.prepare()`，紧接着同步执行了 `void voice.interrupt()`。`interrupt` 导致全局会话计数器 `sessionRunId.current` 同步递增，导致异步完成的 `prepare` 在检测会话有效性时，因 ID 不匹配而触发 `"TTS session superseded"` 错误，刚建立的播放器被立刻销毁。
+  - **修复方案**：在 [page.tsx](file:///Users/scm/code/rust_enrollment/apps/web/app/chat/page.tsx) 中调整调用顺序，先执行 `voice.interrupt()` 打断清理旧播放，再同步启动 `voice.prepare()` 开启新会话，确保计数器状态对齐。
+- **故障 2：香港公网 HTTP 访问显示“语音暂不可用”**：
+  - **根本原因**：`server-voice` 模式需使用 `AudioWorklet` 处理 PCM 裸流。出于安全性设计，现代浏览器规定 `AudioWorklet` 仅能在安全上下文（HTTPS 或 localhost）下启用。在公网 HTTP (`http://cpa.abolian.online/chat`) 环境下，浏览器禁用该组件，从而导致数字人左侧报“语音暂不可用”。
+  - **修复方案**：在 `ChatPage` 中加入自动 HTTPS 重定向策略，若检测到在非 localhost 生产环境使用 HTTP 协议访问，自动将协议升级至 HTTPS（因配置了 Cloudflare 的 HTTPS 代理，此过程对用户无感），彻底解决非安全上下文禁用 `AudioWorklet` 的限制。该方案已在服务器 2 上重新部署验证成功。

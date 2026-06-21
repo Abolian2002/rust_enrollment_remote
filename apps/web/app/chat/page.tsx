@@ -220,6 +220,20 @@ function chunkTextForTts(text: string): string[] {
 }
 
 export default function ChatPage() {
+  // Redirect to HTTPS in production to ensure a secure context for AudioWorklet support
+  useEffect(() => {
+    if (
+      typeof window !== "undefined" &&
+      window.location.protocol === "http:" &&
+      window.location.hostname !== "localhost" &&
+      window.location.hostname !== "127.0.0.1"
+    ) {
+      window.location.replace(
+        `https://${window.location.hostname}${window.location.pathname}${window.location.search}`
+      );
+    }
+  }, []);
+
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const [localRichMessages, setLocalRichMessages] = useState<LocalRichMessage[]>([]);
   const [isDrawerOpen, setIsDrawerOpen] = useState(false);

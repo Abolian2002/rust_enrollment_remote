@@ -74,10 +74,7 @@ impl AdmissionsAgent {
     }
 
     pub async fn chat(&self, input: ChatRequest) -> Result<ChatReply> {
-        let active_llm = match input.model.as_deref() {
-            Some("theirs") => &self.llm_theirs,
-            _ => &self.llm,
-        };
+        let active_llm = &self.llm;
         let mut llm_model = active_llm.as_ref().map(|client| client.model().to_owned());
 
         let conversation_id = self
@@ -152,10 +149,7 @@ impl AdmissionsAgent {
         F: FnMut(String, String) -> Fut + Send,
         Fut: Future<Output = bool> + Send,
     {
-        let active_llm = match input.model.as_deref() {
-            Some("theirs") => &self.llm_theirs,
-            _ => &self.llm,
-        };
+        let active_llm = &self.llm;
         let mut llm_model = active_llm.as_ref().map(|client| client.model().to_owned());
 
         let conversation_id = self
@@ -186,6 +180,8 @@ impl AdmissionsAgent {
                         Ok(mut stream) => {
                             let mut streamed = String::new();
                             let mut stream_error = None;
+                            let mut passed_think_gate = false;
+                            let mut think_buffer = String::new();
                             while let Some(delta_result) = stream.next().await {
                                 match delta_result {
                                     Ok(delta) => {
@@ -193,10 +189,49 @@ impl AdmissionsAgent {
                                             continue;
                                         }
                                         streamed.push_str(&delta);
-                                        emitted_any = true;
-                                        if !on_delta(prepared.conversation_id.clone(), delta).await
-                                        {
-                                            break;
+                                        if !passed_think_gate {
+                                            think_buffer.push_str(&delta);
+                                            let mut end_pos = None;
+                                            if let Some(pos) = think_buffer.find("</think>") {
+                                                end_pos = Some((pos, 8));
+                                            } else if let Some(pos) = think_buffer.find("*Draft:*") {
+                                                end_pos = Some((pos, 8));
+                                            } else if let Some(pos) = think_buffer.find("Draft:") {
+                                                end_pos = Some((pos, 6));
+                                            }
+
+                                            if let Some((pos, len)) = end_pos {
+                                                let after_think = think_buffer[pos + len..].to_owned();
+                                                passed_think_gate = true;
+                                                if !after_think.is_empty() {
+                                                    emitted_any = true;
+                                                    if !on_delta(prepared.conversation_id.clone(), after_think).await {
+                                                        break;
+                                                    }
+                                                }
+                                            } else if think_buffer.contains("<think>") {
+                                                // Wait for end delimiter
+                                            } else {
+                                                let temp = think_buffer.trim();
+                                                let is_likely_thinking = temp.starts_with("Thinking")
+                                                    || temp.starts_with("1.")
+                                                    || temp.starts_with("用户")
+                                                    || temp.starts_with("分析")
+                                                    || temp.starts_with("我需要");
+                                                if !is_likely_thinking || think_buffer.len() > 300 {
+                                                    let to_emit = std::mem::take(&mut think_buffer);
+                                                    passed_think_gate = true;
+                                                    emitted_any = true;
+                                                    if !on_delta(prepared.conversation_id.clone(), to_emit).await {
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                        } else {
+                                            emitted_any = true;
+                                            if !on_delta(prepared.conversation_id.clone(), delta).await {
+                                                break;
+                                            }
                                         }
                                     }
                                     Err(error) => {
@@ -204,6 +239,11 @@ impl AdmissionsAgent {
                                         break;
                                     }
                                 }
+                            }
+
+                            if !passed_think_gate && !think_buffer.is_empty() {
+                                emitted_any = true;
+                                let _ = on_delta(prepared.conversation_id.clone(), think_buffer).await;
                             }
 
                             if let Some(error) = stream_error {
@@ -2574,11 +2614,33 @@ fn render_evidence_bundle_answer(result: &ChatStructuredResult) -> String {
     }
 }
 
+fn strip_think_block(mut reply: String) -> String {
+    let mut end_pos = None;
+    if let Some(pos) = reply.find("</think>") {
+        end_pos = Some((pos, 8));
+    } else if let Some(pos) = reply.find("*Draft:*") {
+        end_pos = Some((pos, 8));
+    } else if let Some(pos) = reply.find("Draft:") {
+        end_pos = Some((pos, 6));
+    }
+
+    if let Some((pos, len)) = end_pos {
+        reply = reply[pos + len..].to_owned();
+    }
+
+    if let Some(pos) = reply.find("<think>") {
+        reply = reply[pos + 7..].to_owned();
+    }
+
+    reply.trim().to_owned()
+}
+
 fn finalize_reply(
     reply: String,
     structured_result: &ChatStructuredResult,
     memory: &ResolvedMemory,
 ) -> String {
+    let reply = strip_think_block(reply);
     let reply = ensure_reply_mentions_confirmed_major(reply, structured_result, memory);
     let reply = ensure_reply_mentions_probability_score(reply, structured_result);
     let reply = sanitize_unspecified_subject_false_negative(reply, structured_result);

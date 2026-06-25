@@ -239,7 +239,7 @@ export default function ChatPage() {
   const [isDrawerOpen, setIsDrawerOpen] = useState(false);
   const [isDhModalOpen, setIsDhModalOpen] = useState(false);
   const [isTicketModalOpen, setIsTicketModalOpen] = useState(false);
-  const [selectedModel, setSelectedModel] = useState<string>("ours");
+  const selectedModel = "ours";
 
   const voice = useVoicePlayback();
   const {
@@ -395,8 +395,6 @@ export default function ChatPage() {
 
         <Header
           onOpenDrawer={() => setIsDrawerOpen(true)}
-          selectedModel={selectedModel}
-          onModelChange={setSelectedModel}
         />
 
         {/* 3-Column Layout Container */}
@@ -781,11 +779,9 @@ function TicketModal({ onClose }: { onClose: () => void }) {
 
 interface HeaderProps {
   onOpenDrawer?: () => void;
-  selectedModel: string;
-  onModelChange: (model: string) => void;
 }
 
-function Header({ onOpenDrawer, selectedModel, onModelChange }: HeaderProps) {
+function Header({ onOpenDrawer }: HeaderProps) {
   return (
     <header className="relative z-20 flex h-[76px] shrink-0 items-center justify-between border-b border-slate-200/50 bg-white/70 px-4 shadow-[0_4px_30px_rgba(0,0,0,0.03)] backdrop-blur-md md:px-6">
       <div className="flex min-w-0 items-center gap-3">
@@ -803,41 +799,7 @@ function Header({ onOpenDrawer, selectedModel, onModelChange }: HeaderProps) {
       </div>
 
       <div className="flex shrink-0 items-center gap-2 text-slate-600 md:gap-3">
-        {/* Model Switcher Toggle */}
-        <div className="flex items-center rounded-2xl bg-slate-100/80 p-0.5 border border-slate-200/40 shadow-inner backdrop-blur-sm mr-1">
-          <button
-            type="button"
-            onClick={() => onModelChange("ours")}
-            className={cn(
-              "flex items-center gap-1.5 rounded-2xl px-3 py-1.5 text-xs font-bold transition-all duration-300",
-              selectedModel === "ours"
-                ? "bg-white text-school-900 shadow-soft scale-100"
-                : "text-slate-500 hover:text-slate-900 scale-95"
-            )}
-          >
-            <span className="relative flex h-2 w-2">
-              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
-              <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
-            </span>
-            <span>我方自研</span>
-          </button>
-          <button
-            type="button"
-            onClick={() => onModelChange("theirs")}
-            className={cn(
-              "flex items-center gap-1.5 rounded-2xl px-3 py-1.5 text-xs font-bold transition-all duration-300",
-              selectedModel === "theirs"
-                ? "bg-white text-[#ce3459] shadow-soft scale-100"
-                : "text-slate-500 hover:text-slate-900 scale-95"
-            )}
-          >
-            <span className="relative flex h-2 w-2">
-              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-[#ce3459]/50 opacity-75"></span>
-              <span className="relative inline-flex rounded-full h-2 w-2 bg-[#ce3459]"></span>
-            </span>
-            <span>对方竞品</span>
-          </button>
-        </div>
+
 
         {/* High Frequency Toggle for mobile/tablet */}
         <button

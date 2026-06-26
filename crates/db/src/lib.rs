@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Utc, NaiveDate};
 use domain::{
     AdminAdmissionsAnalyticsSnapshot, AdminAuditLogItem, AdminAuditLogList, AdminBehaviorCard,
     AdminBigScreenSnapshot, AdminChartDatum, AdminConversationDetail, AdminConversationList,
@@ -76,19 +76,33 @@ impl Database {
         Ok(())
     }
 
-    pub async fn admin_dashboard_snapshot(&self) -> Result<AdminDashboardSnapshot> {
+    fn get_range_start(&self, range: Option<&str>) -> Option<DateTime<Utc>> {
+        let now = Utc::now();
+        match range {
+            Some("today") => Some(now - chrono::Duration::days(1)),
+            Some("7d") => Some(now - chrono::Duration::days(7)),
+            Some("30d") => Some(now - chrono::Duration::days(30)),
+            Some("1y") => Some(now - chrono::Duration::days(365)),
+            _ => None,
+        }
+    }
+
+    pub async fn admin_dashboard_snapshot(&self, range: Option<&str>) -> Result<AdminDashboardSnapshot> {
+        let start_time = self.get_range_start(range);
+
         let counts = sqlx::query(
             r#"
             SELECT
-              (SELECT COUNT(*)::bigint FROM conversations) AS conversation_count,
-              (SELECT COUNT(*)::bigint FROM conversation_messages WHERE role = 'user') AS user_message_count,
-              (SELECT COUNT(*)::bigint FROM conversation_messages WHERE role = 'assistant') AS assistant_message_count,
+              (SELECT COUNT(*)::bigint FROM conversations WHERE $1::timestamptz IS NULL OR created_at >= $1) AS conversation_count,
+              (SELECT COUNT(*)::bigint FROM conversation_messages WHERE role = 'user' AND ($1::timestamptz IS NULL OR created_at >= $1)) AS user_message_count,
+              (SELECT COUNT(*)::bigint FROM conversation_messages WHERE role = 'assistant' AND ($1::timestamptz IS NULL OR created_at >= $1)) AS assistant_message_count,
               (SELECT COUNT(*)::bigint FROM faq_knowledge WHERE status = 'PUBLISHED') AS faq_count,
               (SELECT COUNT(*)::bigint FROM knowledge_chunks WHERE data_version = 'official-pdf-knowledge-v2') AS chunk_count,
               (SELECT COUNT(DISTINCT province_id)::bigint FROM admission_scores) AS province_count,
               to_char(now(), 'YYYY-MM-DD HH24:MI') AS updated_at
             "#,
         )
+        .bind(start_time)
         .fetch_one(&self.pool)
         .await?;
 
@@ -107,12 +121,20 @@ impl Database {
             "0.0".to_owned()
         };
 
+        let (start_date, end_date) = match range {
+            Some("today") => (Utc::now().naive_utc().date(), Utc::now().naive_utc().date()),
+            Some("7d") => (Utc::now().naive_utc().date() - chrono::Duration::days(6), Utc::now().naive_utc().date()),
+            Some("30d") => (Utc::now().naive_utc().date() - chrono::Duration::days(29), Utc::now().naive_utc().date()),
+            Some("1y") => (Utc::now().naive_utc().date() - chrono::Duration::days(364), Utc::now().naive_utc().date()),
+            _ => (Utc::now().naive_utc().date() - chrono::Duration::days(13), Utc::now().naive_utc().date()),
+        };
+
         let trend_rows = sqlx::query(
             r#"
             SELECT
               to_char(day::date, 'MM-DD') AS label,
               COALESCE(COUNT(m.id), 0)::bigint AS value
-            FROM generate_series(current_date - interval '13 days', current_date, interval '1 day') AS day
+            FROM generate_series($1::date, $2::date, interval '1 day') AS day
             LEFT JOIN conversation_messages m
               ON m.role = 'user'
              AND m.created_at >= day
@@ -121,6 +143,8 @@ impl Database {
             ORDER BY day
             "#,
         )
+        .bind(start_date)
+        .bind(end_date)
         .fetch_all(&self.pool)
         .await?;
         let trend_days = trend_rows
@@ -141,11 +165,12 @@ impl Database {
             LEFT JOIN conversation_messages m
               ON m.role = 'user'
              AND EXTRACT(hour FROM m.created_at)::int = hour
-             AND m.created_at >= now() - interval '30 days'
+             AND ($1::timestamptz IS NULL OR m.created_at >= $1)
             GROUP BY hour
             ORDER BY hour
             "#,
         )
+        .bind(start_time)
         .fetch_all(&self.pool)
         .await?;
         let hourly_values = hourly_rows
@@ -161,11 +186,13 @@ impl Database {
             FROM conversation_messages
             WHERE role = 'user'
               AND trim(content) <> ''
+              AND ($1::timestamptz IS NULL OR created_at >= $1)
             GROUP BY left(regexp_replace(trim(content), '\s+', ' ', 'g'), 80)
             ORDER BY count DESC, max(created_at) DESC
             LIMIT 20
             "#,
         )
+        .bind(start_time)
         .fetch_all(&self.pool)
         .await?;
         let hot_questions = hot_rows
@@ -192,11 +219,13 @@ impl Database {
               END AS category
               FROM conversation_messages
               WHERE role = 'user'
+                AND ($1::timestamptz IS NULL OR created_at >= $1)
             ) categorized
             GROUP BY category
             ORDER BY count DESC
             "#,
         )
+        .bind(start_time)
         .fetch_all(&self.pool)
         .await?;
         let category_stats = category_rows
@@ -214,11 +243,13 @@ impl Database {
               COUNT(*)::bigint AS count
             FROM conversations c
             LEFT JOIN provinces p ON p.code = c.province_code OR p.name = c.province_code
+            WHERE ($1::timestamptz IS NULL OR c.created_at >= $1)
             GROUP BY COALESCE(p.name, NULLIF(c.province_code, ''), '未知')
             ORDER BY count DESC, province
             LIMIT 12
             "#,
         )
+        .bind(start_time)
         .fetch_all(&self.pool)
         .await?;
         let province_bars = province_rows
@@ -279,17 +310,28 @@ impl Database {
         })
     }
 
-    pub async fn admin_insights_snapshot(&self) -> Result<AdminInsightsSnapshot> {
+    pub async fn admin_insights_snapshot(&self, range: Option<&str>) -> Result<AdminInsightsSnapshot> {
+        let start_time = self.get_range_start(range);
+        let active_start_time = start_time.or_else(|| Some(Utc::now() - chrono::Duration::days(30)));
+        let range_label = match range {
+            Some("today") => "今天",
+            Some("7d") => "近7天",
+            Some("30d") => "近30天",
+            Some("1y") => "近1年",
+            _ => "近30天",
+        };
+
         let counts = sqlx::query(
             r#"
             SELECT
-              (SELECT COUNT(DISTINCT conversation_id)::bigint FROM conversation_messages WHERE role = 'user' AND created_at >= now() - interval '30 days') AS active_users,
-              (SELECT COUNT(*)::bigint FROM conversation_messages WHERE role = 'user' AND created_at >= now() - interval '30 days') AS question_count,
-              (SELECT COUNT(DISTINCT c.province_code)::bigint FROM conversations c WHERE NULLIF(c.province_code, '') IS NOT NULL) AS province_count,
-              (SELECT COUNT(*)::bigint FROM conversation_messages WHERE role = 'user') AS total_questions,
+              (SELECT COUNT(DISTINCT conversation_id)::bigint FROM conversation_messages WHERE role = 'user' AND ($1::timestamptz IS NULL OR created_at >= $1)) AS active_users,
+              (SELECT COUNT(*)::bigint FROM conversation_messages WHERE role = 'user' AND ($1::timestamptz IS NULL OR created_at >= $1)) AS question_count,
+              (SELECT COUNT(DISTINCT c.province_code)::bigint FROM conversations c WHERE NULLIF(c.province_code, '') IS NOT NULL AND ($1::timestamptz IS NULL OR c.created_at >= $1)) AS province_count,
+              (SELECT COUNT(*)::bigint FROM conversation_messages WHERE role = 'user' AND ($1::timestamptz IS NULL OR created_at >= $1)) AS total_questions,
               to_char(now(), 'YYYY-MM-DD HH24:MI') AS updated_at
             "#,
         )
+        .bind(active_start_time)
         .fetch_one(&self.pool)
         .await?;
         let active_users = counts.get::<i64, _>("active_users");
@@ -297,9 +339,9 @@ impl Database {
         let province_count = counts.get::<i64, _>("province_count");
         let total_questions = counts.get::<i64, _>("total_questions").max(1);
 
-        let category_stats = self.admin_question_category_stats().await?;
-        let province_bars = self.admin_province_bars(12).await?;
-        let top_questions = self.admin_top_questions(20, total_questions).await?;
+        let category_stats = self.admin_question_category_stats(active_start_time).await?;
+        let province_bars = self.admin_province_bars(12, active_start_time).await?;
+        let top_questions = self.admin_top_questions(20, total_questions, active_start_time).await?;
 
         let word_rows = sqlx::query(
             r#"
@@ -313,12 +355,14 @@ impl Database {
             FROM keywords
             LEFT JOIN conversation_messages m
               ON m.role = 'user' AND m.content ILIKE '%' || word || '%'
+             AND ($1::timestamptz IS NULL OR m.created_at >= $1)
             GROUP BY word
             HAVING COUNT(m.id) > 0
             ORDER BY count DESC, word
             LIMIT 24
             "#,
         )
+        .bind(active_start_time)
         .fetch_all(&self.pool)
         .await?;
         let word_cloud = word_rows
@@ -333,13 +377,13 @@ impl Database {
             updated_at: counts.get("updated_at"),
             stats: vec![
                 AdminStat {
-                    label: "近30天咨询会话".to_owned(),
+                    label: format!("{}咨询会话", range_label),
                     value: format_number(active_users),
                     delta: None,
                     tone: Some("blue".to_owned()),
                 },
                 AdminStat {
-                    label: "近30天用户提问".to_owned(),
+                    label: format!("{}用户提问", range_label),
                     value: format_number(question_count),
                     delta: None,
                     tone: Some("green".to_owned()),
@@ -734,7 +778,7 @@ impl Database {
             .get::<i64, _>("count");
 
         let map_data = self
-            .admin_province_bars(34)
+            .admin_province_bars(34, None)
             .await?
             .into_iter()
             .map(|(name, value)| AdminChartDatum { name, value })
@@ -777,7 +821,7 @@ impl Database {
             .collect::<Vec<_>>();
 
         let day_points = self.admin_recent_user_question_points(7).await?;
-        let top_questions = self.admin_top_questions(10, total_questions).await?;
+        let top_questions = self.admin_top_questions(10, total_questions, None).await?;
 
         Ok(AdminBigScreenSnapshot {
             updated_at,
@@ -937,7 +981,7 @@ impl Database {
         .await?)
     }
 
-    async fn admin_question_category_stats(&self) -> Result<Vec<AdminChartDatum>> {
+    async fn admin_question_category_stats(&self, start_time: Option<DateTime<Utc>>) -> Result<Vec<AdminChartDatum>> {
         let rows = sqlx::query(
             r#"
             SELECT category, COUNT(*)::bigint AS count
@@ -953,11 +997,13 @@ impl Database {
               END AS category
               FROM conversation_messages
               WHERE role = 'user'
+                AND ($1::timestamptz IS NULL OR created_at >= $1)
             ) categorized
             GROUP BY category
             ORDER BY count DESC, category
             "#,
         )
+        .bind(start_time)
         .fetch_all(&self.pool)
         .await?;
 
@@ -970,7 +1016,7 @@ impl Database {
             .collect())
     }
 
-    async fn admin_province_bars(&self, limit: i64) -> Result<Vec<(String, i64)>> {
+    async fn admin_province_bars(&self, limit: i64, start_time: Option<DateTime<Utc>>) -> Result<Vec<(String, i64)>> {
         let rows = sqlx::query(
             r#"
             SELECT
@@ -978,12 +1024,14 @@ impl Database {
               COUNT(*)::bigint AS count
             FROM conversations c
             LEFT JOIN provinces p ON p.code = c.province_code OR p.name = c.province_code
+            WHERE ($2::timestamptz IS NULL OR c.created_at >= $2)
             GROUP BY COALESCE(p.name, NULLIF(c.province_code, ''), '未知')
             ORDER BY count DESC, province
             LIMIT $1
             "#,
         )
         .bind(limit)
+        .bind(start_time)
         .fetch_all(&self.pool)
         .await?;
 
@@ -997,6 +1045,7 @@ impl Database {
         &self,
         limit: i64,
         total_questions: i64,
+        start_time: Option<DateTime<Utc>>,
     ) -> Result<Vec<AdminTopQuestion>> {
         let rows = sqlx::query(
             r#"
@@ -1020,6 +1069,7 @@ impl Database {
               FROM conversation_messages
               WHERE role = 'user'
                 AND trim(content) <> ''
+                AND ($2::timestamptz IS NULL OR created_at >= $2)
               GROUP BY left(regexp_replace(trim(content), '\s+', ' ', 'g'), 80)
             ) grouped
             ORDER BY count DESC, latest_at DESC
@@ -1027,6 +1077,7 @@ impl Database {
             "#,
         )
         .bind(limit)
+        .bind(start_time)
         .fetch_all(&self.pool)
         .await?;
 
@@ -1111,24 +1162,29 @@ impl Database {
         query: &str,
         page: i64,
         page_size: i64,
+        range: Option<&str>,
     ) -> Result<AdminConversationList> {
         let page = page.max(1);
         let page_size = page_size.clamp(1, 100);
         let offset = (page - 1) * page_size;
         let pattern = format!("%{}%", query.trim());
+        let start_time = self.get_range_start(range);
+
         let total = sqlx::query(
             r#"
             SELECT COUNT(DISTINCT c.id)::bigint AS total
             FROM conversations c
-            WHERE $1 = '%%'
-               OR c.id ILIKE $1
-               OR c.session_key ILIKE $1
+            WHERE ($2 = '%%'
+               OR c.id ILIKE $2
+               OR c.session_key ILIKE $2
                OR EXISTS (
                  SELECT 1 FROM conversation_messages m
-                 WHERE m.conversation_id = c.id AND m.content ILIKE $1
-               )
+                 WHERE m.conversation_id = c.id AND m.content ILIKE $2
+               ))
+               AND ($1::timestamptz IS NULL OR c.created_at >= $1)
             "#,
         )
+        .bind(start_time)
         .bind(&pattern)
         .fetch_one(&self.pool)
         .await?
@@ -1154,21 +1210,23 @@ impl Database {
             FROM conversations c
             LEFT JOIN provinces p ON p.code = c.province_code OR p.name = c.province_code
             LEFT JOIN conversation_messages m ON m.conversation_id = c.id
-            WHERE $1 = '%%'
-               OR c.id ILIKE $1
-               OR c.session_key ILIKE $1
+            WHERE ($4 = '%%'
+               OR c.id ILIKE $4
+               OR c.session_key ILIKE $4
                OR EXISTS (
                  SELECT 1 FROM conversation_messages sm
-                 WHERE sm.conversation_id = c.id AND sm.content ILIKE $1
-               )
+                 WHERE sm.conversation_id = c.id AND sm.content ILIKE $4
+               ))
+               AND ($1::timestamptz IS NULL OR c.created_at >= $1)
             GROUP BY c.id, p.name, c.province_code, c.updated_at
             ORDER BY c.updated_at DESC
             LIMIT $2 OFFSET $3
             "#,
         )
-        .bind(&pattern)
+        .bind(start_time)
         .bind(page_size)
         .bind(offset)
+        .bind(&pattern)
         .fetch_all(&self.pool)
         .await?;
 
@@ -2884,7 +2942,17 @@ impl Database {
         Ok(())
     }
 
-    pub async fn admin_evaluation_summary_snapshot(&self) -> Result<AdminEvaluationSummarySnapshot> {
+    pub async fn admin_evaluation_summary_snapshot(&self, range: Option<&str>) -> Result<AdminEvaluationSummarySnapshot> {
+        let start_time = self.get_range_start(range);
+
+        let (start_date, end_date) = match range {
+            Some("today") => (Utc::now().naive_utc().date(), Utc::now().naive_utc().date()),
+            Some("7d") => (Utc::now().naive_utc().date() - chrono::Duration::days(6), Utc::now().naive_utc().date()),
+            Some("30d") => (Utc::now().naive_utc().date() - chrono::Duration::days(29), Utc::now().naive_utc().date()),
+            Some("1y") => (Utc::now().naive_utc().date() - chrono::Duration::days(364), Utc::now().naive_utc().date()),
+            _ => (Utc::now().naive_utc().date() - chrono::Duration::days(29), Utc::now().naive_utc().date()), // default 30 days
+        };
+
         let (
             (total_count, province_count, avg_prob),
             provinces,
@@ -2893,12 +2961,12 @@ impl Database {
             scores,
             top_majors,
         ) = tokio::try_join!(
-            self.fetch_evaluation_stats(),
-            self.fetch_evaluation_provinces(),
-            self.fetch_evaluation_daily_trend(),
-            self.fetch_evaluation_subjects(),
-            self.fetch_evaluation_scores(),
-            self.fetch_evaluation_top_majors(),
+            self.fetch_evaluation_stats(start_time),
+            self.fetch_evaluation_provinces(start_time),
+            self.fetch_evaluation_daily_trend(start_date, end_date),
+            self.fetch_evaluation_subjects(start_time),
+            self.fetch_evaluation_scores(start_time),
+            self.fetch_evaluation_top_majors(start_time),
         )?;
 
         let updated_at = sqlx::query("SELECT to_char(now(), 'YYYY-MM-DD HH24:MI') AS updated_at")
@@ -3031,7 +3099,7 @@ impl Database {
 
     // ---- Helper methods for evaluation statistics and distributions ----
 
-    async fn fetch_evaluation_stats(&self) -> Result<(i64, i64, f64)> {
+    async fn fetch_evaluation_stats(&self, start_time: Option<DateTime<Utc>>) -> Result<(i64, i64, f64)> {
         let row = sqlx::query(
             r#"
             SELECT 
@@ -3040,8 +3108,10 @@ impl Database {
               COALESCE(AVG((structured_payload->'assessment'->>'probability')::double precision), 0.0)::double precision AS avg_prob
             FROM conversation_messages 
             WHERE structured_payload->>'type' = 'probability_assessment'
+              AND ($1::timestamptz IS NULL OR created_at >= $1)
             "#,
         )
+        .bind(start_time)
         .fetch_one(&self.pool)
         .await?;
         Ok((
@@ -3051,7 +3121,7 @@ impl Database {
         ))
     }
 
-    async fn fetch_evaluation_provinces(&self) -> Result<Vec<(String, i64)>> {
+    async fn fetch_evaluation_provinces(&self, start_time: Option<DateTime<Utc>>) -> Result<Vec<(String, i64)>> {
         let rows = sqlx::query(
             r#"
             SELECT 
@@ -3059,10 +3129,12 @@ impl Database {
               COUNT(*)::bigint AS count
             FROM conversation_messages
             WHERE structured_payload->>'type' = 'probability_assessment'
+              AND ($1::timestamptz IS NULL OR created_at >= $1)
             GROUP BY province
             ORDER BY count DESC, province
             "#,
         )
+        .bind(start_time)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows
@@ -3071,20 +3143,14 @@ impl Database {
             .collect())
     }
 
-    async fn fetch_evaluation_daily_trend(&self) -> Result<Vec<(String, i64)>> {
+    async fn fetch_evaluation_daily_trend(&self, start_date: NaiveDate, end_date: NaiveDate) -> Result<Vec<(String, i64)>> {
         let rows = sqlx::query(
             r#"
             SELECT
               to_char(d.day, 'YYYY-MM-DD') AS label,
               COALESCE(COUNT(m.id), 0)::bigint AS value
             FROM (
-              SELECT generate_series(
-                COALESCE(MAX(created_at)::date - interval '29 days', current_date - interval '29 days'),
-                COALESCE(MAX(created_at)::date, current_date),
-                interval '1 day'
-              )::date AS day
-              FROM conversation_messages
-              WHERE structured_payload->>'type' = 'probability_assessment'
+              SELECT generate_series($1::date, $2::date, interval '1 day')::date AS day
             ) d
             LEFT JOIN conversation_messages m
               ON m.structured_payload->>'type' = 'probability_assessment'
@@ -3093,6 +3159,8 @@ impl Database {
             ORDER BY d.day ASC
             "#,
         )
+        .bind(start_date)
+        .bind(end_date)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows
@@ -3101,7 +3169,7 @@ impl Database {
             .collect())
     }
 
-    async fn fetch_evaluation_subjects(&self) -> Result<Vec<AdminChartDatum>> {
+    async fn fetch_evaluation_subjects(&self, start_time: Option<DateTime<Utc>>) -> Result<Vec<AdminChartDatum>> {
         let rows = sqlx::query(
             r#"
             SELECT 
@@ -3109,10 +3177,12 @@ impl Database {
               COUNT(*)::bigint AS value
             FROM conversation_messages
             WHERE structured_payload->>'type' = 'probability_assessment'
+              AND ($1::timestamptz IS NULL OR created_at >= $1)
             GROUP BY name
             ORDER BY value DESC
             "#,
         )
+        .bind(start_time)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows
@@ -3124,7 +3194,7 @@ impl Database {
             .collect())
     }
 
-    async fn fetch_evaluation_scores(&self) -> Result<Vec<AdminChartDatum>> {
+    async fn fetch_evaluation_scores(&self, start_time: Option<DateTime<Utc>>) -> Result<Vec<AdminChartDatum>> {
         let rows = sqlx::query(
             r#"
             SELECT 
@@ -3138,10 +3208,12 @@ impl Database {
               COUNT(*)::bigint AS value
             FROM conversation_messages
             WHERE structured_payload->>'type' = 'probability_assessment'
+              AND ($1::timestamptz IS NULL OR created_at >= $1)
             GROUP BY name
             ORDER BY value DESC
             "#,
         )
+        .bind(start_time)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows
@@ -3153,7 +3225,7 @@ impl Database {
             .collect())
     }
 
-    async fn fetch_evaluation_top_majors(&self) -> Result<Vec<(String, i64)>> {
+    async fn fetch_evaluation_top_majors(&self, start_time: Option<DateTime<Utc>>) -> Result<Vec<(String, i64)>> {
         let rows = sqlx::query(
             r#"
             SELECT 
@@ -3161,17 +3233,92 @@ impl Database {
               COUNT(*)::bigint AS count
             FROM conversation_messages
             WHERE structured_payload->>'type' = 'probability_assessment'
+              AND ($1::timestamptz IS NULL OR created_at >= $1)
             GROUP BY name
             ORDER BY count DESC, name
             LIMIT 10
             "#,
         )
+        .bind(start_time)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows
             .into_iter()
             .map(|row| (row.get::<String, _>("name"), row.get::<i64, _>("count")))
             .collect())
+    }
+
+    pub async fn admin_import_faqs(
+        &self,
+        filename: &str,
+        hash: &str,
+        rows_to_import: Vec<(String, String, String)>,
+        imported_by: &str,
+    ) -> Result<usize> {
+        let batch_id = format!("faq_import_batch_{}", Uuid::new_v4().simple());
+        let batch_no = format!("faq-import-{}", Uuid::new_v4().simple());
+        let notes = "批量导入 FAQ";
+        let mut tx = self.pool.begin().await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO import_batches
+              (id, batch_no, import_type, status, summary, is_sample, notes, imported_by, source_file_name, source_hash, data_version, created_at, updated_at)
+            VALUES
+              ($1, $2, 'FAQ_KNOWLEDGE'::"ImportType", 'SUCCESS'::"ImportBatchStatus", $3, false, $4, $5, $6, $7, 'admin-faq-v1', now(), now())
+            "#
+        )
+        .bind(&batch_id)
+        .bind(&batch_no)
+        .bind(serde_json::json!({ "count": rows_to_import.len() }))
+        .bind(notes)
+        .bind(Some(imported_by))
+        .bind(filename)
+        .bind(hash)
+        .execute(&mut *tx)
+        .await?;
+
+        for (question, answer, category) in &rows_to_import {
+            let id = format!("faq_import_{}", Uuid::new_v4().simple());
+            sqlx::query(
+                r#"
+                INSERT INTO faq_knowledge
+                  (id, imported_batch_id, question, answer, category, tags, status, source_label, data_version, created_at, updated_at)
+                VALUES
+                  ($1, $2, $3, $4, $5, '[]'::jsonb, 'PUBLISHED'::"FaqStatus", '批量导入', 'admin-faq-v1', now(), now())
+                "#
+            )
+            .bind(&id)
+            .bind(&batch_id)
+            .bind(question.trim())
+            .bind(answer.trim())
+            .bind(category.trim())
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        let audit_log_id = format!("audit_{}", Uuid::new_v4().simple());
+        sqlx::query(
+            r#"
+            INSERT INTO admin_audit_logs
+              (id, action, target_type, target_id, actor, detail, created_at)
+            VALUES
+              ($1, 'import_faqs', 'faq_knowledge', $2, $3, $4, now())
+            "#
+        )
+        .bind(&audit_log_id)
+        .bind(&batch_id)
+        .bind(imported_by)
+        .bind(serde_json::json!({
+            "batch_no": batch_no,
+            "filename": filename,
+            "count": rows_to_import.len()
+        }))
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(rows_to_import.len())
     }
 }
 

@@ -365,6 +365,7 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/v1/knowledge/faq", get(knowledge_faq))
         .route("/api/v1/knowledge/policies", get(knowledge_policies))
         .route("/api/v1/tickets", post(create_public_ticket))
+        .route("/api/v1/settings/public", get(public_settings))
         .route("/api/v1/admin/dashboard/summary", get(admin_dashboard))
         .route("/api/v1/admin/analytics/insights", get(admin_insights))
         .route("/api/v1/admin/analytics/special", get(admin_special))
@@ -384,6 +385,10 @@ fn build_router(state: Arc<AppState>) -> Router {
         )
         .route("/api/v1/admin/knowledge/faqs", get(admin_knowledge_faqs))
         .route("/api/v1/admin/knowledge/faqs", post(admin_create_faq))
+        .route(
+            "/api/v1/admin/knowledge/faqs/import",
+            post(admin_import_faqs_handler),
+        )
         .route(
             "/api/v1/admin/knowledge/faqs/{faq_id}",
             patch(admin_update_faq),
@@ -1573,17 +1578,25 @@ async fn knowledge_policies(
 async fn admin_dashboard(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
     if let Err(response) = require_admin_token(&headers) {
         return response;
     }
+    let range = params.get("range").map(|s| s.as_str());
     let cache = &state.admin_cache;
     let db = state.db.clone();
-    match cached_or_refresh(&cache.dashboard, cache.ttl, || async move {
-        db.admin_dashboard_snapshot().await
-    })
-    .await
-    {
+
+    let result = if range.is_some() {
+        db.admin_dashboard_snapshot(range).await
+    } else {
+        cached_or_refresh(&cache.dashboard, cache.ttl, || async move {
+            db.admin_dashboard_snapshot(None).await
+        })
+        .await
+    };
+
+    match result {
         Ok(snapshot) => (StatusCode::OK, Json(ok(snapshot))).into_response(),
         Err(error) => {
             tracing::error!(error = %error, "failed to load admin dashboard");
@@ -1599,17 +1612,25 @@ async fn admin_dashboard(
 async fn admin_insights(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
     if let Err(response) = require_admin_token(&headers) {
         return response;
     }
+    let range = params.get("range").map(|s| s.as_str());
     let cache = &state.admin_cache;
     let db = state.db.clone();
-    match cached_or_refresh(&cache.insights, cache.ttl, || async move {
-        db.admin_insights_snapshot().await
-    })
-    .await
-    {
+
+    let result = if range.is_some() {
+        db.admin_insights_snapshot(range).await
+    } else {
+        cached_or_refresh(&cache.insights, cache.ttl, || async move {
+            db.admin_insights_snapshot(None).await
+        })
+        .await
+    };
+
+    match result {
         Ok(snapshot) => (StatusCode::OK, Json(ok(snapshot))).into_response(),
         Err(error) => {
             tracing::error!(error = %error, "failed to load admin insights");
@@ -1738,10 +1759,11 @@ async fn admin_conversations(
         return response;
     }
     let query = params.get("q").cloned().unwrap_or_default();
+    let range = params.get("range").map(|s| s.as_str());
     let (page, page_size) = pagination_from_params(&params);
     match state
         .db
-        .admin_list_conversations(&query, page, page_size)
+        .admin_list_conversations(&query, page, page_size, range)
         .await
     {
         Ok(list) => (StatusCode::OK, Json(ok(list))).into_response(),
@@ -1885,6 +1907,214 @@ async fn admin_create_faq(
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(fail("ADMIN_FAQ_CREATE_ERROR", "无法创建 FAQ。")),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn admin_import_faqs_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    mut multipart: axum::extract::Multipart,
+) -> impl IntoResponse {
+    if let Err(response) = require_admin_token(&headers) {
+        return response;
+    }
+
+    let mut filename = String::new();
+    let mut file_bytes = Vec::new();
+
+    while let Ok(Some(field)) = multipart.next_field().await {
+        let name = field.name().unwrap_or_default().to_owned();
+        if name == "file" {
+            filename = field.file_name().unwrap_or_default().to_owned();
+            match field.bytes().await {
+                Ok(bytes) => {
+                    file_bytes = bytes.to_vec();
+                }
+                Err(error) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(fail("UPLOAD_ERROR", &format!("文件上传失败: {}", error))),
+                    )
+                        .into_response();
+                }
+            }
+            break;
+        }
+    }
+
+    if file_bytes.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(fail("BAD_REQUEST", "上传的文件不能为空，且 field name 必须为 'file'。")),
+        )
+            .into_response();
+    }
+
+    use sha2::Digest;
+    let hash = format!("{:x}", sha2::Sha256::digest(&file_bytes));
+
+    use calamine::{Reader, DataType};
+    let cursor = std::io::Cursor::new(file_bytes);
+    let mut workbook = match calamine::open_workbook_auto_from_rs(cursor) {
+        Ok(wb) => wb,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(fail("PARSE_ERROR", &format!("Excel 解析失败，可能不是合法的 Excel 文件: {}", error))),
+            )
+                .into_response();
+        }
+    };
+
+    let sheet_name = match workbook.sheet_names().first().cloned() {
+        Some(name) => name,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(fail("PARSE_ERROR", "Excel 文件中没有工作表(Sheet)。")),
+            )
+                .into_response();
+        }
+    };
+
+    let range = match workbook.worksheet_range(&sheet_name) {
+        Ok(r) => r,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(fail("PARSE_ERROR", &format!("无法读取工作表 '{}': {}", sheet_name, error))),
+            )
+                .into_response();
+        }
+    };
+
+    let mut rows_to_import = Vec::new();
+    let mut is_header_row = true;
+    let mut col_question_idx = 0;
+    let mut col_answer_idx = 1;
+    let mut col_category_idx = Some(2);
+
+    for (row_idx, row) in range.rows().enumerate() {
+        if row.iter().all(|cell| cell.is_empty()) {
+            continue;
+        }
+
+        let row_values: Vec<String> = row.iter().map(|cell| match cell {
+            calamine::Data::String(s) => s.trim().to_owned(),
+            calamine::Data::Float(f) => f.to_string(),
+            calamine::Data::Int(i) => i.to_string(),
+            calamine::Data::Bool(b) => b.to_string(),
+            _ => "".to_owned(),
+        }).collect();
+
+        if is_header_row {
+            is_header_row = false;
+            let has_header_keywords = row_values.iter().any(|val| {
+                let lower = val.to_lowercase();
+                lower.contains("问题") || lower.contains("答案") || lower.contains("分类") || lower.contains("question") || lower.contains("answer")
+            });
+
+            if has_header_keywords {
+                let mut found_q = false;
+                let mut found_a = false;
+                for (col_idx, val) in row_values.iter().enumerate() {
+                    let lower = val.to_lowercase();
+                    if (lower.contains("问题") || lower.contains("question")) && !found_q {
+                        col_question_idx = col_idx;
+                        found_q = true;
+                    } else if (lower.contains("答案") || lower.contains("answer")) && !found_a {
+                        col_answer_idx = col_idx;
+                        found_a = true;
+                    } else if lower.contains("分类") || lower.contains("category") || lower.contains("类型") {
+                        col_category_idx = Some(col_idx);
+                    }
+                }
+                if found_q && found_a {
+                    continue;
+                } else {
+                    col_question_idx = 0;
+                    col_answer_idx = 1;
+                    col_category_idx = Some(2);
+                }
+            }
+        }
+
+        let max_idx = col_question_idx.max(col_answer_idx).max(col_category_idx.unwrap_or(0));
+        if row_values.len() <= max_idx {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(fail("VALIDATION_ERROR", &format!("第 {} 行: 列数不足，无法获取对应列的数据。", row_idx + 1))),
+            )
+                .into_response();
+        }
+
+        let question = row_values[col_question_idx].trim().to_owned();
+        let answer = row_values[col_answer_idx].trim().to_owned();
+        let category = match col_category_idx {
+            Some(idx) => {
+                let cat = row_values[idx].trim().to_owned();
+                if cat.is_empty() {
+                    "招生咨询".to_owned()
+                } else {
+                    cat
+                }
+            }
+            None => "招生咨询".to_owned(),
+        };
+
+        if question.is_empty() {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(fail("VALIDATION_ERROR", &format!("第 {} 行: 标准问题不能为空。", row_idx + 1))),
+            )
+                .into_response();
+        }
+        if answer.is_empty() {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(fail("VALIDATION_ERROR", &format!("第 {} 行: 标准答案不能为空。", row_idx + 1))),
+            )
+                .into_response();
+        }
+
+        if question.chars().count() > 300 {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(fail("VALIDATION_ERROR", &format!("第 {} 行: 标准问题过长 (字数上限 300)。", row_idx + 1))),
+            )
+                .into_response();
+        }
+        if answer.chars().count() > 3000 {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(fail("VALIDATION_ERROR", &format!("第 {} 行: 标准答案过长 (字数上限 3000)。", row_idx + 1))),
+            )
+                .into_response();
+        }
+
+        rows_to_import.push((question, answer, category));
+    }
+
+    if rows_to_import.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(fail("VALIDATION_ERROR", "没有找到可以导入的 FAQ 记录。")),
+        )
+            .into_response();
+    }
+
+    match state.db.admin_import_faqs(&filename, &hash, rows_to_import, "admin").await {
+        Ok(count) => {
+            (StatusCode::OK, Json(ok(json!({ "count": count })))).into_response()
+        }
+        Err(error) => {
+            tracing::error!(error = %error, "failed to import faqs");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(fail("IMPORT_ERROR", &format!("导入失败: {}", error))),
             )
                 .into_response()
         }
@@ -2175,6 +2405,22 @@ fn is_valid_email(value: &str) -> bool {
         && !domain.ends_with('.')
         && value.chars().count() <= 120
         && !value.chars().any(char::is_whitespace)
+}
+
+async fn public_settings(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    match state.db.admin_get_settings().await {
+        Ok(settings) => (StatusCode::OK, Json(ok(settings))).into_response(),
+        Err(error) => {
+            tracing::error!(error = %error, "failed to load public settings");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(fail("SETTINGS_ERROR", "无法读取系统配置。")),
+            )
+                .into_response()
+        }
+    }
 }
 
 async fn admin_settings(
@@ -3253,17 +3499,25 @@ fn is_valid_conversation_id(value: &str) -> bool {
 async fn admin_evaluation_summary(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
     if let Err(response) = require_admin_token(&headers) {
         return response;
     }
+    let range = params.get("range").map(|s| s.as_str());
     let cache = &state.admin_cache;
     let db = state.db.clone();
-    match cached_or_refresh(&cache.evaluation_summary, cache.ttl, || async move {
-        db.admin_evaluation_summary_snapshot().await
-    })
-    .await
-    {
+
+    let result = if range.is_some() {
+        db.admin_evaluation_summary_snapshot(range).await
+    } else {
+        cached_or_refresh(&cache.evaluation_summary, cache.ttl, || async move {
+            db.admin_evaluation_summary_snapshot(None).await
+        })
+        .await
+    };
+
+    match result {
         Ok(snapshot) => (StatusCode::OK, Json(ok(snapshot))).into_response(),
         Err(error) => {
             tracing::error!(error = %error, "failed to load admin evaluation summary");

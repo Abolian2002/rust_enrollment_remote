@@ -1,4 +1,4 @@
-import { apiGet, apiPatch, apiPost } from './client';
+import { apiGet, apiPatch, apiPost, apiUpload } from './client';
 import type {
   AdminAuditLogList,
   AdminAdmissionsAnalyticsSnapshot,
@@ -20,12 +20,12 @@ import type {
   AdminEvaluationList,
 } from '../types/admin';
 
-export function fetchAdminDashboard() {
-  return apiGet<AdminDashboardSnapshot>('/api/v1/admin/dashboard/summary');
+export function fetchAdminDashboard(range?: string) {
+  return apiGet<AdminDashboardSnapshot>('/api/v1/admin/dashboard/summary', { range });
 }
 
-export function fetchAdminInsights() {
-  return apiGet<AdminInsightsSnapshot>('/api/v1/admin/analytics/insights');
+export function fetchAdminInsights(range?: string) {
+  return apiGet<AdminInsightsSnapshot>('/api/v1/admin/analytics/insights', { range });
 }
 
 export function fetchAdminSpecial() {
@@ -44,9 +44,10 @@ export function fetchAdminBigScreen() {
   return apiGet<AdminBigScreenSnapshot>('/api/v1/admin/analytics/big-screen');
 }
 
-export function fetchAdminConversations(q: string) {
+export function fetchAdminConversations(q: string, range?: string) {
   return apiGet<AdminConversationList>('/api/v1/admin/conversations', {
     q,
+    range,
     page: 1,
     pageSize: 50,
   });
@@ -56,11 +57,11 @@ export function fetchAdminConversationDetail(id: string) {
   return apiGet<AdminConversationDetail>(`/api/v1/admin/conversations/${encodeURIComponent(id)}`);
 }
 
-export function fetchAdminFaqs(q: string) {
+export function fetchAdminFaqs(q: string, page: number = 1, pageSize: number = 50) {
   return apiGet<AdminFaqList>('/api/v1/admin/knowledge/faqs', {
     q,
-    page: 1,
-    pageSize: 80,
+    page,
+    pageSize,
   });
 }
 
@@ -137,8 +138,8 @@ export function fetchAdminAuditLogs() {
   });
 }
 
-export function fetchAdminEvaluationSummary() {
-  return apiGet<AdminEvaluationSummarySnapshot>('/api/v1/admin/analytics/evaluation/summary');
+export function fetchAdminEvaluationSummary(range?: string) {
+  return apiGet<AdminEvaluationSummarySnapshot>('/api/v1/admin/analytics/evaluation/summary', { range });
 }
 
 export function fetchAdminEvaluationList(q: string, page: number = 1, pageSize: number = 20) {
@@ -147,4 +148,8 @@ export function fetchAdminEvaluationList(q: string, page: number = 1, pageSize: 
     page,
     pageSize,
   });
+}
+
+export function importAdminFaqs(file: File) {
+  return apiUpload<{ count: number }>('/api/v1/admin/knowledge/faqs/import', file);
 }

@@ -438,7 +438,12 @@ impl AdmissionsAgent {
                             // answer when tools ran but no reliable evidence was found.
                             Ok::<(), anyhow::Error>(())
                         })?;
-                        let reply = render_knowledge_answer(&result.structured_result);
+                        let mut reply = render_knowledge_answer(&result.structured_result);
+                        if !has_knowledge_evidence(&result.structured_result) {
+                            if let Ok(settings) = self.db.admin_get_settings().await {
+                                reply = settings.fallback_message;
+                            }
+                        }
                         (reply, result.structured_result, result.citations, 1)
                     }
                 }

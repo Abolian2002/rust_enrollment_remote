@@ -6,7 +6,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useChatSession } from "@/components/use-chat-session";
 import { useVoicePlayback } from "@/components/digital-human/use-voice-playback";
 import { FormattedMessage } from "@/components/formatted-message";
-import { createPublicTicket, stopActiveVoiceStream, streamVoiceChatMessage } from "@/lib/api-client";
+import { createPublicTicket, stopActiveVoiceStream, streamVoiceChatMessage, fetchPublicSettings } from "@/lib/api-client";
 import { cn } from "@/lib/cn";
 
 const hotCategories = [
@@ -234,6 +234,20 @@ export default function ChatPage() {
     }
   }, []);
 
+  const [welcomeMessage, setWelcomeMessage] = useState<string>("哈喽～我是哈师大招生小助手沐阳😊 不管是录取分数、位次参考、各专业情况、公费师范政策、校园生活、就业升学，还是想做志愿位次测评，都可以随时问我，我来帮你一一解答！");
+
+  useEffect(() => {
+    fetchPublicSettings()
+      .then((settings) => {
+        if (settings && settings.welcome_message) {
+          setWelcomeMessage(settings.welcome_message);
+        }
+      })
+      .catch((error) => {
+        console.error("Failed to fetch public settings:", error);
+      });
+  }, []);
+
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const [localRichMessages, setLocalRichMessages] = useState<LocalRichMessage[]>([]);
   const [isDrawerOpen, setIsDrawerOpen] = useState(false);
@@ -436,6 +450,7 @@ export default function ChatPage() {
                     <WelcomeBubble
                       isSpeaking={voice.isSpeaking}
                       latestAssistant={latestAssistant ?? null}
+                      message={welcomeMessage}
                       onReplay={() => {
                         if (latestAssistant) {
                           if (voice.usesServerVoice) {
@@ -1110,11 +1125,13 @@ function HotQuestions({ onAsk }: { onAsk: (question: string) => void | Promise<v
 function WelcomeBubble({
   isSpeaking,
   latestAssistant,
-  onReplay
+  onReplay,
+  message,
 }: {
   isSpeaking: boolean;
   latestAssistant: string | null;
   onReplay: () => void;
+  message?: string;
 }) {
   return (
     <div className="flex items-start gap-4">
@@ -1123,7 +1140,7 @@ function WelcomeBubble({
       </div>
       <div className="max-w-[min(680px,calc(100%-56px))] rounded-2xl rounded-tl-none border border-school-100 bg-school-50/50 p-4 shadow-sm text-left">
         <p className="text-sm font-medium leading-7 text-school-950">
-          哈喽～我是哈师大招生小助手沐阳😊 不管是录取分数、位次参考、各专业情况、公费师范政策、校园生活、就业升学，还是想做志愿位次测评，都可以随时问我，我来帮你一一解答！
+          {message || "哈喽～我是哈师大招生小助手沐阳😊 不管是录取分数、位次参考、各专业情况、公费师范政策、校园生活、就业升学，还是想做志愿位次测评，都可以随时问我，我来帮你一一解答！"}
         </p>
         <p className="mt-3 text-[10px] font-medium text-slate-400">内容由 AI 生成，仅供参考，具体请以院校官方公告为准。</p>
         

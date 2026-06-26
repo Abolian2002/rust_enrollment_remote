@@ -22,7 +22,8 @@ license = "UNLICENSED"
 [workspace.dependencies]
 anyhow = "1.0"
 async-trait = "0.1"
-axum = { version = "0.8", features = ["macros", "ws"] }
+axum = { version = "0.8", features = ["macros", "ws", "multipart"] }
+calamine = "0.26"
 chrono = { version = "0.4", features = ["serde"] }
 dotenvy = "0.15"
 futures = "0.3"
@@ -41,6 +42,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = { version = "1.11", features = ["serde", "v4"] }
 wiremock = "0.6"
 insta = { version = "1.41", features = ["json"] }
+sha2 = "0.10"
 
 domain = { path = "crates/domain" }
 db = { path = "crates/db" }

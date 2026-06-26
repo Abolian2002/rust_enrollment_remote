@@ -713,3 +713,115 @@ ss -ltnp | grep ':10090'
 - **故障 2：香港公网 HTTP 访问显示“语音暂不可用”**：
   - **根本原因**：`server-voice` 模式需使用 `AudioWorklet` 处理 PCM 裸流。出于安全性设计，现代浏览器规定 `AudioWorklet` 仅能在安全上下文（HTTPS 或 localhost）下启用。在公网 HTTP (`http://cpa.abolian.online/chat`) 环境下，浏览器禁用该组件，从而导致数字人左侧报“语音暂不可用”。
   - **修复方案**：在 `ChatPage` 中加入自动 HTTPS 重定向策略，若检测到在非 localhost 生产环境使用 HTTP 协议访问，自动将协议升级至 HTTPS（因配置了 Cloudflare 的 HTTPS 代理，此过程对用户无感），彻底解决非安全上下文禁用 `AudioWorklet` 的限制。该方案已在服务器 2 上重新部署验证成功。
+
+## 20. 单模型模式强制及 Qwen3.5 CoT 思考过程屏蔽记录（2026-06-25）
+
+### 20.1 强制单模型模式
+- **前端调整**：从首部彻底删除了我方自研 vs 对方竞品模型切换控件，并将 `selectedModel` 强制固定为 `"ours"`，确保所有前端请求固定指向我方模型。
+- **后端简化**：修改 `crates/admissions_agent/src/lib.rs` 的 `chat` 及 `chat_stream_with_deltas` 函数，废弃对请求参数中 `model` 的判断，强制使用 `self.llm` 客户端。
+
+### 20.2 Qwen3.5 CoT 思考过程屏蔽
+- **Jinja 模版传参修复**：Qwen3.5 采用内置 Jinja 模版渲染 prompt。若未显式传参 `enable_thinking: false`，模型默认会输出思考过程。我们更新了 `crates/llm/src/lib.rs` 的 API 荷载结构，在请求体中增加了 vLLM 所要求的 `chat_template_kwargs`：
+  ```json
+  "chat_template_kwargs": {
+      "enable_thinking": false
+  }
+  ```
+  以此在模型模版渲染层关闭思考输出，避开了因 1600 tokens 长度限制中途截断而暴露思考块的故障。
+- **Prompt 强化**：在合成应答 Prompt 中追加了关于屏蔽 `<think>` 和 `Thinking Process:` 的重要规则约束。
+- **历史数据清洗**：由于模型具备 In-Context Learning (上下文学习) 特性，在多轮对话中会模仿历史中已有的推理过程结构。我们在 remote 数据库中执行了清洗语句，将 `conversation_messages` 中残留的历史 "Thinking Process:" 回答内容全部重置。
+
+### 20.3 vLLM 服务运行环境
+Qwen 3.5 MoE-122B-A10B 运行在 Server 2 的虚拟环境中，具体信息如下：
+- **运行端口**：`7868`
+- **运行进程 PID**：`3721828` (ll3 conda 环境)
+- **显存与 GPU 拓扑**：使用 `--tensor-parallel-size 4` 张卡并行，每张卡占用约 34GB 显存。
+- **服务启动命令**：
+  ```bash
+  /home/t2_enroll_ai/miniconda3/envs/ll3/bin/python -m vllm.entrypoints.openai.api_server \
+    --model /home/t2_enroll_ai/llmws/t4/LLaMA-Factory/qwen122ba10b \
+    --served-model-name qwen \
+    --tensor-parallel-size 4 \
+    --port 7868 \
+    --trust-remote-code \
+    --limit-mm-per-prompt '{"image":16,"video":4}'
+  ```
+
+### 20.4 ll3 Conda 环境依赖包
+
+Server 2 上 vLLM 运行在 Conda 环境 `ll3` 中（Python 解释器路径：`/home/t2_enroll_ai/miniconda3/envs/ll3/bin/python`）。
+
+> 注意：该环境的 `pip` shebang 已损坏，列出包需使用 `python -m pip list`。
+
+#### 核心框架与推理引擎
+
+| 包 | 版本 | 说明 |
+| --- | --- | --- |
+| `vllm` | `0.17.0` | 推理服务主引擎 |
+| `torch` | `2.10.0` | PyTorch |
+| `torchaudio` | `2.10.0` | |
+| `torchvision` | `0.25.0` | |
+| `transformers` | `5.6.0` | HuggingFace Transformers |
+| `tokenizers` | `0.22.2` | 分词器 |
+| `accelerate` | `1.11.0` | 分布式加速 |
+| `safetensors` | `0.8.0` | 模型权重格式 |
+| `xformers` | `0.0.29.post2` | 高效注意力算子 |
+| `triton` | `3.6.0` | Triton JIT 编译器 |
+| `flashinfer-python` | `0.6.4` | FlashInfer 注意力后端 |
+| `xgrammar` | `0.1.29` | 结构化生成 |
+
+#### CUDA / NVIDIA 依赖
+
+| 包 | 版本 |
+| --- | --- |
+| `nvidia-cublas-cu12` | `12.8.4.1` |
+| `nvidia-cuda-runtime-cu12` | `12.8.90` |
+| `nvidia-cudnn-cu12` | `9.10.2.21` |
+| `nvidia-nccl-cu12` | `2.27.5` |
+| `nvidia-cufft-cu12` | `11.3.3.83` |
+| `nvidia-cusparse-cu12` | `12.5.8.93` |
+| `nvidia-cusparselt-cu12` | `0.7.1` |
+| `nvidia-nvjitlink-cu12` | `12.8.93` |
+| `nvidia-nvshmem-cu12` | `3.4.5` |
+| `cuda-bindings` | `12.9.4` |
+| `cupy-cuda12x` | `13.6.0` |
+
+#### 训练 / 微调相关
+
+| 包 | 版本 | 说明 |
+| --- | --- | --- |
+| `llamafactory` | `0.9.6.dev0` | LLaMA-Factory（editable install） |
+| `peft` | `0.18.1` | LoRA / 参数高效微调 |
+| `trl` | `0.24.0` | 强化学习训练 |
+| `datasets` | `4.0.0` | HuggingFace Datasets |
+| `sentencepiece` | `0.2.1` | 分词 |
+| `tiktoken` | `0.13.0` | OpenAI 分词 |
+
+#### API / Web 服务
+
+| 包 | 版本 |
+| --- | --- |
+| `openai` | `2.24.0` |
+| `fastapi` | `0.137.0` |
+| `uvicorn` | `0.49.0` |
+| `gradio` | `5.50.0` |
+| `starlette` | `1.3.1` |
+| `huggingface_hub` | `1.19.0` |
+
+#### 其他关键包
+
+| 包 | 版本 |
+| --- | --- |
+| `numpy` | `2.2.6` |
+| `scipy` | `1.17.1` |
+| `pandas` | `2.3.3` |
+| `scikit-learn` | `1.9.0` |
+| `ray` | `2.55.1` |
+| `compressed-tensors` | `0.13.0` |
+| `gguf` | `0.19.0` |
+| `supervisor` | `4.3.0` |
+| `Jinja2` | `3.1.6` |
+| `protobuf` | `6.33.6` |
+| `PyYAML` | `6.0.3` |
+
+> `flash-attn` 未安装；vLLM 0.17.0 使用 `flashinfer-python 0.6.4` 作为注意力后端。

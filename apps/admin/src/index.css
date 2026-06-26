@@ -1301,13 +1301,21 @@ tr:hover td {
   min-height: 0;
 }
 .big-left, .big-right, .map-area { display: grid; gap: 10px; min-height: 0; }
-.big-left { grid-template-rows: 350px minmax(0, 1fr); }
+.big-left { grid-template-rows: 245px minmax(0, 1fr); }
 .map-area { grid-template-rows: minmax(0, 1fr) 230px; }
 .big-panel {
   border-radius: 9px;
   padding: 12px;
   min-height: 0;
   overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+.big-panel > .echarts-for-react,
+.big-panel > .province-detail,
+.big-panel > .live-list {
+  flex: 1;
+  min-height: 0;
 }
 .big-panel-head {
   height: 28px;

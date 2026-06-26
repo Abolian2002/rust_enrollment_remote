@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState, type FormEvent, type ReactNode } from 'react';
+import { useCallback, useEffect, useState, useRef, type FormEvent, type ReactNode } from 'react';
 import { BrowserRouter, Link, Navigate, Route, Routes, useLocation, useNavigate } from 'react-router-dom';
 import ReactECharts from 'echarts-for-react';
 import * as echarts from 'echarts';
@@ -53,6 +53,7 @@ import {
   updateAdminTicket,
   fetchAdminEvaluationSummary,
   fetchAdminEvaluationList,
+  importAdminFaqs,
 } from './api/admin';
 import type {
   AdminAuditLogItem,
@@ -321,8 +322,8 @@ function SearchBox({ value, onChange, placeholder }: { value: string; onChange: 
   );
 }
 
-function PrimaryButton({ children, onClick, ghost = false }: { children: ReactNode; onClick?: () => void; ghost?: boolean }) {
-  return <button type="button" className={ghost ? 'ghost-button' : 'primary-button'} onClick={onClick}>{children}</button>;
+function PrimaryButton({ children, onClick, ghost = false, disabled = false }: { children: ReactNode; onClick?: () => void; ghost?: boolean; disabled?: boolean }) {
+  return <button type="button" className={ghost ? 'ghost-button' : 'primary-button'} onClick={onClick} disabled={disabled}>{children}</button>;
 }
 
 function StatusBadge({ value }: { value: string }) {
@@ -375,7 +376,8 @@ function DashboardPage() {
 
   const loadDashboard = useCallback(() => {
     setLoading(true);
-    fetchAdminDashboard()
+    const rangeParam = timeRange === '今天' ? 'today' : timeRange === '近7天' ? '7d' : timeRange === '近30天' ? '30d' : undefined;
+    fetchAdminDashboard(rangeParam)
       .then((data) => {
         setDashboard(data);
         setLoadError('');
@@ -387,7 +389,7 @@ function DashboardPage() {
       .finally(() => {
         setLoading(false);
       });
-  }, []);
+  }, [timeRange]);
 
   useEffect(() => {
     loadDashboard();
@@ -458,7 +460,8 @@ function InsightsPage() {
 
   const loadInsights = useCallback(() => {
     setLoading(true);
-    fetchAdminInsights()
+    const rangeParam = month === '近7天' ? '7d' : month === '近30天' ? '30d' : month === '全年' ? '1y' : undefined;
+    fetchAdminInsights(rangeParam)
       .then((data) => {
         setInsights(data);
         setLoadError('');
@@ -470,7 +473,7 @@ function InsightsPage() {
       .finally(() => {
         setLoading(false);
       });
-  }, []);
+  }, [month]);
 
   useEffect(() => {
     loadInsights();
@@ -596,7 +599,8 @@ function EvaluationOverviewPage() {
 
   const loadData = useCallback(() => {
     setLoading(true);
-    fetchAdminEvaluationSummary()
+    const rangeParam = timeRange === '近7天' ? '7d' : timeRange === '近30天' ? '30d' : timeRange === '全年' ? '1y' : undefined;
+    fetchAdminEvaluationSummary(rangeParam)
       .then((res) => {
         setData(res);
         setLoadError('');
@@ -608,7 +612,7 @@ function EvaluationOverviewPage() {
       .finally(() => {
         setLoading(false);
       });
-  }, []);
+  }, [timeRange]);
 
   useEffect(() => {
     loadData();
@@ -818,7 +822,8 @@ function ConversationsPage() {
 
   const loadConversations = useCallback(() => {
     setLoading(true);
-    fetchAdminConversations(query)
+    const rangeParam = timeRange === '近7天' ? '7d' : timeRange === '近30天' ? '30d' : undefined;
+    fetchAdminConversations(query, rangeParam)
       .then((data) => {
         setApiRows(data.items);
         setLoadError('');
@@ -830,7 +835,7 @@ function ConversationsPage() {
       .finally(() => {
         setLoading(false);
       });
-  }, [query]);
+  }, [query, timeRange]);
 
   useEffect(() => {
     loadConversations();
@@ -959,17 +964,20 @@ function KnowledgePage() {
   const [modal, setModal] = useState<'new' | 'import' | 'edit' | null>(null);
   const [editingFaq, setEditingFaq] = useState<KnowledgeItem | null>(null);
   const [savingFaq, setSavingFaq] = useState(false);
+  const [faqPage, setFaqPage] = useState(1);
+  const [faqTotal, setFaqTotal] = useState(0);
   const rows = apiItems ?? [];
 
   const loadKnowledge = useCallback(() => {
     setLoading(true);
     Promise.all([
-      fetchAdminFaqs(query),
+      fetchAdminFaqs(query, faqPage, 50),
       fetchAdminKnowledgeChunks(query),
       fetchAdminKnowledgeCoverage(),
     ])
       .then(([faqList, chunkList, coverageData]) => {
         setApiItems(faqList.items);
+        setFaqTotal(faqList.total);
         setChunks(chunkList.items);
         setCoverage(coverageData);
         setChunkTotal(chunkList.total);
@@ -977,6 +985,7 @@ function KnowledgePage() {
       })
       .catch((error: Error) => {
         setApiItems([]);
+        setFaqTotal(0);
         setChunks([]);
         setCoverage(null);
         setChunkTotal(null);
@@ -985,7 +994,7 @@ function KnowledgePage() {
       .finally(() => {
         setLoading(false);
       });
-  }, [query]);
+  }, [query, faqPage]);
 
   useEffect(() => {
     loadKnowledge();
@@ -1025,6 +1034,20 @@ function KnowledgePage() {
     }
   }
 
+  async function importFaqs(file: File) {
+    setSavingFaq(true);
+    try {
+      const res = await importAdminFaqs(file);
+      alert(`导入成功！共导入 ${res.count} 条标准问答。`);
+      setModal(null);
+      loadKnowledge();
+    } catch (error) {
+      setLoadError(error instanceof Error ? error.message : 'FAQ 导入失败');
+    } finally {
+      setSavingFaq(false);
+    }
+  }
+
   const filteredFaqs = rows.filter((item) => {
     return statusFilter === '全部状态' || item.status === (statusFilter === '启用' ? '启用' : '禁用');
   });
@@ -1034,7 +1057,7 @@ function KnowledgePage() {
       <Toolbar>
         <Select value={typeFilter} onChange={setTypeFilter} options={['全部类型', '标准问答库 (FAQ)', 'PDF文档片段']} />
         <Select value={statusFilter} onChange={setStatusFilter} options={['全部状态', '启用', '禁用']} />
-        <SearchBox value={query} onChange={setQuery} placeholder="搜索问答内容..." />
+        <SearchBox value={query} onChange={(val) => { setQuery(val); setFaqPage(1); }} placeholder="搜索问答内容..." />
         <RefreshAction loading={loading} onClick={loadKnowledge} />
         <PrimaryButton ghost onClick={() => setModal('import')}><Upload size={16} />批量导入</PrimaryButton>
         <PrimaryButton ghost><Download size={16} />导出</PrimaryButton>
@@ -1065,10 +1088,51 @@ function KnowledgePage() {
         </>
       ) : null}
       {typeFilter === '全部类型' || typeFilter === '标准问答库 (FAQ)' ? (
-        <Card title={`标准问答库 ${filteredFaqs.length} 条`}>
+        <Card title={`标准问答库 (共 ${faqTotal} 条，第 ${faqPage} / ${Math.max(Math.ceil(faqTotal / 50), 1)} 页)`}>
           {loading && !filteredFaqs.length ? <EmptyState compact>正在读取真实 FAQ...</EmptyState> : null}
           {!loading && filteredFaqs.length === 0 ? <EmptyState compact>暂无匹配的真实 FAQ。</EmptyState> : null}
-          {filteredFaqs.length ? <DataTable headers={['ID', '标准问题', '相似问法', '标准答案', '来源', '更新时间', '状态', '命中', '操作']} rows={filteredFaqs.map((item) => [item.id, item.question, item.similar, item.answer, item.source, item.updatedAt, <StatusBadge value={item.status} />, item.hits, <button className="table-action" type="button" onClick={() => openFaqEditor(item)}>编辑</button>])} /> : null}
+          {filteredFaqs.length ? (
+            <>
+              <DataTable headers={['ID', '标准问题', '相似问法', '标准答案', '来源', '更新时间', '状态', '命中', '操作']} rows={filteredFaqs.map((item) => [item.id, item.question, item.similar, item.answer, item.source, item.updatedAt, <StatusBadge value={item.status} />, item.hits, <button className="table-action" type="button" onClick={() => openFaqEditor(item)}>编辑</button>])} />
+              {faqTotal > 50 ? (
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '15px', marginTop: '20px', padding: '10px 0' }}>
+                  <button 
+                    disabled={faqPage <= 1} 
+                    onClick={() => setFaqPage(p => Math.max(p - 1, 1))}
+                    style={{
+                      padding: '5px 12px',
+                      borderRadius: '6px',
+                      border: '1px solid rgba(41, 121, 255, 0.3)',
+                      background: 'rgba(10, 31, 64, 0.4)',
+                      color: faqPage <= 1 ? '#7593bb' : '#dbeafe',
+                      cursor: faqPage <= 1 ? 'not-allowed' : 'pointer',
+                      opacity: faqPage <= 1 ? 0.5 : 1
+                    }}
+                  >
+                    上一页
+                  </button>
+                  <span style={{ fontSize: '13px', color: '#a8c7ff' }}>
+                    第 {faqPage} / {Math.ceil(faqTotal / 50)} 页
+                  </span>
+                  <button 
+                    disabled={faqPage >= Math.ceil(faqTotal / 50)} 
+                    onClick={() => setFaqPage(p => Math.min(p + 1, Math.ceil(faqTotal / 50)))}
+                    style={{
+                      padding: '5px 12px',
+                      borderRadius: '6px',
+                      border: '1px solid rgba(41, 121, 255, 0.3)',
+                      background: 'rgba(10, 31, 64, 0.4)',
+                      color: faqPage >= Math.ceil(faqTotal / 50) ? '#7593bb' : '#dbeafe',
+                      cursor: faqPage >= Math.ceil(faqTotal / 50) ? 'not-allowed' : 'pointer',
+                      opacity: faqPage >= Math.ceil(faqTotal / 50) ? 0.5 : 1
+                    }}
+                  >
+                    下一页
+                  </button>
+                </div>
+              ) : null}
+            </>
+          ) : null}
         </Card>
       ) : null}
       {typeFilter === '全部类型' || typeFilter === 'PDF文档片段' ? (
@@ -1095,7 +1159,7 @@ function KnowledgePage() {
       <Card title="未知问题归集池" action={<span className="soft-pill amber">待接入真实事件日志</span>}>
         <EmptyState compact>未知问题归集需要接入低置信度回答、无证据回答、人工反馈等真实事件日志；当前不展示临时数据。</EmptyState>
       </Card>
-      {modal ? <KnowledgeModal mode={modal} initialItem={editingFaq} saving={savingFaq} onClose={() => { setModal(null); setEditingFaq(null); }} onSave={(item) => void saveFaqDraft(item)} /> : null}
+      {modal ? <KnowledgeModal mode={modal} initialItem={editingFaq} saving={savingFaq} onClose={() => { setModal(null); setEditingFaq(null); }} onSave={(item) => void saveFaqDraft(item)} onImport={(file) => void importFaqs(file)} /> : null}
     </>
   );
 }
@@ -1106,6 +1170,7 @@ function KnowledgeModal({
   saving,
   onClose,
   onSave,
+  onImport,
 }: {
   mode: 'new' | 'import' | 'edit';
   initialItem: KnowledgeItem | null;
@@ -1119,6 +1184,7 @@ function KnowledgeModal({
     status: 'draft' | 'published';
     sourceLabel: string;
   }) => void;
+  onImport?: (file: File) => void;
 }) {
   const [question, setQuestion] = useState(initialItem?.question ?? '');
   const [answer, setAnswer] = useState(initialItem?.answer ?? '');
@@ -1128,9 +1194,97 @@ function KnowledgeModal({
   const [sourceLabel, setSourceLabel] = useState(initialItem?.source ?? '管理后台录入');
   const tags = tagsText.split(/[|,，]/).map((item) => item.trim()).filter(Boolean);
 
+  const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  const [dragActive, setDragActive] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const handleDrag = (e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (e.type === "dragenter" || e.type === "dragover") {
+      setDragActive(true);
+    } else if (e.type === "dragleave") {
+      setDragActive(false);
+    }
+  };
+
+  const handleDrop = (e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setDragActive(false);
+    if (e.dataTransfer.files && e.dataTransfer.files[0]) {
+      const file = e.dataTransfer.files[0];
+      const ext = file.name.split('.').pop()?.toLowerCase();
+      if (ext === 'xlsx' || ext === 'xls') {
+        setSelectedFile(file);
+      } else {
+        alert('只允许上传 Excel (.xlsx, .xls) 文件。');
+      }
+    }
+  };
+
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (e.target.files && e.target.files[0]) {
+      const file = e.target.files[0];
+      const ext = file.name.split('.').pop()?.toLowerCase();
+      if (ext === 'xlsx' || ext === 'xls') {
+        setSelectedFile(file);
+      } else {
+        alert('只允许上传 Excel (.xlsx, .xls) 文件。');
+      }
+    }
+  };
+
+  if (mode === 'import') {
+    return (
+      <Modal title="批量导入问答" onClose={onClose}>
+        <div 
+          className="upload-drop"
+          onDragEnter={handleDrag}
+          onDragOver={handleDrag}
+          onDragLeave={handleDrag}
+          onDrop={handleDrop}
+          onClick={() => fileInputRef.current?.click()}
+          style={{
+            borderColor: dragActive ? '#2161ff' : undefined,
+            background: dragActive ? 'rgba(33, 97, 255, 0.08)' : undefined
+          }}
+        >
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept=".xlsx,.xls"
+            onChange={handleFileChange}
+            style={{ display: 'none' }}
+          />
+          <Upload size={30} />
+          {selectedFile ? (
+            <div style={{ textAlign: 'center' }}>
+              <p style={{ fontWeight: 'bold', color: '#101828', margin: '0 0 4px' }}>{selectedFile.name}</p>
+              <p style={{ fontSize: '12px', color: '#667085', margin: 0 }}>{(selectedFile.size / 1024).toFixed(1)} KB (点击重新选择)</p>
+            </div>
+          ) : (
+            <span>拖拽 Excel 文件到此处，或点击选择文件</span>
+          )}
+        </div>
+        <p className="soft-note">仅支持 Excel (.xlsx, .xls) 格式。文件首行若包含“问题”、“答案”等关键字将自动识别为表头；无表头时默认第 1 列为问题，第 2 列为答案，第 3 列为分类。</p>
+        <PrimaryButton 
+          disabled={!selectedFile || saving}
+          onClick={() => {
+            if (selectedFile && onImport) {
+              onImport(selectedFile);
+            }
+          }}
+        >
+          <Save size={16} />
+          {saving ? '导入中...' : '开始导入'}
+        </PrimaryButton>
+      </Modal>
+    );
+  }
+
   return (
     <Modal title={mode === 'edit' ? '编辑标准问答' : mode === 'new' ? '新增标准问答' : '批量导入问答'} onClose={onClose}>
-      {mode === 'import' ? <div className="upload-drop"><Upload size={30} />拖拽 Excel 文件到此处，或点击选择文件</div> : null}
       <label className="field"><span>标准问题</span><input value={question} onChange={(event) => setQuestion(event.target.value)} placeholder="请输入标准问题" /></label>
       <label className="field"><span>标准答案</span><textarea value={answer} onChange={(event) => setAnswer(event.target.value)} placeholder="请输入标准答案" /></label>
       <div className="grid-two compact-grid">
@@ -1393,7 +1547,7 @@ function BigScreenPage() {
       min: 0,
       max: mapMax,
       right: 18,
-      bottom: 120,
+      top: 'middle',
       text: ['高', '低'],
       textStyle: { color: '#a8c7ff' },
       inRange: { color: ['#63a6ff', '#8cf06e', '#ffd04f', '#ff5555'] },
@@ -1404,8 +1558,8 @@ function BigScreenPage() {
       map: 'china',
       roam: false,
       zoom: 1,
-      layoutCenter: ['50%', '54%'],
-      layoutSize: '96%',
+      layoutCenter: ['50%', '48%'],
+      layoutSize: '88%',
       label: { show: false },
       itemStyle: { areaColor: '#2a78d7', borderColor: '#163f8a', borderWidth: 0.8 },
       emphasis: { itemStyle: { areaColor: '#ff9d24' } },
@@ -1470,7 +1624,7 @@ function BigScreenPage() {
         </aside>
         <section className="map-area">
           <BigPanel title="全国各省咨询热力分布" action={<span>IP解析精准度≥99.9%</span>}>
-            {screenMapData.length ? <Chart option={mapOption} height={390} /> : <EmptyState compact>暂无真实热力图数据。</EmptyState>}
+            {screenMapData.length ? <Chart option={mapOption} height="100%" /> : <EmptyState compact>暂无真实热力图数据。</EmptyState>}
           </BigPanel>
           <BigPanel title="实时咨询动态" action={<span className="live-dot">实时</span>}>
             {screenRealtimeMessages.length ? <div className="live-list">
@@ -1540,7 +1694,7 @@ function BigPanel({ title, action, children }: { title: string; action?: ReactNo
   return <section className="big-panel"><div className="big-panel-head"><h2>{title}</h2>{action}</div>{children}</section>;
 }
 
-function Chart({ option, height }: { option: object; height: number }) {
+function Chart({ option, height }: { option: object; height: number | string }) {
   return <ReactECharts option={option} style={{ height, width: '100%' }} notMerge lazyUpdate />;
 }
 

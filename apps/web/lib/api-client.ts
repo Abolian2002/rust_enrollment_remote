@@ -840,3 +840,12 @@ export async function createAdminFeedback(payload: {
     createdAt: string;
   }>("/api/v1/admin/feedback", payload);
 }
+
+export interface PublicSettings {
+  welcome_message: string;
+  fallback_message: string;
+}
+
+export async function fetchPublicSettings() {
+  return apiGet<PublicSettings>("/api/v1/settings/public");
+}

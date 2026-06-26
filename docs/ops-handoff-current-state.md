@@ -825,3 +825,99 @@ Server 2 上 vLLM 运行在 Conda 环境 `ll3` 中（Python 解释器路径：`/
 | `PyYAML` | `6.0.3` |
 
 > `flash-attn` 未安装；vLLM 0.17.0 使用 `flashinfer-python 0.6.4` 作为注意力后端。
+
+## 21. 服务器上网方式与 GitHub SSH 推送配置（2026-06-26）
+
+### 21.1 服务器访问外网的方式
+
+内网项目服务器（`10.10.200.13`）**无法直接访问公网（包括 GitHub）**，需要借助本地 macOS 的 SOCKS5 代理（Clash，端口 `10090`）通过 SSH 反向隧道中转。
+
+**操作步骤：**
+
+**第一步**：在本地 macOS 上建立反向隧道（把本地 10090 反向暴露到服务器的 10090）：
+
+```bash
+sshpass -p 'qwer123456' ssh \
+  -o ExitOnForwardFailure=yes \
+  -o ServerAliveInterval=30 \
+  -o ServerAliveCountMax=3 \
+  -o StrictHostKeyChecking=no \
+  -o ProxyCommand="nc -X 5 -x 127.0.0.1:10090 %h %p" \
+  -N -R 10090:127.0.0.1:10090 \
+  t2_enroll_ai@10.10.200.13
+```
+
+此命令放后台运行（加 `&` 或用 screen/tmux）。
+
+**第二步**：在服务器上设置代理环境变量后，即可访问外网（如 pip install、git push 等）：
+
+```bash
+export http_proxy=http://127.0.0.1:10090
+export https_proxy=http://127.0.0.1:10090
+export HTTP_PROXY=http://127.0.0.1:10090
+export HTTPS_PROXY=http://127.0.0.1:10090
+```
+
+验证连通性：
+
+```bash
+curl -x http://127.0.0.1:10090 -I https://github.com
+```
+
+### 21.2 服务器 GitHub SSH 推送配置
+
+已在服务器上为 `t2_enroll_ai` 用户配置好 GitHub SSH 免密推送，后续无需 token。
+
+**SSH 密钥信息：**
+
+- 密钥路径：`/home/t2_enroll_ai/.ssh/github_ed25519`
+- 公钥已添加到 GitHub 账号 `Abolian2002`，标题：`train2-server`
+- 公钥内容：
+  ```
+  ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFAx0VFKzOnI3c/0w+W3gV+cuBlh4t2pv5u2sMqw46ev train2-server
+  ```
+
+**SSH config 配置**（`/home/t2_enroll_ai/.ssh/config`）：
+
+```
+Host github.com
+  HostName ssh.github.com
+  Port 443
+  User git
+  IdentityFile ~/.ssh/github_ed25519
+  ProxyCommand nc -X 5 -x 127.0.0.1:10090 %h %p
+```
+
+> 使用 `ssh.github.com:443` 而非默认 `22` 端口，因为内网对 22 出站有限制。
+> ProxyCommand 依赖本地反向隧道（见 21.1），需先建立隧道再推送。
+
+**git remote 配置**（服务器仓库已切换为 SSH 协议）：
+
+```bash
+# 已执行，无需重复执行
+git remote set-url origin git@github.com:Abolian2002/rust_enrollment_remote.git
+```
+
+**从服务器推送的完整流程：**
+
+```bash
+# 1. 本地先建立反向隧道（见 21.1）
+
+# 2. 验证 GitHub SSH 连通性（服务器上执行）
+ssh -T git@github.com
+# 期望输出：Hi Abolian2002! You've successfully authenticated...
+
+# 3. 推送（服务器上执行）
+cd /home/t2_enroll_ai/rust_enrollment
+git push origin main
+```
+
+### 21.3 git 仓库双 remote 说明
+
+| 端 | remote 名 | 地址 | 用途 |
+| --- | --- | --- | --- |
+| 本地 macOS | `origin` | `https://github.com/Abolian2002/rust_enrollment.git` | 主开发库，本地推送到此 |
+| 本地 macOS | `enrollment_remote` | `https://github.com/Abolian2002/rust_enrollment_remote.git` | 服务器部署库远端指针 |
+| 服务器 | `origin` | `git@github.com:Abolian2002/rust_enrollment_remote.git` | 服务器推送到此（SSH） |
+
+> 两个 GitHub 仓库是独立的，本地和服务器分别维护各自的提交记录，通常保持同步。

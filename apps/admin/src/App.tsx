@@ -138,8 +138,8 @@ function AdminRoutes() {
 
 function LoginPage() {
   const navigate = useNavigate();
-  const [username, setUsername] = useState('admin');
-  const [password, setPassword] = useState('admin123');
+  const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
   const [visible, setVisible] = useState(false);
   const [error, setError] = useState('');
 
@@ -176,7 +176,6 @@ function LoginPage() {
           </label>
           {error ? <div className="form-error">{error}</div> : null}
           <button className="login-button" type="submit">登 录</button>
-          <div className="demo-account">演示账号：admin / admin123</div>
         </form>
         <p className="copyright">版权所有 哈尔滨师范大学招生办公室</p>
       </section>

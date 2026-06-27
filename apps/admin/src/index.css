@@ -29,17 +29,9 @@ a { color: inherit; text-decoration: none; }
 }
 .login-scrim {
   position: absolute;
-  inset: -20px;
-  background: url("/assets/campus-bg.jpg?v=20260614") center / cover no-repeat;
-  filter: blur(12px) saturate(1.2);
-  transform: scale(1.05);
-  z-index: 0;
-}
-.login-scrim::after {
-  content: "";
-  position: absolute;
   inset: 0;
-  background: rgba(255, 255, 255, 0.2);
+  background: url("/assets/campus-bg.jpg?v=20260614") center / cover no-repeat;
+  z-index: 0;
 }
 .login-panel {
   position: relative;
@@ -60,16 +52,22 @@ a { color: inherit; text-decoration: none; }
 }
 .login-panel h1 {
   margin: 0;
-  font-size: 32px;
-  font-weight: 800;
-  color: #111827;
-  letter-spacing: 0.5px;
+  font-size: 36px;
+  font-weight: 700;
+  color: #a31f24;
+  font-family: "Georgia", "Source Han Serif SC", "Source Han Serif CN", "Noto Serif CJK SC", "Songti SC", "Microsoft YaHei", serif;
+  letter-spacing: 6px;
+  text-indent: 6px;
+  text-shadow: 0 2px 4px rgba(255, 255, 255, 0.9), 0 1px 1px rgba(255, 255, 255, 0.8);
 }
 .login-subtitle {
   margin: 8px 0 34px;
   color: #374151;
   font-size: 17px;
-  font-weight: 500;
+  font-weight: 600;
+  letter-spacing: 3px;
+  text-indent: 3px;
+  text-shadow: 0 1px 2px rgba(255, 255, 255, 0.9);
 }
 .login-card {
   text-align: left;
@@ -426,6 +424,7 @@ a { color: inherit; text-decoration: none; }
   padding: 24px;
   box-shadow: 0 4px 18px rgba(16, 24, 40, 0.03);
   transition: transform 0.25s cubic-bezier(0.4, 0, 0.2, 1), box-shadow 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+  margin-bottom: 24px;
 }
 .card:hover {
   transform: translateY(-2px);
@@ -816,16 +815,96 @@ tr:hover td {
   font-size: 12px;
 }
 .word-cloud {
-  min-height: 150px;
+  min-height: 220px;
   display: flex;
   flex-wrap: wrap;
   align-items: center;
   justify-content: center;
   gap: 16px 24px;
+  padding: 36px;
+  background: transparent;
+  perspective: 1000px;
 }
-.word-cloud span:nth-child(3n) { color: #2161ff; }
-.word-cloud span:nth-child(3n+1) { color: #16a34a; }
-.word-cloud span:nth-child(3n+2) { color: #f97316; }
+.word-cloud span {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 8px 18px;
+  border-radius: 9999px;
+  font-weight: 700;
+  transition: all 0.4s cubic-bezier(0.34, 1.56, 0.64, 1);
+  cursor: pointer;
+  text-decoration: none;
+  border: 1px solid rgba(255, 255, 255, 0.45);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  box-shadow: 0 4px 10px rgba(0, 0, 0, 0.02);
+}
+
+/* 旋转交错排布，制造生动的词云无序美 */
+.word-cloud span:nth-child(5n+1) {
+  transform: rotate(-5deg);
+}
+.word-cloud span:nth-child(5n+3) {
+  transform: rotate(4deg);
+}
+.word-cloud span:nth-child(5n+4) {
+  transform: rotate(-3deg);
+}
+
+/* 悬停状态：变大、回正、底色变实、文字变白、彩色发光 */
+.word-cloud span:hover {
+  transform: scale(1.15) rotate(0deg) !important;
+  color: #ffffff !important;
+  z-index: 10;
+  border-color: rgba(255, 255, 255, 0.8);
+}
+
+/* 6级字号微调重写，大小均衡精致 */
+.word-cloud span:nth-child(6n+5) { font-size: 26px !important; }
+.word-cloud span:nth-child(6n+4) { font-size: 22px !important; }
+.word-cloud span:nth-child(6n+3) { font-size: 19px !important; }
+.word-cloud span:nth-child(6n+2) { font-size: 16px !important; }
+.word-cloud span:nth-child(6n+1) { font-size: 14px !important; }
+.word-cloud span:nth-child(6n)   { font-size: 12px !important; }
+
+/* 炫彩渐变三色阶系映射 */
+
+/* 1. 梦幻紫蓝霓虹 (3n) */
+.word-cloud span:nth-child(3n) {
+  color: #4f46e5;
+  background: linear-gradient(135deg, rgba(99, 102, 241, 0.07), rgba(168, 85, 247, 0.07));
+  border-color: rgba(99, 102, 241, 0.12);
+  box-shadow: 0 4px 12px rgba(99, 102, 241, 0.03);
+}
+.word-cloud span:nth-child(3n):hover {
+  background: linear-gradient(135deg, #6366f1, #a855f7);
+  box-shadow: 0 8px 24px rgba(99, 102, 241, 0.35);
+}
+
+/* 2. 活力橘红暖阳 (3n+1) */
+.word-cloud span:nth-child(3n+1) {
+  color: #ea580c;
+  background: linear-gradient(135deg, rgba(249, 115, 22, 0.07), rgba(239, 68, 68, 0.07));
+  border-color: rgba(249, 115, 22, 0.12);
+  box-shadow: 0 4px 12px rgba(249, 115, 22, 0.03);
+}
+.word-cloud span:nth-child(3n+1):hover {
+  background: linear-gradient(135deg, #f97316, #ef4444);
+  box-shadow: 0 8px 24px rgba(249, 115, 22, 0.35);
+}
+
+/* 3. 翡翠湖蓝生机 (3n+2) */
+.word-cloud span:nth-child(3n+2) {
+  color: #059669;
+  background: linear-gradient(135deg, rgba(16, 185, 129, 0.07), rgba(6, 182, 212, 0.07));
+  border-color: rgba(16, 185, 129, 0.12);
+  box-shadow: 0 4px 12px rgba(16, 185, 129, 0.03);
+}
+.word-cloud span:nth-child(3n+2):hover {
+  background: linear-gradient(135deg, #10b981, #06b6d4);
+  box-shadow: 0 8px 24px rgba(16, 185, 129, 0.35);
+}
 .knowledge-chart-row {
   align-items: stretch;
 }
